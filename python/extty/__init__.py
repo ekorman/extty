@@ -1,8 +1,9 @@
 """extty: Terminal-native ML experiment tracker."""
 
 from extty.run import Run
+from extty.sync import push, list_local_runs
 
-__all__ = ["init", "log", "finish", "Run"]
+__all__ = ["init", "log", "finish", "Run", "push", "list_local_runs"]
 __version__ = "0.1.0"
 
 _active_run: Run | None = None
