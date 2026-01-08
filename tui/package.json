@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "tsx src/index.tsx",
     "build": "tsup src/index.tsx --format esm --dts",
+    "build:binary": "./scripts/build.sh",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -16,7 +17,8 @@
     "chokidar": "^3.6.0",
     "commander": "^12.1.0",
     "ink": "^5.0.1",
-    "react": "^18.3.1"
+    "react": "^18.3.1",
+    "react-devtools-core": "^4.28.5"
   },
   "devDependencies": {
     "@types/asciichart": "^1.5.8",
