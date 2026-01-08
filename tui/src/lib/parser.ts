@@ -1,5 +1,5 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
-import { join, basename } from "node:path";
+import { join, relative } from "node:path";
 import { getMetaPath, getMetricsDir, getSystemPath, getRunsDir } from "./paths.js";
 
 export interface MetricPoint {
@@ -87,6 +87,22 @@ export function parseMetaJson(content: string): RunMeta | null {
   }
 }
 
+function findCsvFiles(dir: string, baseDir: string): string[] {
+  const results: string[] = [];
+  if (!existsSync(dir)) return results;
+
+  const entries = readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...findCsvFiles(fullPath, baseDir));
+    } else if (entry.isFile() && entry.name.endsWith(".csv")) {
+      results.push(relative(baseDir, fullPath));
+    }
+  }
+  return results;
+}
+
 export function loadRunData(runName: string): RunData {
   const metaPath = getMetaPath(runName);
   const metricsDir = getMetricsDir(runName);
@@ -98,15 +114,11 @@ export function loadRunData(runName: string): RunData {
   }
 
   const metrics = new Map<string, MetricPoint[]>();
-  if (existsSync(metricsDir)) {
-    const files = readdirSync(metricsDir);
-    for (const file of files) {
-      if (file.endsWith(".csv")) {
-        const metricName = basename(file, ".csv");
-        const content = readFileSync(join(metricsDir, file), "utf-8");
-        metrics.set(metricName, parseMetricsCsv(content));
-      }
-    }
+  const csvFiles = findCsvFiles(metricsDir, metricsDir);
+  for (const relativePath of csvFiles) {
+    const metricName = relativePath.replace(/\.csv$/, "");
+    const content = readFileSync(join(metricsDir, relativePath), "utf-8");
+    metrics.set(metricName, parseMetricsCsv(content));
   }
 
   let system: SystemPoint[] = [];

@@ -18,11 +18,14 @@ from extty.storage import (
 
 
 class TestSanitizeMetricName:
-    def test_slashes_replaced(self) -> None:
-        assert sanitize_metric_name("train/loss") == "train_loss"
+    def test_slashes_preserved(self) -> None:
+        assert sanitize_metric_name("train/loss") == "train/loss"
 
-    def test_multiple_special_chars(self) -> None:
-        assert sanitize_metric_name("val/f1@epoch") == "val_f1_epoch"
+    def test_nested_slashes(self) -> None:
+        assert sanitize_metric_name("train/metrics/loss") == "train/metrics/loss"
+
+    def test_special_chars_in_components(self) -> None:
+        assert sanitize_metric_name("val/f1@epoch") == "val/f1_epoch"
 
     def test_preserves_valid_chars(self) -> None:
         assert sanitize_metric_name("loss_v2.0") == "loss_v2.0"
@@ -68,7 +71,7 @@ class TestRunStorage:
         storage.log_metric("train/loss", 0.5, step=0)
         storage.flush()
 
-        csv_path = temp_run_dir / "test-run" / "metrics" / "train_loss.csv"
+        csv_path = temp_run_dir / "test-run" / "metrics" / "train" / "loss.csv"
         assert csv_path.exists()
 
         content = csv_path.read_text()

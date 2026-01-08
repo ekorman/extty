@@ -19,11 +19,14 @@ def get_runs_dir() -> Path:
 
 def sanitize_metric_name(name: str) -> str:
     """
-    Sanitize a metric name for use as a filename.
+    Sanitize a metric name for use as a file path.
 
-    Replaces slashes and other special characters with underscores.
+    Preserves forward slashes as directory separators.
+    Sanitizes each path component individually.
     """
-    return re.sub(r"[^\w\-.]", "_", name)
+    parts = name.split("/")
+    sanitized_parts = [re.sub(r"[^\w\-.]", "_", part) for part in parts]
+    return "/".join(sanitized_parts)
 
 
 def generate_run_name() -> str:
@@ -131,8 +134,9 @@ class RunStorage:
         self, name: str, values: list[tuple[int, float, float]]
     ) -> None:
         """Write a batch of metric values to the CSV file."""
-        filename = sanitize_metric_name(name) + ".csv"
-        filepath = self.run_dir / "metrics" / filename
+        relative_path = sanitize_metric_name(name) + ".csv"
+        filepath = self.run_dir / "metrics" / relative_path
+        filepath.parent.mkdir(parents=True, exist_ok=True)
 
         file_exists = filepath.exists()
         with open(filepath, "a") as f:
