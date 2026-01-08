@@ -5,9 +5,10 @@ import { loadRunData } from "../lib/parser.js";
 interface RunListProps {
   runs: string[];
   selectedIndex: number;
+  pushStatus?: { message: string; success: boolean } | null;
 }
 
-export function RunList({ runs, selectedIndex }: RunListProps): React.ReactElement {
+export function RunList({ runs, selectedIndex, pushStatus }: RunListProps): React.ReactElement {
   if (runs.length === 0) {
     return (
       <Box flexDirection="column" padding={1}>
@@ -35,10 +36,17 @@ export function RunList({ runs, selectedIndex }: RunListProps): React.ReactEleme
         />
       ))}
 
+      {pushStatus && (
+        <Box>
+          <Text color={pushStatus.success ? "green" : "red"}>{pushStatus.message}</Text>
+        </Box>
+      )}
+
       <Text />
       <Box gap={2}>
         <Text dimColor>[↑↓] navigate</Text>
         <Text dimColor>[enter] select</Text>
+        <Text dimColor>[p] push</Text>
         <Text dimColor>[q] quit</Text>
       </Box>
     </Box>
