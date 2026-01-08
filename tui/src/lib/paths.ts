@@ -20,3 +20,7 @@ export function getMetricsDir(runName: string): string {
 export function getSystemPath(runName: string): string {
   return join(getRunDir(runName), "system.csv");
 }
+
+export function getExamplesDir(runName: string): string {
+  return join(getRunDir(runName), "examples");
+}

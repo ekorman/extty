@@ -86,6 +86,7 @@ class RunStorage:
     def __post_init__(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "metrics").mkdir(exist_ok=True)
+        (self.run_dir / "examples").mkdir(exist_ok=True)
 
     def write_meta(self, meta: MetaData) -> None:
         """Write or update the meta.json file."""
@@ -173,6 +174,21 @@ class RunStorage:
                 f"{timestamp:.6f},{ram_used_gb:.2f},{ram_total_gb:.2f},"
                 f"{gpu_mem_used},{gpu_mem_total},{gpu_util}\n"
             )
+
+    def log_example(self, name: str, data: dict[str, Any], step: int) -> None:
+        """Log a structured example payload to a JSONL file."""
+        timestamp = time.time()
+        relative_path = sanitize_metric_name(name) + ".jsonl"
+        filepath = self.run_dir / "examples" / relative_path
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        record = {
+            "step": step,
+            "timestamp": timestamp,
+            "data": data,
+        }
+        with open(filepath, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
     def close(self) -> None:
         """Flush remaining data and close any open file handles."""

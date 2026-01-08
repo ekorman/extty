@@ -50,6 +50,7 @@ class TestRunStorage:
         storage = RunStorage(run_dir=temp_run_dir / "test-run")
         assert (temp_run_dir / "test-run").exists()
         assert (temp_run_dir / "test-run" / "metrics").exists()
+        assert (temp_run_dir / "test-run" / "examples").exists()
 
     def test_write_and_read_meta(self, temp_run_dir: Path) -> None:
         storage = RunStorage(run_dir=temp_run_dir / "test-run")
@@ -98,6 +99,22 @@ class TestRunStorage:
         assert "ram_used_gb" in lines[0]
         assert "8.00" in lines[1]
 
+    def test_log_example_creates_jsonl(self, temp_run_dir: Path) -> None:
+        storage = RunStorage(run_dir=temp_run_dir / "test-run")
+        storage.log_example(
+            "val/example",
+            {"prompt": "Hello", "response": "Hi"},
+            step=10,
+        )
+
+        jsonl_path = (
+            temp_run_dir / "test-run" / "examples" / "val" / "example.jsonl"
+        )
+        assert jsonl_path.exists()
+        lines = jsonl_path.read_text().strip().split("\n")
+        assert len(lines) == 1
+        assert '"prompt": "Hello"' in lines[0]
+
 
 class TestExttyAPI:
     def test_init_creates_run(self, tmp_path: Path) -> None:
@@ -118,6 +135,28 @@ class TestExttyAPI:
             assert loss_csv.exists()
             lines = loss_csv.read_text().strip().split("\n")
             assert len(lines) == 3
+
+    def test_log_examples(self, tmp_path: Path) -> None:
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="example-test", system_metrics=False)
+            extty.log(
+                "val/example",
+                {"prompt": "Capital of France?", "response": "Paris"},
+                step=10,
+            )
+            extty.finish()
+
+            example_path = (
+                tmp_path
+                / "runs"
+                / "example-test"
+                / "examples"
+                / "val"
+                / "example.jsonl"
+            )
+            assert example_path.exists()
+            content = example_path.read_text()
+            assert '"response": "Paris"' in content
 
     def test_context_manager(self, tmp_path: Path) -> None:
         import json

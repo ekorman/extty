@@ -1,5 +1,7 @@
 """extty: Terminal-native ML experiment tracker."""
 
+from typing import Any, overload
+
 from extty.run import Run
 from extty.sync import push, list_local_runs
 
@@ -42,20 +44,30 @@ def init(
     return _active_run
 
 
-def log(metrics: dict[str, float], *, step: int) -> None:
+@overload
+def log(metrics: dict[str, float], *, step: int) -> None: ...
+
+
+@overload
+def log(name: str, payload: dict[str, Any], *, step: int) -> None: ...
+
+
+def log(metrics: dict[str, float] | str, payload: dict[str, Any] | None = None, *, step: int) -> None:
     """
-    Log metrics for the current step.
+    Log metrics or structured examples for the current step.
 
     Parameters
     ----------
-    metrics : dict[str, float]
-        Dictionary of metric names to values.
+    metrics : dict[str, float] | str
+        Dictionary of metric names to values, or the example name.
+    payload : dict[str, Any] | None
+        Example payload when logging structured examples.
     step : int
         The current training step.
     """
     if _active_run is None:
         raise RuntimeError("No active run. Call extty.init() first.")
-    _active_run.log(metrics, step=step)
+    _active_run.log(metrics, payload, step=step)
 
 
 def finish() -> None:

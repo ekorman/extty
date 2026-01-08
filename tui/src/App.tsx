@@ -7,6 +7,7 @@ import { RunHeader } from "./components/RunHeader.js";
 import { SystemStats } from "./components/SystemStats.js";
 import { ConfigPanel } from "./components/ConfigPanel.js";
 import { RunList } from "./components/RunList.js";
+import { ExamplePanel } from "./components/ExamplePanel.js";
 import { useFileWatch } from "./hooks/useFileWatch.js";
 import { getRunsDir } from "./lib/paths.js";
 
@@ -104,6 +105,8 @@ export function App({ initialRun }: AppProps): React.ReactElement {
       <Box paddingTop={1}>
         <SystemStats system={data.system} />
       </Box>
+
+      <ExamplePanel examples={data.examples} />
 
       <ConfigPanel meta={data.meta} />
 
