@@ -4,7 +4,7 @@ on:
   push:
 
 jobs:
-  test:
+  test-python:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -15,3 +15,15 @@ jobs:
       - run: uv python install 3.12
       - run: uv sync --extra dev
       - run: uv run pytest tests
+
+  test-backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv python install 3.12
+      - run: uv sync --extra dev
+      - run: uv run pytest tests -v
