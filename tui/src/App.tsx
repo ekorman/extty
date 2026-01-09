@@ -32,8 +32,7 @@ export function App({ initialRun }: AppProps): React.ReactElement {
 
   // Clear screen helper to prevent leftover content when switching views
   const clearScreen = useCallback(() => {
-    // Move cursor to top-left and clear entire screen
-    stdout.write("\x1b[2J\x1b[H");
+    stdout.write("\x1b[2J\x1b[3J\x1b[H");
   }, [stdout]);
 
   const runsUpdateCount = useFileWatch(getRunsDir(), { debounceMs: 200 });
@@ -105,11 +104,13 @@ export function App({ initialRun }: AppProps): React.ReactElement {
       }
     } else {
       if (key.leftArrow && selectedIndex > 0) {
-        prevDataRef.current = null; // Clear when switching runs
+        clearScreen();
+        prevDataRef.current = null;
         setSelectedIndex(selectedIndex - 1);
       }
       if (key.rightArrow && selectedIndex < runs.length - 1) {
-        prevDataRef.current = null; // Clear when switching runs
+        clearScreen();
+        prevDataRef.current = null;
         setSelectedIndex(selectedIndex + 1);
       }
     }
