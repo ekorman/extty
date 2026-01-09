@@ -167,7 +167,9 @@ class RunStorage:
                 )
 
             gpu_mem_used = "" if gpu_mem_used_gb is None else f"{gpu_mem_used_gb:.2f}"
-            gpu_mem_total = "" if gpu_mem_total_gb is None else f"{gpu_mem_total_gb:.2f}"
+            gpu_mem_total = (
+                "" if gpu_mem_total_gb is None else f"{gpu_mem_total_gb:.2f}"
+            )
             gpu_util = "" if gpu_util_pct is None else f"{gpu_util_pct:.1f}"
 
             f.write(

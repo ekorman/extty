@@ -74,23 +74,27 @@ def upload_run(
         db.flush()
 
         for p in points:
-            db.add(MetricPoint(
-                metric_id=metric.id,
-                step=p.step,
-                value=p.value,
-                timestamp=p.timestamp,
-            ))
+            db.add(
+                MetricPoint(
+                    metric_id=metric.id,
+                    step=p.step,
+                    value=p.value,
+                    timestamp=p.timestamp,
+                )
+            )
 
     for sp in data.system:
-        db.add(SystemPoint(
-            run_id=run.id,
-            timestamp=sp.timestamp,
-            ram_used_gb=sp.ram_used_gb,
-            ram_total_gb=sp.ram_total_gb,
-            gpu_mem_used_gb=sp.gpu_mem_used_gb,
-            gpu_mem_total_gb=sp.gpu_mem_total_gb,
-            gpu_util_pct=sp.gpu_util_pct,
-        ))
+        db.add(
+            SystemPoint(
+                run_id=run.id,
+                timestamp=sp.timestamp,
+                ram_used_gb=sp.ram_used_gb,
+                ram_total_gb=sp.ram_total_gb,
+                gpu_mem_used_gb=sp.gpu_mem_used_gb,
+                gpu_mem_total_gb=sp.gpu_mem_total_gb,
+                gpu_util_pct=sp.gpu_util_pct,
+            )
+        )
 
     db.commit()
     db.refresh(run)
@@ -209,9 +213,9 @@ def list_metrics(
     db: Annotated[Session, Depends(get_db)],
 ) -> list[str]:
     """List metric names for a run."""
-    metrics = db.execute(
-        select(Metric.name).where(Metric.run_id == run_id)
-    ).scalars().all()
+    metrics = (
+        db.execute(select(Metric.name).where(Metric.run_id == run_id)).scalars().all()
+    )
 
     return list(metrics)
 

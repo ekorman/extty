@@ -33,12 +33,14 @@ class Run(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     project: Mapped["Project"] = relationship(back_populates="runs")
-    metrics: Mapped[list["Metric"]] = relationship(back_populates="run", cascade="all, delete-orphan")
-    system_points: Mapped[list["SystemPoint"]] = relationship(back_populates="run", cascade="all, delete-orphan")
-
-    __table_args__ = (
-        Index("idx_runs_project", "project_id"),
+    metrics: Mapped[list["Metric"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
     )
+    system_points: Mapped[list["SystemPoint"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("idx_runs_project", "project_id"),)
 
 
 class Metric(Base):
@@ -49,11 +51,11 @@ class Metric(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
 
     run: Mapped["Run"] = relationship(back_populates="metrics")
-    points: Mapped[list["MetricPoint"]] = relationship(back_populates="metric", cascade="all, delete-orphan")
-
-    __table_args__ = (
-        Index("idx_metrics_run_name", "run_id", "name", unique=True),
+    points: Mapped[list["MetricPoint"]] = relationship(
+        back_populates="metric", cascade="all, delete-orphan"
     )
+
+    __table_args__ = (Index("idx_metrics_run_name", "run_id", "name", unique=True),)
 
 
 class MetricPoint(Base):
@@ -87,9 +89,7 @@ class SystemPoint(Base):
 
     run: Mapped["Run"] = relationship(back_populates="system_points")
 
-    __table_args__ = (
-        Index("idx_system_points_run", "run_id"),
-    )
+    __table_args__ = (Index("idx_system_points_run", "run_id"),)
 
 
 class ProjectSchema(BaseModel):
