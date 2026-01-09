@@ -10,6 +10,7 @@ import { RunList } from "./components/RunList.js";
 import { ExamplePanel } from "./components/ExamplePanel.js";
 import { useFileWatch } from "./hooks/useFileWatch.js";
 import { getRunsDir } from "./lib/paths.js";
+import { pushRun } from "./lib/sync.js";
 
 type View = "list" | "detail";
 
@@ -24,6 +25,10 @@ export function App({ initialRun }: AppProps): React.ReactElement {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [view, setView] = useState<View>(initialRun ? "detail" : "list");
   const prevDataRef = useRef<typeof data>(null);
+  const [pushStatus, setPushStatus] = useState<{
+    message: string;
+    success: boolean;
+  } | null>(null);
 
   // Clear screen helper to prevent leftover content when switching views
   const clearScreen = useCallback(() => {
@@ -63,6 +68,12 @@ export function App({ initialRun }: AppProps): React.ReactElement {
     prevDataRef.current = data;
   }
   const displayData = data ?? prevDataRef.current;
+  const handlePush = async (runName: string) => {
+    setPushStatus({ message: "Pushing...", success: true });
+    const result = await pushRun(runName);
+    setPushStatus({ message: result.message, success: result.success });
+    setTimeout(() => setPushStatus(null), 3000);
+  };
 
   useInput((input, key) => {
     if (input === "q") {
@@ -73,6 +84,11 @@ export function App({ initialRun }: AppProps): React.ReactElement {
       } else {
         exit();
       }
+      return;
+    }
+
+    if (input === "p" && currentRun) {
+      handlePush(currentRun);
       return;
     }
 
@@ -100,7 +116,13 @@ export function App({ initialRun }: AppProps): React.ReactElement {
   });
 
   if (view === "list") {
-    return <RunList runs={runs} selectedIndex={selectedIndex} />;
+    return (
+      <RunList
+        runs={runs}
+        selectedIndex={selectedIndex}
+        pushStatus={pushStatus}
+      />
+    );
   }
 
   if (!displayData) {
@@ -137,11 +159,20 @@ export function App({ initialRun }: AppProps): React.ReactElement {
 
       <ConfigPanel meta={displayData.meta} />
 
+      {pushStatus && (
+        <Box paddingX={1}>
+          <Text color={pushStatus.success ? "green" : "red"}>
+            {pushStatus.message}
+          </Text>
+        </Box>
+      )}
+
       <Box paddingX={1} paddingY={0} gap={2}>
         <Text dimColor>[q] back</Text>
         <Text dimColor>
           [←→] switch runs ({selectedIndex + 1}/{runs.length})
         </Text>
+        <Text dimColor>[p] push</Text>
       </Box>
     </Box>
   );

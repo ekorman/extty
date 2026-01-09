@@ -100,8 +100,8 @@ def _build_payload(run_dir: Path) -> dict:
     }
 
     if metrics_dir.exists():
-        for csv_file in metrics_dir.glob("*.csv"):
-            metric_name = csv_file.stem
+        for csv_file in metrics_dir.rglob("*.csv"):
+            metric_name = csv_file.relative_to(metrics_dir).with_suffix("").as_posix()
             points = _parse_metric_csv(csv_file)
             if points:
                 payload["metrics"][metric_name] = points
