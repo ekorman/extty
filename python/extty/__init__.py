@@ -42,14 +42,14 @@ def init(
     return _active_run
 
 
-def log(metrics: dict[str, float], *, step: int) -> None:
+def log(metrics: dict[str, float | dict], *, step: int) -> None:
     """
-    Log metrics for the current step.
+    Log metrics or structured examples for the current step.
 
     Parameters
     ----------
-    metrics : dict[str, float]
-        Dictionary of metric names to values.
+    metrics : dict[str, float | dict]
+        Dictionary of metric names to values or structured example payloads.
     step : int
         The current training step.
     """

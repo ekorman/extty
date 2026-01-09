@@ -54,14 +54,19 @@ class Run:
         self._lock = threading.Lock()
         self._finished = False
 
-    def log(self, metrics: dict[str, float], *, step: int) -> None:
+    def log(
+        self,
+        metrics: dict[str, float | dict[str, Any]],
+        *,
+        step: int,
+    ) -> None:
         """
-        Log metrics for the current step.
+        Log metrics or structured examples for the current step.
 
         Parameters
         ----------
-        metrics : dict[str, float]
-            Dictionary of metric names to values.
+        metrics : dict[str, float | dict[str, Any]]
+            Dictionary of metric names to values or structured example payloads.
         step : int
             The current training step.
 
@@ -73,8 +78,11 @@ class Run:
         with self._lock:
             if self._finished:
                 raise RuntimeError("Cannot log to a finished run.")
-            for name, value in metrics.items():
-                self._storage.log_metric(name, value, step)
+            for name, metric_value in metrics.items():
+                if isinstance(metric_value, dict):
+                    self._storage.log_example(name, metric_value, step)
+                else:
+                    self._storage.log_metric(name, float(metric_value), step)
 
     def finish(self) -> None:
         """

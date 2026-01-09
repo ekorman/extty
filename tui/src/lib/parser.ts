@@ -1,6 +1,12 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
-import { getMetaPath, getMetricsDir, getSystemPath, getRunsDir } from "./paths.js";
+import {
+  getMetaPath,
+  getMetricsDir,
+  getSystemPath,
+  getRunsDir,
+  getExamplesDir,
+} from "./paths.js";
 
 export interface MetricPoint {
   step: number;
@@ -30,6 +36,13 @@ export interface RunData {
   meta: RunMeta | null;
   metrics: Map<string, MetricPoint[]>;
   system: SystemPoint[];
+  examples: Map<string, ExampleEntry[]>;
+}
+
+export interface ExampleEntry {
+  step: number;
+  timestamp: number;
+  data: Record<string, unknown>;
 }
 
 export function parseMetricsCsv(content: string): MetricPoint[] {
@@ -103,10 +116,57 @@ function findCsvFiles(dir: string, baseDir: string): string[] {
   return results;
 }
 
+function findJsonlFiles(dir: string, baseDir: string): string[] {
+  const results: string[] = [];
+  if (!existsSync(dir)) return results;
+
+  const entries = readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...findJsonlFiles(fullPath, baseDir));
+    } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      results.push(relative(baseDir, fullPath));
+    }
+  }
+  return results;
+}
+
+function parseExamplesJsonl(content: string): ExampleEntry[] {
+  const lines = content.trim().split("\n");
+  const examples: ExampleEntry[] = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line) as {
+        step: number;
+        timestamp: number;
+        data: Record<string, unknown>;
+      };
+      if (
+        typeof parsed.step === "number" &&
+        typeof parsed.timestamp === "number" &&
+        parsed.data &&
+        typeof parsed.data === "object"
+      ) {
+        examples.push({
+          step: parsed.step,
+          timestamp: parsed.timestamp,
+          data: parsed.data,
+        });
+      }
+    } catch {
+      continue;
+    }
+  }
+  return examples;
+}
+
 export function loadRunData(runName: string): RunData {
   const metaPath = getMetaPath(runName);
   const metricsDir = getMetricsDir(runName);
   const systemPath = getSystemPath(runName);
+  const examplesDir = getExamplesDir(runName);
 
   let meta: RunMeta | null = null;
   if (existsSync(metaPath)) {
@@ -126,7 +186,18 @@ export function loadRunData(runName: string): RunData {
     system = parseSystemCsv(readFileSync(systemPath, "utf-8"));
   }
 
-  return { meta, metrics, system };
+  const examples = new Map<string, ExampleEntry[]>();
+  const jsonlFiles = findJsonlFiles(examplesDir, examplesDir);
+  for (const relativePath of jsonlFiles) {
+    const exampleName = relativePath.replace(/\.jsonl$/, "");
+    const content = readFileSync(join(examplesDir, relativePath), "utf-8");
+    const entries = parseExamplesJsonl(content);
+    if (entries.length > 0) {
+      examples.set(exampleName, entries);
+    }
+  }
+
+  return { meta, metrics, system, examples };
 }
 
 export function listRuns(): string[] {
