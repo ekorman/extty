@@ -121,11 +121,13 @@ def _parse_metric_csv(path: Path) -> list[dict]:
     for line in lines[1:]:
         parts = line.strip().split(",")
         if len(parts) >= 3:
-            points.append({
-                "step": int(parts[0]),
-                "timestamp": float(parts[1]),
-                "value": float(parts[2]),
-            })
+            points.append(
+                {
+                    "step": int(parts[0]),
+                    "timestamp": float(parts[1]),
+                    "value": float(parts[2]),
+                }
+            )
 
     return points
 
@@ -143,9 +145,15 @@ def _parse_system_csv(path: Path) -> list[dict]:
                 "timestamp": float(parts[0]),
                 "ram_used_gb": float(parts[1]) if parts[1] else None,
                 "ram_total_gb": float(parts[2]) if parts[2] else None,
-                "gpu_mem_used_gb": float(parts[3]) if len(parts) > 3 and parts[3] else None,
-                "gpu_mem_total_gb": float(parts[4]) if len(parts) > 4 and parts[4] else None,
-                "gpu_util_pct": float(parts[5]) if len(parts) > 5 and parts[5] else None,
+                "gpu_mem_used_gb": float(parts[3])
+                if len(parts) > 3 and parts[3]
+                else None,
+                "gpu_mem_total_gb": float(parts[4])
+                if len(parts) > 4 and parts[4]
+                else None,
+                "gpu_util_pct": float(parts[5])
+                if len(parts) > 5 and parts[5]
+                else None,
             }
             points.append(point)
 
@@ -159,6 +167,5 @@ def list_local_runs() -> list[str]:
         return []
 
     return [
-        d.name for d in runs_dir.iterdir()
-        if d.is_dir() and (d / "meta.json").exists()
+        d.name for d in runs_dir.iterdir() if d.is_dir() and (d / "meta.json").exists()
     ]

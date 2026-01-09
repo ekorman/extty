@@ -17,9 +17,7 @@ def list_projects(
     db: Annotated[Session, Depends(get_db)],
 ) -> list[Project]:
     """List all projects."""
-    projects = db.execute(
-        select(Project).order_by(Project.name)
-    ).scalars().all()
+    projects = db.execute(select(Project).order_by(Project.name)).scalars().all()
 
     return list(projects)
 

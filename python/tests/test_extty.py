@@ -107,9 +107,7 @@ class TestRunStorage:
             step=10,
         )
 
-        jsonl_path = (
-            temp_run_dir / "test-run" / "examples" / "val" / "example.jsonl"
-        )
+        jsonl_path = temp_run_dir / "test-run" / "examples" / "val" / "example.jsonl"
         assert jsonl_path.exists()
         lines = jsonl_path.read_text().strip().split("\n")
         assert len(lines) == 1

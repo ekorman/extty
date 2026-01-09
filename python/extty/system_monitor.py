@@ -99,7 +99,11 @@ class SystemMonitor:
         gpu_mem_total_gb: float | None = None
         gpu_util_pct: float | None = None
 
-        if self._gpu_initialized and self._gpu_handle is not None and _pynvml is not None:
+        if (
+            self._gpu_initialized
+            and self._gpu_handle is not None
+            and _pynvml is not None
+        ):
             try:
                 mem_info = _pynvml.nvmlDeviceGetMemoryInfo(self._gpu_handle)
                 gpu_mem_used_gb = mem_info.used / (1024**3)
