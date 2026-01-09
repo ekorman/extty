@@ -3,41 +3,56 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
 
-from app.database import get_db
-from app.models import Project, Run, ProjectSchema, RunSchema
+from app.database import get_db, decode_json
+from app.models import ProjectSchema, RunSchema
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 
 @router.get("", response_model=list[ProjectSchema])
 def list_projects(
-    db: Annotated[Session, Depends(get_db)],
-) -> list[Project]:
+    conn: Annotated[object, Depends(get_db)],
+) -> list[ProjectSchema]:
     """List all projects."""
-    projects = db.execute(select(Project).order_by(Project.name)).scalars().all()
-
-    return list(projects)
+    cursor = conn.execute("SELECT id, name, created_at FROM projects ORDER BY name")
+    projects = [ProjectSchema(**dict(row)) for row in cursor.fetchall()]
+    return projects
 
 
 @router.get("/{project_name}", response_model=list[RunSchema])
 def get_project_runs(
     project_name: str,
-    db: Annotated[Session, Depends(get_db)],
-) -> list[Run]:
+    conn: Annotated[object, Depends(get_db)],
+) -> list[RunSchema]:
     """Get all runs for a project."""
-    project = db.execute(
-        select(Project)
-        .options(selectinload(Project.runs))
-        .where(Project.name == project_name)
-    ).scalar_one_or_none()
+    # Check if project exists
+    cursor = conn.execute("SELECT id, name FROM projects WHERE name = ?", (project_name,))
+    project = cursor.fetchone()
 
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    for run in project.runs:
-        run.project_name = project.name
+    project_id = project[0]
+    project_name_actual = project[1]
 
-    return list(project.runs)
+    # Get all runs for the project
+    cursor = conn.execute(
+        """
+        SELECT id, project_id, name, config, started_at, finished_at, status, created_at
+        FROM runs
+        WHERE project_id = ?
+        ORDER BY created_at DESC
+        """,
+        (project_id,),
+    )
+
+    runs = []
+    for row in cursor.fetchall():
+        run_dict = dict(row)
+        # Decode JSON config
+        run_dict["config"] = decode_json(run_dict["config"])
+        run_dict["project_name"] = project_name_actual
+        runs.append(RunSchema(**run_dict))
+
+    return runs
