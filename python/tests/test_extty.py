@@ -140,8 +140,7 @@ class TestExttyAPI:
         with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
             extty.init("test-project", name="example-test", system_metrics=False)
             extty.log(
-                "val/example",
-                {"prompt": "Capital of France?", "response": "Paris"},
+                {"val/example": {"prompt": "Capital of France?", "response": "Paris"}},
                 step=10,
             )
             extty.finish()

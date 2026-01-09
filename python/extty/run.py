@@ -56,8 +56,7 @@ class Run:
 
     def log(
         self,
-        metrics: dict[str, float] | str,
-        value: dict[str, Any] | None = None,
+        metrics: dict[str, float | dict[str, Any]],
         *,
         step: int,
     ) -> None:
@@ -66,10 +65,8 @@ class Run:
 
         Parameters
         ----------
-        metrics : dict[str, float] | str
-            Dictionary of metric names to values, or the example name.
-        value : dict[str, Any] | None
-            Example payload when logging structured examples.
+        metrics : dict[str, float | dict[str, Any]]
+            Dictionary of metric names to values or structured example payloads.
         step : int
             The current training step.
 
@@ -81,15 +78,11 @@ class Run:
         with self._lock:
             if self._finished:
                 raise RuntimeError("Cannot log to a finished run.")
-            if isinstance(metrics, str):
-                if value is None or not isinstance(value, dict):
-                    raise TypeError("Example logging requires a dict payload.")
-                self._storage.log_example(metrics, value, step)
-                return
-            if value is not None:
-                raise TypeError("Metric logging does not accept an example payload.")
             for name, metric_value in metrics.items():
-                self._storage.log_metric(name, metric_value, step)
+                if isinstance(metric_value, dict):
+                    self._storage.log_example(name, metric_value, step)
+                else:
+                    self._storage.log_metric(name, float(metric_value), step)
 
     def finish(self) -> None:
         """
