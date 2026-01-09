@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, or_
 from sqlalchemy.orm import Session, selectinload
 
+from app.auth import verify_api_key
 from app.database import get_db
 from app.models import (
     Project,
@@ -24,7 +25,7 @@ from app.models import (
 router = APIRouter(prefix="/runs", tags=["runs"])
 
 
-@router.post("", response_model=RunSchema)
+@router.post("", response_model=RunSchema, dependencies=[Depends(verify_api_key)])
 def upload_run(
     data: RunUploadSchema,
     db: Annotated[Session, Depends(get_db)],
@@ -190,7 +191,7 @@ def get_run(
     )
 
 
-@router.delete("/{run_id}")
+@router.delete("/{run_id}", dependencies=[Depends(verify_api_key)])
 def delete_run(
     run_id: int,
     db: Annotated[Session, Depends(get_db)],
