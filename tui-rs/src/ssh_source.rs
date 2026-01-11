@@ -107,19 +107,27 @@ async fn exec_command(handle: &mut Handle<Client>, cmd: &str) -> Result<String> 
     channel.exec(true, cmd).await?;
 
     let mut output = String::new();
+    let mut exit_status: Option<u32> = None;
+
     while let Some(msg) = channel.wait().await {
         match msg {
             russh::ChannelMsg::Data { ref data } => {
                 output.push_str(&String::from_utf8_lossy(data));
             }
-            russh::ChannelMsg::ExitStatus { exit_status: _ } => {
+            russh::ChannelMsg::ExitStatus { exit_status: status } => {
+                exit_status = Some(status);
                 break;
             }
             _ => {}
         }
     }
 
-    Ok(output)
+    // Check if command succeeded
+    match exit_status {
+        Some(0) => Ok(output),
+        Some(code) => Err(anyhow!("Command failed with exit code {}: {}", code, cmd)),
+        None => Err(anyhow!("Command did not return exit status: {}", cmd)),
+    }
 }
 
 /// Create an SSH session
@@ -198,9 +206,11 @@ pub fn load_run_ssh(config: &SshConfig, run_name: &str) -> Result<Run> {
 async fn load_run_ssh_with_session(session: &mut Handle<Client>, run_name: &str) -> Result<Run> {
     let run_path = format!("~/.ex/runs/{}", run_name);
 
-    // Check if meta.json exists
-    let check_output = exec_command(session, &format!("test -f {}/meta.json && echo ok", run_path))
-        .await?;
+    // Check if meta.json exists (use || true to ensure exit code 0)
+    let check_output = exec_command(
+        session,
+        &format!("test -f {}/meta.json && echo ok || true", run_path)
+    ).await?;
 
     if !check_output.trim().contains("ok") {
         return Err(anyhow!("Run {} does not have meta.json", run_name));
