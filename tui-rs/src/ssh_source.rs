@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::io::Read;
-use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local};
+use russh::client::{self, Handle, Handler};
+use russh::keys::key;
+use russh_keys::load_secret_key;
 use serde::Deserialize;
-use ssh2::Session;
 
 use crate::data::{Example, MetricPoint, Run, RunStatus};
 
@@ -75,82 +76,139 @@ impl SshConfig {
             port: 22,
         })
     }
+}
 
-    /// Create an SSH session
-    pub fn connect(&self) -> Result<Session> {
-        let tcp = TcpStream::connect(format!("{}:{}", self.hostname, self.port))
-            .context("Failed to connect via TCP")?;
+/// SSH client handler
+struct Client;
 
-        let mut sess = Session::new()?;
+#[async_trait::async_trait]
+impl Handler for Client {
+    type Error = russh::Error;
 
-        sess.set_tcp_stream(tcp);
-        sess.handshake()
-            .context("SSH handshake failed")?;
-
-        // Try to authenticate using SSH agent
-        sess.userauth_agent(&self.username)
-            .context("SSH authentication failed")?;
-
-        if !sess.authenticated() {
-            return Err(anyhow!("SSH authentication failed"));
-        }
-
-        Ok(sess)
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        // Accept all host keys (similar to ssh2's AutoAddPolicy)
+        Ok(true)
     }
+}
+
+/// Execute a command and return stdout
+async fn exec_command(handle: &mut Handle<Client>, cmd: &str) -> Result<String> {
+    let mut channel = handle.channel_open_session().await?;
+    channel.exec(true, cmd).await?;
+
+    let mut output = String::new();
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            russh::ChannelMsg::Data { ref data } => {
+                output.push_str(&String::from_utf8_lossy(data));
+            }
+            russh::ChannelMsg::ExitStatus { exit_status: _ } => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(output)
+}
+
+/// Create an SSH session
+async fn connect(config: &SshConfig) -> Result<Handle<Client>> {
+    let client_config = Arc::new(client::Config::default());
+    let mut session = client::connect(client_config, (&*config.hostname, config.port), Client)
+        .await
+        .context("Failed to connect to SSH server")?;
+
+    // Try to load SSH keys from standard locations
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
+    let ssh_dir = home.join(".ssh");
+
+    // Try common key files
+    let key_files = vec!["id_rsa", "id_ed25519", "id_ecdsa"];
+
+    for key_file in key_files {
+        let key_path = ssh_dir.join(key_file);
+        if key_path.exists() {
+            if let Ok(key_pair) = load_secret_key(key_path, None) {
+                let auth_result = session
+                    .authenticate_publickey(&config.username, Arc::new(key_pair))
+                    .await;
+
+                if let Ok(true) = auth_result {
+                    return Ok(session);
+                }
+            }
+        }
+    }
+
+    Err(anyhow!("SSH authentication failed - no valid keys found"))
 }
 
 /// List all runs from a remote server via SSH
 pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
-    let sess = config.connect()?;
+    // Create a tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new()?;
 
-    // List directories in ~/.ex/runs/
-    let (stdout, _exit_code) = exec_command(
-        &sess,
-        "cd ~/.ex/runs 2>/dev/null && ls -1 || true"
-    )?;
+    rt.block_on(async {
+        let mut session = connect(config).await?;
 
-    let mut runs = Vec::new();
+        // List directories in ~/.ex/runs/
+        let stdout = exec_command(
+            &mut session,
+            "cd ~/.ex/runs 2>/dev/null && ls -1 || true",
+        )
+        .await?;
 
-    for line in stdout.lines() {
-        let run_name = line.trim();
-        if run_name.is_empty() {
-            continue;
+        let mut runs = Vec::new();
+
+        for line in stdout.lines() {
+            let run_name = line.trim();
+            if run_name.is_empty() {
+                continue;
+            }
+
+            // Load each run
+            if let Ok(run) = load_run_ssh_async(config, run_name).await {
+                runs.push(run);
+            }
         }
 
-        // Load each run
-        if let Ok(run) = load_run_ssh(config, run_name) {
-            runs.push(run);
-        }
-    }
-
-    // Sort by name descending (newest first)
-    runs.sort_by(|a, b| b.name.cmp(&a.name));
-    Ok(runs)
+        // Sort by name descending (newest first)
+        runs.sort_by(|a, b| b.name.cmp(&a.name));
+        Ok(runs)
+    })
 }
 
 /// Load a single run from SSH
 pub fn load_run_ssh(config: &SshConfig, run_name: &str) -> Result<Run> {
-    let sess = config.connect()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(load_run_ssh_async(config, run_name))
+}
+
+async fn load_run_ssh_async(config: &SshConfig, run_name: &str) -> Result<Run> {
+    let mut session = connect(config).await?;
     let run_path = format!("~/.ex/runs/{}", run_name);
 
     // Check if meta.json exists
-    let (_, exit_code) = exec_command(
-        &sess,
-        &format!("test -f {}/meta.json", run_path)
-    )?;
+    let check_output = exec_command(&mut session, &format!("test -f {}/meta.json && echo ok", run_path))
+        .await?;
 
-    if exit_code != 0 {
+    if !check_output.trim().contains("ok") {
         return Err(anyhow!("Run {} does not have meta.json", run_name));
     }
 
     // Load metadata
-    let (start_time, end_time, status, config_json) = load_run_meta_ssh(&sess, &run_path)?;
+    let (start_time, end_time, status, config_json) =
+        load_run_meta_ssh(&mut session, &run_path).await?;
 
     // Load metrics
-    let metrics = load_metrics_ssh(&sess, &run_path)?;
+    let metrics = load_metrics_ssh(&mut session, &run_path).await?;
 
     // Load examples
-    let examples = load_examples_ssh(&sess, &run_path)?;
+    let examples = load_examples_ssh(&mut session, &run_path).await?;
 
     Ok(Run {
         name: run_name.to_string(),
@@ -164,20 +222,27 @@ pub fn load_run_ssh(config: &SshConfig, run_name: &str) -> Result<Run> {
     })
 }
 
-fn load_run_meta_ssh(
-    sess: &Session,
+async fn load_run_meta_ssh(
+    session: &mut Handle<Client>,
     run_path: &str,
-) -> Result<(Option<DateTime<Local>>, Option<DateTime<Local>>, RunStatus, Option<serde_json::Value>)> {
-    let (content, _) = exec_command(sess, &format!("cat {}/meta.json", run_path))?;
+) -> Result<(
+    Option<DateTime<Local>>,
+    Option<DateTime<Local>>,
+    RunStatus,
+    Option<serde_json::Value>,
+)> {
+    let content = exec_command(session, &format!("cat {}/meta.json", run_path)).await?;
 
-    let meta: RunMeta = serde_json::from_str(&content)
-        .context("Failed to parse meta.json")?;
+    let meta: RunMeta =
+        serde_json::from_str(&content).context("Failed to parse meta.json")?;
 
-    let start_time = meta.started_at
+    let start_time = meta
+        .started_at
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Local));
 
-    let end_time = meta.finished_at
+    let end_time = meta
+        .finished_at
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Local));
 
@@ -197,16 +262,23 @@ fn load_run_meta_ssh(
     Ok((start_time, end_time, status, meta.config))
 }
 
-fn load_metrics_ssh(sess: &Session, run_path: &str) -> Result<HashMap<String, Vec<MetricPoint>>> {
+async fn load_metrics_ssh(
+    session: &mut Handle<Client>,
+    run_path: &str,
+) -> Result<HashMap<String, Vec<MetricPoint>>> {
     let mut metrics = HashMap::new();
 
     // List all CSV files in metrics directory
-    let (stdout, exit_code) = exec_command(
-        sess,
-        &format!("cd {}/metrics 2>/dev/null && find . -name '*.csv' -type f || true", run_path)
-    )?;
+    let stdout = exec_command(
+        session,
+        &format!(
+            "cd {}/metrics 2>/dev/null && find . -name '*.csv' -type f || true",
+            run_path
+        ),
+    )
+    .await?;
 
-    if exit_code != 0 || stdout.trim().is_empty() {
+    if stdout.trim().is_empty() {
         return Ok(metrics);
     }
 
@@ -217,10 +289,11 @@ fn load_metrics_ssh(sess: &Session, run_path: &str) -> Result<HashMap<String, Ve
         }
 
         // Read the CSV file
-        let (csv_content, _) = exec_command(
-            sess,
-            &format!("cat {}/metrics/{}", run_path, csv_path)
-        )?;
+        let csv_content = exec_command(
+            session,
+            &format!("cat {}/metrics/{}", run_path, csv_path),
+        )
+        .await?;
 
         // Parse CSV
         let points = parse_metric_csv(&csv_content)?;
@@ -249,16 +322,23 @@ fn parse_metric_csv(content: &str) -> Result<Vec<MetricPoint>> {
     Ok(points)
 }
 
-fn load_examples_ssh(sess: &Session, run_path: &str) -> Result<HashMap<String, Vec<Example>>> {
+async fn load_examples_ssh(
+    session: &mut Handle<Client>,
+    run_path: &str,
+) -> Result<HashMap<String, Vec<Example>>> {
     let mut examples_map = HashMap::new();
 
     // List all JSONL files in examples directory
-    let (stdout, exit_code) = exec_command(
-        sess,
-        &format!("cd {}/examples 2>/dev/null && find . -name '*.jsonl' -type f || true", run_path)
-    )?;
+    let stdout = exec_command(
+        session,
+        &format!(
+            "cd {}/examples 2>/dev/null && find . -name '*.jsonl' -type f || true",
+            run_path
+        ),
+    )
+    .await?;
 
-    if exit_code != 0 || stdout.trim().is_empty() {
+    if stdout.trim().is_empty() {
         return Ok(examples_map);
     }
 
@@ -269,10 +349,11 @@ fn load_examples_ssh(sess: &Session, run_path: &str) -> Result<HashMap<String, V
         }
 
         // Read the JSONL file
-        let (jsonl_content, _) = exec_command(
-            sess,
-            &format!("cat {}/examples/{}", run_path, jsonl_path)
-        )?;
+        let jsonl_content = exec_command(
+            session,
+            &format!("cat {}/examples/{}", run_path, jsonl_path),
+        )
+        .await?;
 
         // Parse JSONL
         let examples = parse_examples_jsonl(&jsonl_content)?;
@@ -303,24 +384,4 @@ fn parse_examples_jsonl(content: &str) -> Result<Vec<Example>> {
 
     examples.sort_by_key(|e| e.step);
     Ok(examples)
-}
-
-/// Execute a command over SSH and return (stdout, exit_code)
-fn exec_command(sess: &Session, cmd: &str) -> Result<(String, i32)> {
-    let mut channel = sess.channel_session()
-        .context("Failed to open SSH channel")?;
-
-    channel.exec(cmd)
-        .context("Failed to execute command")?;
-
-    let mut stdout = String::new();
-    channel.read_to_string(&mut stdout)
-        .context("Failed to read stdout")?;
-
-    channel.wait_close()
-        .context("Failed to close channel")?;
-
-    let exit_code = channel.exit_status()?;
-
-    Ok((stdout, exit_code))
 }
