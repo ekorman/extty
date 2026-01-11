@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+  R2_BUCKET: ${{ vars.R2_BUCKET_NAME }}
 
 jobs:
   build-tui:
@@ -97,9 +97,9 @@ jobs:
       - name: Publish to PyPI server
         working-directory: python
         env:
-          TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
+          TWINE_USERNAME: ${{ vars.PYPI_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-          TWINE_REPOSITORY_URL: ${{ secrets.PYPI_REPOSITORY_URL }}
+          TWINE_REPOSITORY_URL: ${{ vars.PYPI_REPOSITORY_URL }}
         run: twine upload --verbose dist/*
 
   upload-r2:
@@ -117,9 +117,9 @@ jobs:
 
       - name: Upload to Cloudflare R2
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_ACCESS_KEY_ID: ${{ vars.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_ENDPOINT_URL: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           AWS_REGION: auto
         run: |
           VERSION=${GITHUB_REF_NAME}
