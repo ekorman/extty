@@ -18,20 +18,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: tui-rs
+            artifact: extty
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact: tui-rs
+            artifact: extty
             cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: tui-rs
+            artifact: extty
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: tui-rs
+            artifact: extty
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: tui-rs.exe
+            artifact: extty.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -57,23 +57,15 @@ jobs:
         working-directory: tui-rs
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Create archive (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          cd tui-rs/target/${{ matrix.target }}/release
-          tar -czvf ../../../../tui-rs-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
-
-      - name: Create archive (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd tui-rs/target/${{ matrix.target }}/release
-          7z a ../../../../tui-rs-${{ matrix.target }}.zip ${{ matrix.artifact }}
+      - name: Prepare artifact
+        shell: bash
+        run: cp tui-rs/target/${{ matrix.target }}/release/${{ matrix.artifact }} ./extty-${{ matrix.target }}${{ runner.os == 'Windows' && '.exe' || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tui-rs-${{ matrix.target }}
-          path: tui-rs-${{ matrix.target }}.*
+          name: extty-${{ matrix.target }}
+          path: extty-${{ matrix.target }}*
 
   publish-python:
     runs-on: ubuntu-latest
@@ -111,7 +103,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: tui-rs-*
+          pattern: extty-*
           path: artifacts
           merge-multiple: true
 
@@ -126,17 +118,17 @@ jobs:
 
           # Upload versioned files
           for file in artifacts/*; do
-            aws s3 cp "$file" "s3://$R2_BUCKET/tui-rs/$VERSION/$(basename $file)"
+            aws s3 cp "$file" "s3://$R2_BUCKET/extty/$VERSION/$(basename $file)"
           done
 
           # Also upload as 'latest'
           for file in artifacts/*; do
-            aws s3 cp "$file" "s3://$R2_BUCKET/tui-rs/latest/$(basename $file)"
+            aws s3 cp "$file" "s3://$R2_BUCKET/extty/latest/$(basename $file)"
           done
 
           # Create a simple version manifest
-          echo "$VERSION" | aws s3 cp - "s3://$R2_BUCKET/tui-rs/LATEST_VERSION"
+          echo "$VERSION" | aws s3 cp - "s3://$R2_BUCKET/extty/LATEST_VERSION"
 
           echo "Uploaded to R2:"
-          echo "  - tui-rs/$VERSION/"
-          echo "  - tui-rs/latest/"
+          echo "  - extty/$VERSION/"
+          echo "  - extty/latest/"

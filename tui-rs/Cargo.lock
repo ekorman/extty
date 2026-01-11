@@ -230,6 +230,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "extty"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm",
+ "csv",
+ "dirs",
+ "ratatui",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -699,20 +713,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "tui-rs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm",
- "csv",
- "dirs",
- "ratatui",
- "serde",
- "serde_json",
 ]
 
 [[package]]
