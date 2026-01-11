@@ -4,12 +4,19 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local};
+use once_cell::sync::Lazy;
 use russh::client::{self, Handle, Handler};
 use russh::keys::key;
 use russh_keys::load_secret_key;
 use serde::Deserialize;
+use tokio::runtime::Runtime;
 
 use crate::data::{Example, MetricPoint, Run, RunStatus};
+
+/// Global tokio runtime for SSH operations - reused across all calls
+static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Runtime::new().expect("Failed to create tokio runtime")
+});
 
 #[derive(Debug, Deserialize)]
 struct RunMeta {
@@ -149,10 +156,7 @@ async fn connect(config: &SshConfig) -> Result<Handle<Client>> {
 
 /// List all runs from a remote server via SSH
 pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
-    // Create a tokio runtime for async operations
-    let rt = tokio::runtime::Runtime::new()?;
-
-    rt.block_on(async {
+    RUNTIME.block_on(async {
         let mut session = connect(config).await?;
 
         // List directories in ~/.ex/runs/
@@ -184,8 +188,7 @@ pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
 
 /// Load a single run from SSH (creates a new connection)
 pub fn load_run_ssh(config: &SshConfig, run_name: &str) -> Result<Run> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    RUNTIME.block_on(async {
         let mut session = connect(config).await?;
         load_run_ssh_with_session(&mut session, run_name).await
     })

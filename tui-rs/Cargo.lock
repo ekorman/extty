@@ -662,6 +662,7 @@ dependencies = [
  "crossterm",
  "csv",
  "dirs",
+ "once_cell",
  "ratatui",
  "russh",
  "russh-keys",
