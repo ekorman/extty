@@ -101,6 +101,11 @@ pub fn load_runs() -> Vec<Run> {
     runs
 }
 
+// Reload a single run (public for refreshing)
+pub fn reload_run(path: &PathBuf) -> Option<Run> {
+    load_run(path)
+}
+
 // Load a single run from a directory
 fn load_run(path: &PathBuf) -> Option<Run> {
     let name = path.file_name()?.to_string_lossy().to_string();

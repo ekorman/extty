@@ -14,7 +14,7 @@ from typing import Any
 
 def get_runs_dir() -> Path:
     """Get the default runs directory (~/.extty/runs/)."""
-    return Path.home() / ".extty" / "runs"
+    return Path.home() / ".ex" / "runs"
 
 
 def sanitize_metric_name(name: str) -> str:

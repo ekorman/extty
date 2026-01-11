@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
@@ -72,6 +72,28 @@ impl App {
     fn update_size(&mut self, width: u16, height: u16) {
         self.term_width = width;
         self.term_height = height;
+    }
+
+    fn refresh_runs(&mut self) {
+        let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
+        self.runs = load_runs();
+
+        if let Some(name) = current_name {
+            if let Some(idx) = self.runs.iter().position(|r| r.name == name) {
+                self.selected_run = idx;
+            } else {
+                self.selected_run = self.selected_run.min(self.runs.len().saturating_sub(1));
+            }
+        }
+    }
+
+    fn refresh_current_run(&mut self) {
+        if let Some(run) = self.runs.get(self.selected_run) {
+            let path = run.path.clone();
+            if let Some(updated) = data::reload_run(&path) {
+                self.runs[self.selected_run] = updated;
+            }
+        }
     }
 
     fn grid_layout(&self) -> (usize, usize) {
@@ -252,11 +274,30 @@ fn main() -> Result<()> {
 
     // Create app and run event loop
     let mut app = App::new();
+    let mut last_list_refresh = Instant::now();
+    let mut last_data_refresh = Instant::now();
+    let list_refresh_interval = Duration::from_secs(3);
+    let data_refresh_interval = Duration::from_millis(500);
 
     while !app.should_quit {
         // Update terminal size
         let size = terminal.size()?;
         app.update_size(size.width, size.height);
+
+        // Periodic refresh of run list (less frequent)
+        if last_list_refresh.elapsed() >= list_refresh_interval {
+            app.refresh_runs();
+            last_list_refresh = Instant::now();
+            last_data_refresh = Instant::now();
+        }
+
+        // Faster refresh of current run data when viewing details
+        if matches!(app.view, View::Detail | View::Focused)
+            && last_data_refresh.elapsed() >= data_refresh_interval
+        {
+            app.refresh_current_run();
+            last_data_refresh = Instant::now();
+        }
 
         // Draw the UI
         terminal.draw(|frame| render(&app, frame))?;
