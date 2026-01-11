@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+
+jobs:
+  build-tui:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: tui-rs
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: tui-rs
+            cross: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: tui-rs
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: tui-rs
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: tui-rs.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.cross
+        working-directory: tui-rs
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build with cargo
+        if: ${{ !matrix.cross }}
+        working-directory: tui-rs
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd tui-rs/target/${{ matrix.target }}/release
+          tar -czvf ../../../../tui-rs-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd tui-rs/target/${{ matrix.target }}/release
+          7z a ../../../../tui-rs-${{ matrix.target }}.zip ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-rs-${{ matrix.target }}
+          path: tui-rs-${{ matrix.target }}.*
+
+  build-python:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build package
+        working-directory: python
+        run: python -m build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extty-python
+          path: python/dist/*
+
+  upload-r2:
+    needs: build-tui
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tui-rs-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REGION: auto
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+
+          # Upload versioned files
+          for file in artifacts/*; do
+            aws s3 cp "$file" "s3://$R2_BUCKET/tui-rs/$VERSION/$(basename $file)"
+          done
+
+          # Also upload as 'latest'
+          for file in artifacts/*; do
+            aws s3 cp "$file" "s3://$R2_BUCKET/tui-rs/latest/$(basename $file)"
+          done
+
+          # Create a simple version manifest
+          echo "$VERSION" | aws s3 cp - "s3://$R2_BUCKET/tui-rs/LATEST_VERSION"
+
+          echo "Uploaded to R2:"
+          echo "  - tui-rs/$VERSION/"
+          echo "  - tui-rs/latest/"
+
+  publish-pypi:
+    needs: build-python
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download Python artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: extty-python
+          path: dist
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install twine
+        run: pip install twine
+
+      - name: Publish to PyPI server
+        env:
+          TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
+          TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+          TWINE_REPOSITORY_URL: ${{ secrets.PYPI_REPOSITORY_URL }}
+        run: |
+          twine upload --verbose dist/*
