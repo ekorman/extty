@@ -170,8 +170,8 @@ pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
                 continue;
             }
 
-            // Load each run
-            if let Ok(run) = load_run_ssh_async(config, run_name).await {
+            // Load each run using the same session
+            if let Ok(run) = load_run_ssh_with_session(&mut session, run_name).await {
                 runs.push(run);
             }
         }
@@ -182,18 +182,21 @@ pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
     })
 }
 
-/// Load a single run from SSH
+/// Load a single run from SSH (creates a new connection)
 pub fn load_run_ssh(config: &SshConfig, run_name: &str) -> Result<Run> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(load_run_ssh_async(config, run_name))
+    rt.block_on(async {
+        let mut session = connect(config).await?;
+        load_run_ssh_with_session(&mut session, run_name).await
+    })
 }
 
-async fn load_run_ssh_async(config: &SshConfig, run_name: &str) -> Result<Run> {
-    let mut session = connect(config).await?;
+/// Load a single run using an existing SSH session (internal helper)
+async fn load_run_ssh_with_session(session: &mut Handle<Client>, run_name: &str) -> Result<Run> {
     let run_path = format!("~/.ex/runs/{}", run_name);
 
     // Check if meta.json exists
-    let check_output = exec_command(&mut session, &format!("test -f {}/meta.json && echo ok", run_path))
+    let check_output = exec_command(session, &format!("test -f {}/meta.json && echo ok", run_path))
         .await?;
 
     if !check_output.trim().contains("ok") {
@@ -202,13 +205,13 @@ async fn load_run_ssh_async(config: &SshConfig, run_name: &str) -> Result<Run> {
 
     // Load metadata
     let (start_time, end_time, status, config_json) =
-        load_run_meta_ssh(&mut session, &run_path).await?;
+        load_run_meta_ssh(session, &run_path).await?;
 
     // Load metrics
-    let metrics = load_metrics_ssh(&mut session, &run_path).await?;
+    let metrics = load_metrics_ssh(session, &run_path).await?;
 
     // Load examples
-    let examples = load_examples_ssh(&mut session, &run_path).await?;
+    let examples = load_examples_ssh(session, &run_path).await?;
 
     Ok(Run {
         name: run_name.to_string(),
