@@ -228,7 +228,7 @@ pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
         // List directories in ~/.ex/runs/
         let stdout = exec_command(
             &mut session,
-            "cd ~/.ex/runs 2>/dev/null && ls -1 || true",
+            "cd \"$HOME/.ex/runs\" 2>/dev/null && ls -1 || true",
         )
         .await?;
 
