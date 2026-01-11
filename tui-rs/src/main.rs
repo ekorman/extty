@@ -104,12 +104,21 @@ impl App {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
 
         // Refresh runs based on data source
-        self.runs = match &self.data_source {
+        // On error, keep the existing runs list instead of showing empty
+        let new_runs = match &self.data_source {
             DataSource::Local => load_runs(),
             DataSource::Ssh(config) => {
-                load_runs_ssh(config).unwrap_or_else(|_| vec![])
+                match load_runs_ssh(config) {
+                    Ok(runs) => runs,
+                    Err(_) => {
+                        // Keep existing runs on error instead of clearing them
+                        return;
+                    }
+                }
             }
         };
+
+        self.runs = new_runs;
 
         if let Some(name) = current_name {
             if let Some(idx) = self.runs.iter().position(|r| r.name == name) {
