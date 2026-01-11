@@ -8,6 +8,7 @@ interface ChartProps {
   data: MetricPoint[];
   width?: number;
   height?: number;
+  selected?: boolean;
 }
 
 export function Chart({
@@ -15,10 +16,18 @@ export function Chart({
   data,
   width = 40,
   height = 8,
+  selected = false,
 }: ChartProps): React.ReactElement {
+  const borderColor = selected ? "cyan" : "gray";
+
   if (data.length === 0) {
     return (
-      <Box flexDirection="column" width={width}>
+      <Box
+        flexDirection="column"
+        width={width}
+        borderStyle="round"
+        borderColor={borderColor}
+      >
         <Text bold color="cyan">
           {title}
         </Text>
@@ -31,16 +40,21 @@ export function Chart({
   const lastStep = data[data.length - 1]?.step ?? 0;
   const lastValue = values[values.length - 1] ?? 0;
 
-  const chartWidth = Math.max(width - 10, 10);
+  const chartWidth = Math.max(width - 12, 10);
   const sampled = sampleData(values, chartWidth);
 
   const chart = asciichart.plot(sampled, {
-    height: height - 2,
+    height: height - 4,
     format: (x: number) => x.toFixed(2).padStart(8),
   });
 
   return (
-    <Box flexDirection="column" width={width}>
+    <Box
+      flexDirection="column"
+      width={width}
+      borderStyle="round"
+      borderColor={borderColor}
+    >
       <Text bold color="cyan">
         {title}
       </Text>

@@ -29,6 +29,8 @@ export function App({ initialRun }: AppProps): React.ReactElement {
     message: string;
     success: boolean;
   } | null>(null);
+  const [selectedChartIndex, setSelectedChartIndex] = useState(0);
+  const [chartFocused, setChartFocused] = useState(false);
 
   // Clear screen helper to prevent leftover content when switching views
   const clearScreen = useCallback(() => {
@@ -74,12 +76,19 @@ export function App({ initialRun }: AppProps): React.ReactElement {
     setTimeout(() => setPushStatus(null), 3000);
   };
 
+  const metricNames = displayData ? Array.from(displayData.metrics.keys()) : [];
+  const chartCount = metricNames.length;
+
   useInput((input, key) => {
-    if (input === "q") {
-      if (view === "detail") {
+    if (input === "q" || key.escape) {
+      if (chartFocused) {
+        clearScreen();
+        setChartFocused(false);
+      } else if (view === "detail") {
         clearScreen();
         setView("list");
-        prevDataRef.current = null; // Clear when leaving detail view
+        prevDataRef.current = null;
+        setSelectedChartIndex(0);
       } else {
         exit();
       }
@@ -102,15 +111,40 @@ export function App({ initialRun }: AppProps): React.ReactElement {
         clearScreen();
         setView("detail");
       }
+    } else if (chartFocused) {
+      if (key.leftArrow && selectedChartIndex > 0) {
+        setSelectedChartIndex(selectedChartIndex - 1);
+      }
+      if (key.rightArrow && selectedChartIndex < chartCount - 1) {
+        setSelectedChartIndex(selectedChartIndex + 1);
+      }
     } else {
-      if (key.leftArrow && selectedIndex > 0) {
+      if (key.leftArrow && selectedChartIndex > 0) {
+        setSelectedChartIndex(selectedChartIndex - 1);
+      }
+      if (key.rightArrow && selectedChartIndex < chartCount - 1) {
+        setSelectedChartIndex(selectedChartIndex + 1);
+      }
+      if (key.upArrow && selectedChartIndex > 0) {
+        setSelectedChartIndex(Math.max(0, selectedChartIndex - 1));
+      }
+      if (key.downArrow && selectedChartIndex < chartCount - 1) {
+        setSelectedChartIndex(Math.min(chartCount - 1, selectedChartIndex + 1));
+      }
+      if (key.return && chartCount > 0) {
+        clearScreen();
+        setChartFocused(true);
+      }
+      if (input === "[" && selectedIndex > 0) {
         clearScreen();
         prevDataRef.current = null;
+        setSelectedChartIndex(0);
         setSelectedIndex(selectedIndex - 1);
       }
-      if (key.rightArrow && selectedIndex < runs.length - 1) {
+      if (input === "]" && selectedIndex < runs.length - 1) {
         clearScreen();
         prevDataRef.current = null;
+        setSelectedChartIndex(0);
         setSelectedIndex(selectedIndex + 1);
       }
     }
@@ -134,20 +168,43 @@ export function App({ initialRun }: AppProps): React.ReactElement {
     );
   }
 
-  const metricNames = Array.from(displayData.metrics.keys());
+  const termWidth = stdout.columns ?? 80;
+  const termHeight = stdout.rows ?? 24;
+
+  if (chartFocused) {
+    const focusedName = metricNames[selectedChartIndex];
+    const focusedData = displayData.metrics.get(focusedName) ?? [];
+    return (
+      <Box flexDirection="column" padding={1}>
+        <Chart
+          title={focusedName}
+          data={focusedData}
+          width={termWidth - 4}
+          height={termHeight - 6}
+        />
+        <Box paddingTop={1} gap={2}>
+          <Text dimColor>[q] back to grid</Text>
+          <Text dimColor>
+            [←→] chart {selectedChartIndex + 1}/{chartCount}
+          </Text>
+        </Box>
+      </Box>
+    );
+  }
 
   return (
     <Box flexDirection="column">
       <RunHeader meta={displayData.meta} metrics={displayData.metrics} />
 
       <Box flexDirection="row" flexWrap="wrap" gap={2} padding={1}>
-        {metricNames.map((name) => (
+        {metricNames.map((name, index) => (
           <Chart
             key={name}
             title={name}
             data={displayData.metrics.get(name) ?? []}
             width={45}
             height={10}
+            selected={index === selectedChartIndex}
           />
         ))}
       </Box>
@@ -170,8 +227,10 @@ export function App({ initialRun }: AppProps): React.ReactElement {
 
       <Box paddingX={1} paddingY={0} gap={2}>
         <Text dimColor>[q] back</Text>
+        <Text dimColor>[←→↑↓] select chart</Text>
+        <Text dimColor>[Enter] focus</Text>
         <Text dimColor>
-          [←→] switch runs ({selectedIndex + 1}/{runs.length})
+          [&#91;&#93;] run {selectedIndex + 1}/{runs.length}
         </Text>
         <Text dimColor>[p] push</Text>
       </Box>

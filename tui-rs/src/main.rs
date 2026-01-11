@@ -9,8 +9,15 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
 };
+
+// Cyberpunk color palette
+const NEON_CYAN: Color = Color::Rgb(0, 255, 255);
+const NEON_MAGENTA: Color = Color::Rgb(255, 0, 128);
+const NEON_GREEN: Color = Color::Rgb(0, 255, 136);
+const NEON_YELLOW: Color = Color::Rgb(255, 255, 0);
+const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
 use data::{load_runs, MetricPoint, Run};
@@ -39,6 +46,7 @@ struct App {
     scroll_offset: usize,
     view: View,
     should_quit: bool,
+    show_config: bool,
     // Terminal dimensions for layout calculations
     term_width: u16,
     term_height: u16,
@@ -55,6 +63,7 @@ impl App {
             scroll_offset: 0,
             view: View::List,
             should_quit: false,
+            show_config: false,
             term_width: 80,
             term_height: 24,
         }
@@ -186,6 +195,9 @@ impl App {
             KeyCode::PageDown | KeyCode::Char('j') => {
                 self.scroll_offset = (self.scroll_offset + 1).min(max_scroll);
             }
+            KeyCode::Char('c') => {
+                self.show_config = !self.show_config;
+            }
             _ => {}
         }
     }
@@ -277,30 +289,91 @@ fn render(app: &App, frame: &mut Frame) {
 fn render_list(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
-    // Create list items from runs
+    // Create list items from runs with styling
     let items: Vec<ListItem> = app
         .runs
         .iter()
-        .map(|run| ListItem::new(run.name.clone()))
+        .enumerate()
+        .map(|(i, run)| {
+            let is_running = run.is_running();
+            let is_selected = i == app.selected_run;
+
+            let (status_icon, status_color) = if is_running {
+                ("● ", NEON_GREEN)
+            } else {
+                ("○ ", Color::DarkGray)
+            };
+
+            let name_style = if is_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if is_running {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let start_str = run.start_time
+                .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "—".to_string());
+
+            let end_str = if is_running {
+                "running...".to_string()
+            } else {
+                run.end_time
+                    .map(|t| t.format("%H:%M").to_string())
+                    .unwrap_or_else(|| "—".to_string())
+            };
+
+            let time_style = if is_running {
+                Style::default().fg(NEON_YELLOW)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(status_icon, Style::default().fg(status_color)),
+                Span::styled(run.name.clone(), name_style),
+                Span::styled("  ", Style::default()),
+                Span::styled(start_str, Style::default().fg(Color::DarkGray)),
+                Span::styled(" → ", Style::default().fg(DIM_CYAN)),
+                Span::styled(end_str, time_style),
+            ]))
+        })
         .collect();
 
     let mut state = ListState::default();
     state.select(Some(app.selected_run));
 
     let list = List::new(items)
-        .block(Block::default().title("Runs").borders(Borders::ALL))
-        .highlight_style(Style::default().bg(Color::DarkGray).bold())
-        .highlight_symbol("> ");
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " ◆ TRAINING RUNS ",
+                    Style::default().fg(NEON_CYAN).bold(),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIM_CYAN)),
+        )
+        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
+        .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(list, area, &mut state);
 
-    // Help text at bottom
-    let help = "[up/down] navigate  [Enter] select  [q] quit";
+    // Help text at bottom with styling
+    let help = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+        Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Enter", Style::default().fg(NEON_CYAN)),
+        Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+    ]);
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
-    frame.render_widget(
-        Paragraph::new(help).style(Style::default().dim()),
-        help_area,
-    );
+    frame.render_widget(Paragraph::new(help), help_area);
 }
 
 fn render_detail(app: &App, frame: &mut Frame) {
@@ -311,24 +384,39 @@ fn render_detail(app: &App, frame: &mut Frame) {
         return;
     };
 
-    // Layout: header, charts area, footer
+    // Layout: header, main content, footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // header
-            Constraint::Min(10),    // charts
+            Constraint::Min(10),    // main content
             Constraint::Length(1),  // footer
         ])
         .split(area);
 
+    // Split main content horizontally if config panel is shown
+    let config_width = 35u16;
+    let (grid_area, config_area) = if app.show_config && run.config.is_some() {
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(40),
+                Constraint::Length(config_width),
+            ])
+            .split(chunks[1]);
+        (h_chunks[0], Some(h_chunks[1]))
+    } else {
+        (chunks[1], None)
+    };
+
     // Calculate scroll info for header
     let card_width = 40u16;
     let card_height = 12u16;
-    let cols = (chunks[1].width / card_width).max(1) as usize;
+    let cols = (grid_area.width / card_width).max(1) as usize;
     let cards = app.cards();
     let total_cards = cards.len();
     let total_rows = (total_cards + cols - 1) / cols;
-    let visible_rows = (chunks[1].height / card_height) as usize;
+    let visible_rows = (grid_area.height / card_height) as usize;
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let scroll = app.scroll_offset.min(max_scroll);
 
@@ -347,29 +435,58 @@ fn render_detail(app: &App, frame: &mut Frame) {
     };
 
     let total_examples: usize = run.examples.values().map(|v| v.len()).sum();
-    let header = Paragraph::new(format!(
-        "Run: {}  ({} charts, {} examples){}",
-        run.name,
-        run.metrics.len(),
-        total_examples,
-        scroll_indicator
-    ))
-    .block(Block::default().borders(Borders::ALL));
+    let header_text = Line::from(vec![
+        Span::styled("◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled(&run.name, Style::default().fg(NEON_CYAN).bold()),
+        Span::styled("  │  ", Style::default().fg(DIM_CYAN)),
+        Span::styled(format!("{}", run.metrics.len()), Style::default().fg(NEON_GREEN)),
+        Span::styled(" charts  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", total_examples), Style::default().fg(NEON_YELLOW)),
+        Span::styled(" examples", Style::default().fg(Color::DarkGray)),
+        Span::styled(&scroll_indicator, Style::default().fg(NEON_MAGENTA)),
+    ]);
+    let header = Paragraph::new(header_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DIM_CYAN)),
+    );
     frame.render_widget(header, chunks[0]);
 
     // Cards grid
-    render_cards_grid(app, frame, chunks[1], &cards);
+    render_cards_grid(app, frame, grid_area, &cards);
 
-    // Footer
-    let footer = format!(
-        "[q] back  [arrows] select  [Enter] focus  [j/k] scroll  [[] []] run {}/{}",
-        app.selected_run + 1,
-        app.runs.len()
-    );
-    frame.render_widget(
-        Paragraph::new(footer).style(Style::default().dim()),
-        chunks[2],
-    );
+    // Config panel (if shown)
+    if let Some(config_area) = config_area {
+        if let Some(config) = &run.config {
+            render_config_panel(frame, config_area, config);
+        }
+    }
+
+    // Footer with styled keys
+    let config_hint = if app.show_config { "hide" } else { "config" };
+    let footer = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("↑↓←→", Style::default().fg(NEON_CYAN)),
+        Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+        Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("c", Style::default().fg(NEON_CYAN)),
+        Span::styled(format!("] {}  ", config_hint), Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("[]", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] run ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}/{}", app.selected_run + 1, app.runs.len()),
+            Style::default().fg(NEON_YELLOW),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
 fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
@@ -426,18 +543,97 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
     }
 }
 
+fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value) {
+    let mut lines: Vec<Line> = Vec::new();
+    render_json_value(config, 0, &mut lines);
+
+    let block = Block::default()
+        .title(Span::styled(" CONFIG ", Style::default().fg(NEON_CYAN).bold()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
+}
+
+fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<Line>) {
+    let pad = "  ".repeat(indent);
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                match val {
+                    serde_json::Value::Object(_) => {
+                        lines.push(Line::from(vec![
+                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(format!("{}:", key), Style::default().fg(NEON_MAGENTA)),
+                        ]));
+                        render_json_value(val, indent + 1, lines);
+                    }
+                    serde_json::Value::Array(arr) => {
+                        lines.push(Line::from(vec![
+                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
+                            Span::styled(format!("[{}]", arr.len()), Style::default().fg(Color::DarkGray)),
+                        ]));
+                    }
+                    _ => {
+                        let val_str = format_json_primitive(val);
+                        lines.push(Line::from(vec![
+                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
+                            Span::styled(val_str, Style::default().fg(Color::White)),
+                        ]));
+                    }
+                }
+            }
+        }
+        _ => {
+            let val_str = format_json_primitive(value);
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", pad, val_str),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+}
+
+fn format_json_primitive(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => format!("[{} items]", arr.len()),
+        serde_json::Value::Object(_) => "{...}".to_string(),
+    }
+}
+
 fn render_chart(frame: &mut Frame, area: Rect, title: &str, points: &[MetricPoint], selected: bool) {
     use ratatui::widgets::{Axis, Chart, Dataset, GraphType};
     use ratatui::symbols::Marker;
 
-    let border_color = if selected { Color::Cyan } else { Color::DarkGray };
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
 
     if points.is_empty() {
         let block = Block::default()
-            .title(title)
+            .title(Span::styled(title, title_style))
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
-        frame.render_widget(Paragraph::new("No data").block(block), area);
+        frame.render_widget(
+            Paragraph::new(Span::styled("No data", Style::default().fg(Color::DarkGray)))
+                .block(block),
+            area,
+        );
         return;
     }
 
@@ -461,30 +657,36 @@ fn render_chart(frame: &mut Frame, area: Rect, title: &str, points: &[MetricPoin
     let dataset = Dataset::default()
         .marker(Marker::Braille)
         .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(NEON_GREEN))
         .data(&data);
+
+    let axis_style = Style::default().fg(DIM_CYAN);
+    let label_style = Style::default().fg(Color::DarkGray);
 
     let chart = Chart::new(vec![dataset])
         .block(
             Block::default()
-                .title(title)
+                .title(Span::styled(title, title_style))
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(border_color)),
         )
         .x_axis(
             Axis::default()
+                .style(axis_style)
                 .bounds([x_min, x_max])
                 .labels(vec![
-                    Span::raw(format!("{:.0}", x_min)),
-                    Span::raw(format!("{:.0}", x_max)),
+                    Span::styled(format!("{:.0}", x_min), label_style),
+                    Span::styled(format!("{:.0}", x_max), label_style),
                 ]),
         )
         .y_axis(
             Axis::default()
+                .style(axis_style)
                 .bounds([y_min, y_max])
                 .labels(vec![
-                    Span::raw(format!("{:.2}", y_min)),
-                    Span::raw(format!("{:.2}", y_max)),
+                    Span::styled(format!("{:.2}", y_min), label_style),
+                    Span::styled(format!("{:.2}", y_max), label_style),
                 ]),
         );
 
@@ -498,31 +700,48 @@ fn render_examples_card(
     examples: &[data::Example],
     selected: bool,
 ) {
-    let border_color = if selected { Color::Cyan } else { Color::DarkGray };
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
 
     // Show the latest example as preview
-    let content = if let Some(example) = examples.last() {
+    let content: Vec<Line> = if let Some(example) = examples.last() {
         let max_lines = area.height.saturating_sub(4) as usize;
-        let prompt_preview: String = example
-            .prompt
-            .chars()
-            .take(50)
-            .collect::<String>();
-        let response_preview: String = example
+        let prompt_preview: String = example.prompt.chars().take(50).collect();
+        let response_lines: Vec<&str> = example
             .response
             .lines()
             .take(max_lines.saturating_sub(2))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect();
 
-        format!("Q: {}...\n\nA: {}", prompt_preview, response_preview)
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Q: ", Style::default().fg(NEON_YELLOW).bold()),
+                Span::styled(format!("{}...", prompt_preview), Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("A: ", Style::default().fg(NEON_GREEN).bold())),
+        ];
+        for line in response_lines {
+            lines.push(Line::from(Span::styled(line, Style::default().fg(Color::Gray))));
+        }
+        lines
     } else {
-        "No examples".to_string()
+        vec![Line::from(Span::styled("No examples", Style::default().fg(Color::DarkGray)))]
     };
 
+    let title = Line::from(vec![
+        Span::styled(format!("{} ", name), title_style),
+        Span::styled(format!("({} total)", examples.len()), Style::default().fg(Color::DarkGray)),
+    ]);
+
     let block = Block::default()
-        .title(format!("Examples: {} ({} total)", name, examples.len()))
+        .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
     let paragraph = Paragraph::new(content)
@@ -555,36 +774,50 @@ fn render_focused(app: &App, frame: &mut Frame) {
     match card {
         Card::Chart { name } => {
             if let Some(points) = run.metrics.get(name) {
-                render_chart(frame, chunks[0], name, points, false);
+                render_chart(frame, chunks[0], name, points, true);
             }
             // Footer for charts
-            let footer = format!(
-                "[q] back  [left/right] card {}/{}",
-                app.selected_card + 1,
-                cards.len()
-            );
-            frame.render_widget(
-                Paragraph::new(footer).style(Style::default().dim()),
-                chunks[1],
-            );
+            let footer = Line::from(vec![
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+                Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}/{}", app.selected_card + 1, cards.len()),
+                    Style::default().fg(NEON_GREEN),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
         Card::Examples { name } => {
             if let Some(examples) = run.examples.get(name) {
                 if let Some(example) = examples.get(app.selected_example) {
-                    render_focused_example(frame, chunks[0], name, app.selected_example, example);
+                    render_focused_example(frame, chunks[0], name, app.selected_example, examples.len(), example);
                 }
                 // Footer for examples
-                let footer = format!(
-                    "[q] back  [left/right] card {}/{}  [up/down] example {}/{}",
-                    app.selected_card + 1,
-                    cards.len(),
-                    app.selected_example + 1,
-                    examples.len()
-                );
-                frame.render_widget(
-                    Paragraph::new(footer).style(Style::default().dim()),
-                    chunks[1],
-                );
+                let footer = Line::from(vec![
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+                    Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}", app.selected_card + 1, cards.len()),
+                        Style::default().fg(NEON_GREEN),
+                    ),
+                    Span::styled("  ", Style::default()),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] example ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}", app.selected_example + 1, examples.len()),
+                        Style::default().fg(NEON_YELLOW),
+                    ),
+                ]);
+                frame.render_widget(Paragraph::new(footer), chunks[1]);
             }
         }
     }
@@ -595,32 +828,53 @@ fn render_focused_example(
     area: Rect,
     group_name: &str,
     index: usize,
+    total: usize,
     example: &data::Example,
 ) {
     // Layout: prompt and response
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
-    // Prompt
+    // Prompt title
+    let prompt_title = Line::from(vec![
+        Span::styled("◆ PROMPT ", Style::default().fg(NEON_YELLOW).bold()),
+        Span::styled("│ ", Style::default().fg(DIM_CYAN)),
+        Span::styled(group_name, Style::default().fg(NEON_MAGENTA)),
+        Span::styled(format!(" #{}", index + 1), Style::default().fg(Color::White)),
+        Span::styled(format!("/{}", total), Style::default().fg(Color::DarkGray)),
+        Span::styled(" │ ", Style::default().fg(DIM_CYAN)),
+        Span::styled("step ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", example.step), Style::default().fg(NEON_CYAN)),
+    ]);
+
     let prompt = Paragraph::new(example.prompt.clone())
+        .style(Style::default().fg(Color::White))
         .block(
             Block::default()
-                .title(format!(
-                    "Prompt ({} #{}, step {})",
-                    group_name,
-                    index + 1,
-                    example.step
-                ))
-                .borders(Borders::ALL),
+                .title(prompt_title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIM_CYAN)),
         )
         .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(prompt, chunks[0]);
 
-    // Response
+    // Response title
+    let response_title = Line::from(vec![
+        Span::styled("◆ RESPONSE ", Style::default().fg(NEON_GREEN).bold()),
+    ]);
+
     let response = Paragraph::new(example.response.clone())
-        .block(Block::default().title("Response").borders(Borders::ALL))
+        .style(Style::default().fg(Color::Gray))
+        .block(
+            Block::default()
+                .title(response_title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIM_CYAN)),
+        )
         .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(response, chunks[1]);
 }

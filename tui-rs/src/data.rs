@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
+use chrono::{DateTime, Local};
 use serde::Deserialize;
 
 // A single data point in a metric time series
@@ -20,6 +21,14 @@ pub struct Example {
     pub response: String,
 }
 
+// Run status
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunStatus {
+    Running,
+    Completed,
+    Unknown,
+}
+
 // A training run with its metrics and examples
 #[derive(Debug)]
 pub struct Run {
@@ -28,6 +37,28 @@ pub struct Run {
     pub path: PathBuf,
     pub metrics: HashMap<String, Vec<MetricPoint>>,
     pub examples: HashMap<String, Vec<Example>>,
+    pub start_time: Option<DateTime<Local>>,
+    pub end_time: Option<DateTime<Local>>,
+    pub status: RunStatus,
+    pub config: Option<serde_json::Value>,
+}
+
+impl Run {
+    pub fn is_running(&self) -> bool {
+        self.status == RunStatus::Running
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RunMeta {
+    #[allow(dead_code)]
+    project: Option<String>,
+    #[allow(dead_code)]
+    run_name: Option<String>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    status: Option<String>,
+    config: Option<serde_json::Value>,
 }
 
 // Get the directory where runs are stored
@@ -76,12 +107,51 @@ fn load_run(path: &PathBuf) -> Option<Run> {
     let metrics = load_metrics(path);
     let examples = load_examples(path);
 
+    let (start_time, end_time, status, config) = load_run_meta(path);
+
     Some(Run {
         name,
         path: path.clone(),
         metrics,
         examples,
+        start_time,
+        end_time,
+        status,
+        config,
     })
+}
+
+fn load_run_meta(path: &PathBuf) -> (Option<DateTime<Local>>, Option<DateTime<Local>>, RunStatus, Option<serde_json::Value>) {
+    let meta_path = path.join("meta.json");
+    let Ok(content) = fs::read_to_string(&meta_path) else {
+        return (None, None, RunStatus::Unknown, None);
+    };
+
+    let Ok(meta) = serde_json::from_str::<RunMeta>(&content) else {
+        return (None, None, RunStatus::Unknown, None);
+    };
+
+    let start_time = meta.started_at
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Local));
+
+    let end_time = meta.finished_at
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Local));
+
+    let status = match meta.status.as_deref() {
+        Some("completed") => RunStatus::Completed,
+        Some("running") => RunStatus::Running,
+        _ => {
+            if end_time.is_some() {
+                RunStatus::Completed
+            } else {
+                RunStatus::Running
+            }
+        }
+    };
+
+    (start_time, end_time, status, meta.config)
 }
 
 // Load all metrics from a run directory (recursively)
