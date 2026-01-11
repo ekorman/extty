@@ -99,7 +99,13 @@ impl Handler for Client {
         &mut self,
         _server_public_key: &key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // Accept all host keys (similar to ssh2's AutoAddPolicy)
+        // WARNING: accepting all host keys without verification is insecure and
+        // makes the connection susceptible to man-in-the-middle attacks.
+        // Consider implementing proper host key verification against known_hosts
+        // before using this in production.
+        eprintln!(
+            "Warning: SSH host key verification is disabled; accepting server key without checking known_hosts."
+        );
         Ok(true)
     }
 }
