@@ -144,7 +144,6 @@ async fn connect(config: &SshConfig) -> Result<Handle<Client>> {
     // Try common key files
     let key_files = vec!["id_rsa", "id_ed25519", "id_ecdsa"];
     let mut tried_keys = Vec::new();
-    let mut encrypted_keys = Vec::new();
 
     for key_file in key_files {
         let key_path = ssh_dir.join(key_file);
@@ -154,6 +153,7 @@ async fn connect(config: &SshConfig) -> Result<Handle<Client>> {
 
         tried_keys.push(key_file.to_string());
 
+        // First try without password
         match load_secret_key(&key_path, None) {
             Ok(key_pair) => {
                 let auth_result = session
@@ -169,7 +169,27 @@ async fn connect(config: &SshConfig) -> Result<Handle<Client>> {
                 // Check if error suggests the key is encrypted
                 let error_msg = e.to_string().to_lowercase();
                 if error_msg.contains("encrypted") || error_msg.contains("password") {
-                    encrypted_keys.push(key_file.to_string());
+                    // Prompt for password
+                    eprintln!("Key {} is encrypted.", key_file);
+                    match rpassword::prompt_password(format!("Enter passphrase for {}: ", key_file)) {
+                        Ok(password) => {
+                            // Try loading with password
+                            if let Ok(key_pair) = load_secret_key(&key_path, Some(&password)) {
+                                let auth_result = session
+                                    .authenticate_publickey(&config.username, Arc::new(key_pair))
+                                    .await;
+
+                                if let Ok(true) = auth_result {
+                                    return Ok(session);
+                                }
+                            }
+                            // Password was wrong or auth failed - continue to next key
+                        }
+                        Err(_) => {
+                            // Failed to read password - skip this key
+                            continue;
+                        }
+                    }
                 }
                 // Otherwise key load failed for other reasons - continue to next key
             }
@@ -177,17 +197,10 @@ async fn connect(config: &SshConfig) -> Result<Handle<Client>> {
     }
 
     // Provide informative error message
-    if !encrypted_keys.is_empty() {
-        Err(anyhow!(
-            "SSH authentication failed. Found password-protected keys: {}. \
-             Password-protected keys are not supported. \
-             Please use an unencrypted key or add your key to ssh-agent.",
-            encrypted_keys.join(", ")
-        ))
-    } else if !tried_keys.is_empty() {
+    if !tried_keys.is_empty() {
         Err(anyhow!(
             "SSH authentication failed. Tried keys: {} in ~/.ssh/. \
-             Keys may be wrong type, have wrong permissions, or not authorized on server.",
+             Keys may have wrong permissions, wrong password, or not be authorized on server.",
             tried_keys.join(", ")
         ))
     } else {
