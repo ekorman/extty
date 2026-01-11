@@ -2,6 +2,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -20,7 +21,19 @@ const NEON_YELLOW: Color = Color::Rgb(255, 255, 0);
 const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
+mod ssh_source;
 use data::{load_runs, MetricPoint, Run};
+use ssh_source::{SshConfig, load_runs_ssh, load_run_ssh};
+
+/// Terminal UI for viewing ML experiment runs
+#[derive(Parser, Debug)]
+#[command(name = "extty")]
+#[command(about = "Terminal-native ML experiment tracker", long_about = None)]
+struct Args {
+    /// SSH server to read runs from (format: user@host or host)
+    #[arg(long, value_name = "USER@HOST")]
+    server: Option<String>,
+}
 
 // The views in our app
 #[derive(Clone, Copy, PartialEq)]
@@ -37,6 +50,12 @@ enum Card {
     Examples { name: String },
 }
 
+// Data source configuration
+enum DataSource {
+    Local,
+    Ssh(SshConfig),
+}
+
 // All application state lives here
 struct App {
     runs: Vec<Run>,
@@ -50,12 +69,18 @@ struct App {
     // Terminal dimensions for layout calculations
     term_width: u16,
     term_height: u16,
+    // Data source (local or SSH)
+    data_source: DataSource,
 }
 
 impl App {
-    fn new() -> Self {
-        let runs = load_runs();
-        App {
+    fn new(data_source: DataSource) -> Result<Self> {
+        let runs = match &data_source {
+            DataSource::Local => load_runs(),
+            DataSource::Ssh(config) => load_runs_ssh(config)?,
+        };
+
+        Ok(App {
             runs,
             selected_run: 0,
             selected_card: 0,
@@ -66,7 +91,8 @@ impl App {
             show_config: false,
             term_width: 80,
             term_height: 24,
-        }
+            data_source,
+        })
     }
 
     fn update_size(&mut self, width: u16, height: u16) {
@@ -76,7 +102,14 @@ impl App {
 
     fn refresh_runs(&mut self) {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
-        self.runs = load_runs();
+
+        // Refresh runs based on data source
+        self.runs = match &self.data_source {
+            DataSource::Local => load_runs(),
+            DataSource::Ssh(config) => {
+                load_runs_ssh(config).unwrap_or_else(|_| vec![])
+            }
+        };
 
         if let Some(name) = current_name {
             if let Some(idx) = self.runs.iter().position(|r| r.name == name) {
@@ -89,8 +122,19 @@ impl App {
 
     fn refresh_current_run(&mut self) {
         if let Some(run) = self.runs.get(self.selected_run) {
-            let path = run.path.clone();
-            if let Some(updated) = data::reload_run(&path) {
+            let run_name = run.name.clone();
+
+            let updated = match &self.data_source {
+                DataSource::Local => {
+                    let path = run.path.clone();
+                    data::reload_run(&path)
+                }
+                DataSource::Ssh(config) => {
+                    load_run_ssh(config, &run_name).ok()
+                }
+            };
+
+            if let Some(updated) = updated {
                 self.runs[self.selected_run] = updated;
             }
         }
@@ -265,6 +309,17 @@ impl App {
 }
 
 fn main() -> Result<()> {
+    // Parse command line arguments
+    let args = Args::parse();
+
+    // Determine data source
+    let data_source = if let Some(server) = args.server {
+        let config = SshConfig::parse(&server)?;
+        DataSource::Ssh(config)
+    } else {
+        DataSource::Local
+    };
+
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -273,7 +328,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run event loop
-    let mut app = App::new();
+    let mut app = App::new(data_source)?;
     let mut last_list_refresh = Instant::now();
     let mut last_data_refresh = Instant::now();
     let list_refresh_interval = Duration::from_secs(3);
