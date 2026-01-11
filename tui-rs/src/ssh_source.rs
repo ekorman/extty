@@ -15,7 +15,10 @@ use crate::data::{Example, MetricPoint, Run, RunStatus};
 
 /// Global tokio runtime for SSH operations - reused across all calls
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    Runtime::new().expect("Failed to create tokio runtime")
+    Runtime::new().unwrap_or_else(|e| {
+        eprintln!("Failed to create tokio runtime for SSH operations: {e}");
+        std::process::exit(1);
+    })
 });
 
 #[derive(Debug, Deserialize)]
