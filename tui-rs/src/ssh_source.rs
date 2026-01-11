@@ -143,11 +143,19 @@ async fn connect(config: &SshConfig) -> Result<Handle<Client>> {
 
     // Try common key files
     let key_files = vec!["id_rsa", "id_ed25519", "id_ecdsa"];
+    let mut tried_keys = Vec::new();
+    let mut encrypted_keys = Vec::new();
 
     for key_file in key_files {
         let key_path = ssh_dir.join(key_file);
-        if key_path.exists() {
-            if let Ok(key_pair) = load_secret_key(key_path, None) {
+        if !key_path.exists() {
+            continue;
+        }
+
+        tried_keys.push(key_file.to_string());
+
+        match load_secret_key(&key_path, None) {
+            Ok(key_pair) => {
                 let auth_result = session
                     .authenticate_publickey(&config.username, Arc::new(key_pair))
                     .await;
@@ -155,11 +163,39 @@ async fn connect(config: &SshConfig) -> Result<Handle<Client>> {
                 if let Ok(true) = auth_result {
                     return Ok(session);
                 }
+                // Key loaded but auth failed - continue to next key
+            }
+            Err(e) => {
+                // Check if error suggests the key is encrypted
+                let error_msg = e.to_string().to_lowercase();
+                if error_msg.contains("encrypted") || error_msg.contains("password") {
+                    encrypted_keys.push(key_file.to_string());
+                }
+                // Otherwise key load failed for other reasons - continue to next key
             }
         }
     }
 
-    Err(anyhow!("SSH authentication failed - no valid keys found"))
+    // Provide informative error message
+    if !encrypted_keys.is_empty() {
+        Err(anyhow!(
+            "SSH authentication failed. Found password-protected keys: {}. \
+             Password-protected keys are not supported. \
+             Please use an unencrypted key or add your key to ssh-agent.",
+            encrypted_keys.join(", ")
+        ))
+    } else if !tried_keys.is_empty() {
+        Err(anyhow!(
+            "SSH authentication failed. Tried keys: {} in ~/.ssh/. \
+             Keys may be wrong type, have wrong permissions, or not authorized on server.",
+            tried_keys.join(", ")
+        ))
+    } else {
+        Err(anyhow!(
+            "SSH authentication failed. No SSH keys found in ~/.ssh/. \
+             Expected to find id_rsa, id_ed25519, or id_ecdsa."
+        ))
+    }
 }
 
 /// List all runs from a remote server via SSH
