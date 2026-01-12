@@ -317,6 +317,11 @@ async fn ensure_session(config: &SshConfig) -> Result<()> {
 
 /// Load a single run using an existing SSH session (internal helper)
 async fn load_run_ssh_with_session(session: &mut Handle<Client>, run_name: &str) -> Result<Run> {
+    // Validate run_name to prevent path traversal or injection of path separators.
+    // We only expect simple directory names here.
+    if run_name.contains('/') || run_name.contains('\\') || run_name.contains("..") {
+        return Err(anyhow!("Invalid run name: {}", run_name));
+    }
     let run_path = format!("~/.ex/runs/{}", run_name);
 
     // Check if meta.json exists (use || true to ensure exit code 0)
