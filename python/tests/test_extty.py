@@ -47,7 +47,7 @@ class TestRunStorage:
         shutil.rmtree(temp_dir)
 
     def test_creates_directory_structure(self, temp_run_dir: Path) -> None:
-        storage = RunStorage(run_dir=temp_run_dir / "test-run")
+        RunStorage(run_dir=temp_run_dir / "test-run")
         assert (temp_run_dir / "test-run").exists()
         assert (temp_run_dir / "test-run" / "metrics").exists()
         assert (temp_run_dir / "test-run" / "examples").exists()

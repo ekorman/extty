@@ -17,7 +17,7 @@ def test_db() -> Generator[Database, None, None]:
     """Create a test database for each test."""
     # Create a temporary database file
     db_fd, db_path = tempfile.mkstemp(suffix=".db")
-    
+
     try:
         # Create database instance with temp path
         db = Database(db_path=Path(db_path))
@@ -31,6 +31,7 @@ def test_db() -> Generator[Database, None, None]:
 @pytest.fixture(scope="function")
 def client(test_db: Database) -> TestClient:
     """Create a test client with a test database."""
+
     def override_get_db():
         with test_db.get_connection() as conn:
             yield conn

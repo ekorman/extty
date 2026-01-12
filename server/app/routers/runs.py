@@ -129,7 +129,9 @@ def list_runs(
 ) -> list[RunSchema]:
     """List runs with optional filters."""
     # Build query dynamically
-    query_parts = ["SELECT r.*, p.name as project_name FROM runs r JOIN projects p ON r.project_id = p.id"]
+    query_parts = [
+        "SELECT r.*, p.name as project_name FROM runs r JOIN projects p ON r.project_id = p.id"
+    ]
     params = []
     where_clauses = []
 
@@ -274,5 +276,8 @@ def get_metric_points(
         (metric_id,),
     )
 
-    points = [{"step": row[0], "value": row[1], "timestamp": row[2]} for row in cursor.fetchall()]
+    points = [
+        {"step": row[0], "value": row[1], "timestamp": row[2]}
+        for row in cursor.fetchall()
+    ]
     return points
