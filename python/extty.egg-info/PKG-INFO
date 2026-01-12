@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: extty
+Version: 0.1.dev5+gba0b3605d
+Summary: Terminal-native ML experiment tracker
+Requires-Python: >=3.10
+Requires-Dist: psutil>=5.9.0
+Provides-Extra: gpu
+Requires-Dist: nvidia-ml-py>=12.0.0; extra == "gpu"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
+Requires-Dist: pre-commit>=4.5.1; extra == "dev"
