@@ -27,7 +27,9 @@ def get_project_runs(
 ) -> list[RunSchema]:
     """Get all runs for a project."""
     # Check if project exists
-    cursor = conn.execute("SELECT id, name FROM projects WHERE name = ?", (project_name,))
+    cursor = conn.execute(
+        "SELECT id, name FROM projects WHERE name = ?", (project_name,)
+    )
     project = cursor.fetchone()
 
     if not project:

@@ -1,8 +1,5 @@
 """Tests for metrics endpoints."""
 
-import urllib.parse
-
-import pytest
 from fastapi.testclient import TestClient
 
 
@@ -184,8 +181,7 @@ def test_metric_with_many_points(client: TestClient):
     """Test metric with many data points."""
     # Create 100 metric points
     points = [
-        {"step": i, "value": 1.0 / (i + 1), "timestamp": 1000.0 + i}
-        for i in range(100)
+        {"step": i, "value": 1.0 / (i + 1), "timestamp": 1000.0 + i} for i in range(100)
     ]
 
     data = {
