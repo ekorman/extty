@@ -127,14 +127,14 @@ fn load_run(path: &Path) -> Option<Run> {
 }
 
 /// Return type for run metadata
-type RunMeta2 = (
+type RunMetadata = (
     Option<DateTime<Local>>,
     Option<DateTime<Local>>,
     RunStatus,
     Option<serde_json::Value>,
 );
 
-fn load_run_meta(path: &Path) -> RunMeta2 {
+fn load_run_meta(path: &Path) -> RunMetadata {
     let meta_path = path.join("meta.json");
     let Ok(content) = fs::read_to_string(&meta_path) else {
         return (None, None, RunStatus::Unknown, None);
