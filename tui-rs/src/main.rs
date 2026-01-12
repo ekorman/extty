@@ -5,7 +5,7 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     prelude::*,
@@ -20,7 +20,7 @@ const NEON_YELLOW: Color = Color::Rgb(255, 255, 0);
 const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
-use data::{load_runs, MetricPoint, Run};
+use data::{MetricPoint, Run, load_runs};
 
 // The views in our app
 #[derive(Clone, Copy, PartialEq)]
@@ -353,7 +353,8 @@ fn render_list(app: &App, frame: &mut Frame) {
                 Style::default().fg(Color::Gray)
             };
 
-            let start_str = run.start_time
+            let start_str = run
+                .start_time
                 .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| "—".to_string());
 
@@ -429,9 +430,9 @@ fn render_detail(app: &App, frame: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Min(10),    // main content
-            Constraint::Length(1),  // footer
+            Constraint::Length(3), // header
+            Constraint::Min(10),   // main content
+            Constraint::Length(1), // footer
         ])
         .split(area);
 
@@ -440,10 +441,7 @@ fn render_detail(app: &App, frame: &mut Frame) {
     let (grid_area, config_area) = if app.show_config && run.config.is_some() {
         let h_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(40),
-                Constraint::Length(config_width),
-            ])
+            .constraints([Constraint::Min(40), Constraint::Length(config_width)])
             .split(chunks[1]);
         (h_chunks[0], Some(h_chunks[1]))
     } else {
@@ -480,9 +478,15 @@ fn render_detail(app: &App, frame: &mut Frame) {
         Span::styled("◆ ", Style::default().fg(NEON_MAGENTA)),
         Span::styled(&run.name, Style::default().fg(NEON_CYAN).bold()),
         Span::styled("  │  ", Style::default().fg(DIM_CYAN)),
-        Span::styled(format!("{}", run.metrics.len()), Style::default().fg(NEON_GREEN)),
+        Span::styled(
+            format!("{}", run.metrics.len()),
+            Style::default().fg(NEON_GREEN),
+        ),
         Span::styled(" charts  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}", total_examples), Style::default().fg(NEON_YELLOW)),
+        Span::styled(
+            format!("{}", total_examples),
+            Style::default().fg(NEON_YELLOW),
+        ),
         Span::styled(" examples", Style::default().fg(Color::DarkGray)),
         Span::styled(&scroll_indicator, Style::default().fg(NEON_MAGENTA)),
     ]);
@@ -518,7 +522,10 @@ fn render_detail(app: &App, frame: &mut Frame) {
         Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("c", Style::default().fg(NEON_CYAN)),
-        Span::styled(format!("] {}  ", config_hint), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("] {}  ", config_hint),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("[]", Style::default().fg(NEON_YELLOW)),
         Span::styled("] run ", Style::default().fg(Color::DarkGray)),
@@ -589,7 +596,10 @@ fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value
     render_json_value(config, 0, &mut lines);
 
     let block = Block::default()
-        .title(Span::styled(" CONFIG ", Style::default().fg(NEON_CYAN).bold()))
+        .title(Span::styled(
+            " CONFIG ",
+            Style::default().fg(NEON_CYAN).bold(),
+        ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(DIM_CYAN));
@@ -618,7 +628,10 @@ fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<L
                         lines.push(Line::from(vec![
                             Span::styled(pad.clone(), Style::default()),
                             Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
-                            Span::styled(format!("[{}]", arr.len()), Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!("[{}]", arr.len()),
+                                Style::default().fg(Color::DarkGray),
+                            ),
                         ]));
                     }
                     _ => {
@@ -653,9 +666,15 @@ fn format_json_primitive(value: &serde_json::Value) -> String {
     }
 }
 
-fn render_chart(frame: &mut Frame, area: Rect, title: &str, points: &[MetricPoint], selected: bool) {
-    use ratatui::widgets::{Axis, Chart, Dataset, GraphType};
+fn render_chart(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    points: &[MetricPoint],
+    selected: bool,
+) {
     use ratatui::symbols::Marker;
+    use ratatui::widgets::{Axis, Chart, Dataset, GraphType};
 
     let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
     let title_style = if selected {
@@ -671,18 +690,18 @@ fn render_chart(frame: &mut Frame, area: Rect, title: &str, points: &[MetricPoin
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
         frame.render_widget(
-            Paragraph::new(Span::styled("No data", Style::default().fg(Color::DarkGray)))
-                .block(block),
+            Paragraph::new(Span::styled(
+                "No data",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .block(block),
             area,
         );
         return;
     }
 
     // Convert points to (x, y) tuples for ratatui
-    let data: Vec<(f64, f64)> = points
-        .iter()
-        .map(|p| (p.step as f64, p.value))
-        .collect();
+    let data: Vec<(f64, f64)> = points.iter().map(|p| (p.step as f64, p.value)).collect();
 
     // Find bounds
     let x_min = data.first().map(|p| p.0).unwrap_or(0.0);
@@ -761,22 +780,34 @@ fn render_examples_card(
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("Q: ", Style::default().fg(NEON_YELLOW).bold()),
-                Span::styled(format!("{}...", prompt_preview), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{}...", prompt_preview),
+                    Style::default().fg(Color::White),
+                ),
             ]),
             Line::from(""),
             Line::from(Span::styled("A: ", Style::default().fg(NEON_GREEN).bold())),
         ];
         for line in response_lines {
-            lines.push(Line::from(Span::styled(line, Style::default().fg(Color::Gray))));
+            lines.push(Line::from(Span::styled(
+                line,
+                Style::default().fg(Color::Gray),
+            )));
         }
         lines
     } else {
-        vec![Line::from(Span::styled("No examples", Style::default().fg(Color::DarkGray)))]
+        vec![Line::from(Span::styled(
+            "No examples",
+            Style::default().fg(Color::DarkGray),
+        ))]
     };
 
     let title = Line::from(vec![
         Span::styled(format!("{} ", name), title_style),
-        Span::styled(format!("({} total)", examples.len()), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("({} total)", examples.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
 
     let block = Block::default()
@@ -835,7 +866,14 @@ fn render_focused(app: &App, frame: &mut Frame) {
         Card::Examples { name } => {
             if let Some(examples) = run.examples.get(name) {
                 if let Some(example) = examples.get(app.selected_example) {
-                    render_focused_example(frame, chunks[0], name, app.selected_example, examples.len(), example);
+                    render_focused_example(
+                        frame,
+                        chunks[0],
+                        name,
+                        app.selected_example,
+                        examples.len(),
+                        example,
+                    );
                 }
                 // Footer for examples
                 let footer = Line::from(vec![
@@ -883,7 +921,10 @@ fn render_focused_example(
         Span::styled("◆ PROMPT ", Style::default().fg(NEON_YELLOW).bold()),
         Span::styled("│ ", Style::default().fg(DIM_CYAN)),
         Span::styled(group_name, Style::default().fg(NEON_MAGENTA)),
-        Span::styled(format!(" #{}", index + 1), Style::default().fg(Color::White)),
+        Span::styled(
+            format!(" #{}", index + 1),
+            Style::default().fg(Color::White),
+        ),
         Span::styled(format!("/{}", total), Style::default().fg(Color::DarkGray)),
         Span::styled(" │ ", Style::default().fg(DIM_CYAN)),
         Span::styled("step ", Style::default().fg(Color::DarkGray)),
@@ -903,9 +944,10 @@ fn render_focused_example(
     frame.render_widget(prompt, chunks[0]);
 
     // Response title
-    let response_title = Line::from(vec![
-        Span::styled("◆ RESPONSE ", Style::default().fg(NEON_GREEN).bold()),
-    ]);
+    let response_title = Line::from(vec![Span::styled(
+        "◆ RESPONSE ",
+        Style::default().fg(NEON_GREEN).bold(),
+    )]);
 
     let response = Paragraph::new(example.response.clone())
         .style(Style::default().fg(Color::Gray))

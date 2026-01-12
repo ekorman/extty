@@ -14,10 +14,17 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/doublify/pre-commit-rust
-    rev: v1.0
+  - repo: local
     hooks:
-      - id: fmt
-        args: ['--manifest-path', 'tui-rs/Cargo.toml', '--']
-      - id: clippy
-        args: ['--manifest-path', 'tui-rs/Cargo.toml', '--', '-D', 'warnings']
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --manifest-path tui-rs/Cargo.toml --
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --manifest-path tui-rs/Cargo.toml -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false

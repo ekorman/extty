@@ -126,7 +126,14 @@ fn load_run(path: &PathBuf) -> Option<Run> {
     })
 }
 
-fn load_run_meta(path: &PathBuf) -> (Option<DateTime<Local>>, Option<DateTime<Local>>, RunStatus, Option<serde_json::Value>) {
+fn load_run_meta(
+    path: &PathBuf,
+) -> (
+    Option<DateTime<Local>>,
+    Option<DateTime<Local>>,
+    RunStatus,
+    Option<serde_json::Value>,
+) {
     let meta_path = path.join("meta.json");
     let Ok(content) = fs::read_to_string(&meta_path) else {
         return (None, None, RunStatus::Unknown, None);
@@ -136,11 +143,13 @@ fn load_run_meta(path: &PathBuf) -> (Option<DateTime<Local>>, Option<DateTime<Lo
         return (None, None, RunStatus::Unknown, None);
     };
 
-    let start_time = meta.started_at
+    let start_time = meta
+        .started_at
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Local));
 
-    let end_time = meta.finished_at
+    let end_time = meta
+        .finished_at
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Local));
 
@@ -178,7 +187,9 @@ fn load_metrics_recursive(
     current_dir: &PathBuf,
     metrics: &mut HashMap<String, Vec<MetricPoint>>,
 ) {
-    let Ok(entries) = fs::read_dir(current_dir) else { return };
+    let Ok(entries) = fs::read_dir(current_dir) else {
+        return;
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -188,10 +199,7 @@ fn load_metrics_recursive(
         } else if path.extension().map(|e| e == "csv").unwrap_or(false) {
             // Build metric name from relative path (e.g., "train/loss")
             if let Ok(relative) = path.strip_prefix(base_dir) {
-                let name = relative
-                    .with_extension("")
-                    .to_string_lossy()
-                    .to_string();
+                let name = relative.with_extension("").to_string_lossy().to_string();
                 if let Ok(points) = load_metric_csv(&path) {
                     metrics.insert(name, points);
                 }
@@ -250,7 +258,9 @@ fn load_examples_recursive(
     current_dir: &PathBuf,
     examples: &mut HashMap<String, Vec<Example>>,
 ) {
-    let Ok(entries) = fs::read_dir(current_dir) else { return };
+    let Ok(entries) = fs::read_dir(current_dir) else {
+        return;
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -263,12 +273,7 @@ fn load_examples_recursive(
                 let name = relative
                     .parent()
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| {
-                        relative
-                            .with_extension("")
-                            .to_string_lossy()
-                            .to_string()
-                    });
+                    .unwrap_or_else(|| relative.with_extension("").to_string_lossy().to_string());
                 let name = if name.is_empty() {
                     relative.with_extension("").to_string_lossy().to_string()
                 } else {
