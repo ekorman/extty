@@ -10,6 +10,7 @@ use russh::keys::key;
 use russh_keys::load_secret_key;
 use serde::Deserialize;
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
 
 use crate::data::{Example, MetricPoint, Run, RunStatus};
 
@@ -20,6 +21,10 @@ static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         std::process::exit(1);
     })
 });
+
+/// Cached SSH session - reused across calls to avoid reconnection overhead
+static CACHED_SESSION: Lazy<Mutex<Option<(String, Handle<Client>)>>> =
+    Lazy::new(|| Mutex::new(None));
 
 #[derive(Debug, Deserialize)]
 struct RunMeta {
@@ -223,11 +228,14 @@ async fn connect(config: &SshConfig) -> Result<Handle<Client>> {
 /// List all runs from a remote server via SSH
 pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
     RUNTIME.block_on(async {
-        let mut session = connect(config).await?;
+        ensure_session(config).await?;
+
+        let mut cache = CACHED_SESSION.lock().await;
+        let (_key, session) = cache.as_mut().unwrap();
 
         // List directories in ~/.ex/runs/
         let stdout = exec_command(
-            &mut session,
+            session,
             "cd \"$HOME/.ex/runs\" 2>/dev/null && ls -1 || true",
         )
         .await?;
@@ -241,7 +249,7 @@ pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
             }
 
             // Load each run using the same session
-            if let Ok(run) = load_run_ssh_with_session(&mut session, run_name).await {
+            if let Ok(run) = load_run_ssh_with_session(session, run_name).await {
                 runs.push(run);
             }
         }
@@ -252,12 +260,51 @@ pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
     })
 }
 
-/// Load a single run from SSH (creates a new connection)
+/// Load a single run from SSH (reuses cached connection)
 pub fn load_run_ssh(config: &SshConfig, run_name: &str) -> Result<Run> {
     RUNTIME.block_on(async {
-        let mut session = connect(config).await?;
-        load_run_ssh_with_session(&mut session, run_name).await
+        ensure_session(config).await?;
+
+        let mut cache = CACHED_SESSION.lock().await;
+        let (_key, session) = cache.as_mut().unwrap();
+
+        load_run_ssh_with_session(session, run_name).await
     })
+}
+
+/// Ensure we have a valid cached session for this config
+async fn ensure_session(config: &SshConfig) -> Result<()> {
+    let cache_key = format!("{}@{}:{}", config.username, config.hostname, config.port);
+
+    let mut cache = CACHED_SESSION.lock().await;
+
+    // Check if we need a new session
+    let needs_new_session = if let Some((cached_key, session)) = cache.as_mut() {
+        if cached_key != &cache_key {
+            // Different server
+            true
+        } else {
+            // Same server - test if session is still alive
+            exec_command(session, "echo ok").await.is_err()
+        }
+    } else {
+        // No cached session
+        true
+    };
+
+    if needs_new_session {
+        // Need to drop the lock before calling connect (which might prompt for password)
+        drop(cache);
+
+        // Create new connection
+        let session = connect(config).await?;
+
+        // Re-acquire lock and store session
+        let mut cache = CACHED_SESSION.lock().await;
+        *cache = Some((cache_key, session));
+    }
+
+    Ok(())
 }
 
 /// Load a single run using an existing SSH session (internal helper)
