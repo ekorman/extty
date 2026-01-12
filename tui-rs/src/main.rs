@@ -71,6 +71,8 @@ struct App {
     term_height: u16,
     // Data source (local or SSH)
     data_source: DataSource,
+    // Last error message (for displaying refresh failures)
+    last_error: Option<String>,
 }
 
 impl App {
@@ -92,6 +94,7 @@ impl App {
             term_width: 80,
             term_height: 24,
             data_source,
+            last_error: None,
         })
     }
 
@@ -110,14 +113,17 @@ impl App {
             DataSource::Ssh(config) => {
                 match load_runs_ssh(config) {
                     Ok(runs) => runs,
-                    Err(_) => {
-                        // Keep existing runs on error instead of clearing them
+                    Err(e) => {
+                        // Keep existing runs on error and show error message to user
+                        self.last_error = Some(format!("Refresh failed: {}", e));
                         return;
                     }
                 }
             }
         };
 
+        // Clear any previous error on successful refresh
+        self.last_error = None;
         self.runs = new_runs;
 
         if let Some(name) = current_name {
@@ -464,6 +470,16 @@ fn render_list(app: &App, frame: &mut Frame) {
         .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(list, area, &mut state);
+
+    // Error message if there is one
+    if let Some(ref error) = app.last_error {
+        let error_line = Line::from(vec![
+            Span::styled("⚠ ", Style::default().fg(NEON_YELLOW)),
+            Span::styled(error, Style::default().fg(NEON_YELLOW)),
+        ]);
+        let error_area = Rect::new(area.x + 1, area.bottom() - 2, area.width - 2, 1);
+        frame.render_widget(Paragraph::new(error_line), error_area);
+    }
 
     // Help text at bottom with styling
     let help = Line::from(vec![
