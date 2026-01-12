@@ -14,7 +14,7 @@ try:
         # Package is not installed, use a default version
         __version__ = "0.0.0+unknown"
 except ImportError:
-    # Fallback for Python < 3.8
+    # This should not happen given requires-python >= 3.10, but just in case
     __version__ = "0.0.0+unknown"
 
 _active_run: Run | None = None
