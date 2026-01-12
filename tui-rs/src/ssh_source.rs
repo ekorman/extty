@@ -124,7 +124,9 @@ async fn exec_command(handle: &mut Handle<Client>, cmd: &str) -> Result<String> 
 
     let mut output = String::new();
     let mut exit_status: Option<u32> = None;
+    let mut got_eof = false;
 
+    // Read until we have both EOF and ExitStatus, or channel closes
     while let Some(msg) = channel.wait().await {
         match msg {
             russh::ChannelMsg::Data { ref data } => {
@@ -132,17 +134,24 @@ async fn exec_command(handle: &mut Handle<Client>, cmd: &str) -> Result<String> 
             }
             russh::ChannelMsg::ExitStatus { exit_status: status } => {
                 exit_status = Some(status);
-                break;
+                if got_eof {
+                    break;
+                }
+            }
+            russh::ChannelMsg::Eof => {
+                got_eof = true;
+                if exit_status.is_some() {
+                    break;
+                }
             }
             _ => {}
         }
     }
 
-    // Check if command succeeded
     match exit_status {
         Some(0) => Ok(output),
         Some(code) => Err(anyhow!("Command failed with exit code {}: {}", code, cmd)),
-        None => Err(anyhow!("Command did not return exit status: {}", cmd)),
+        None => Ok(output), // No exit status but got data - assume success
     }
 }
 
@@ -334,9 +343,9 @@ async fn load_run_ssh_with_session(session: &mut Handle<Client>, run_name: &str)
         return Err(anyhow!("Run {} does not have meta.json", run_name));
     }
 
-    // Load metadata
+    // Load metadata (tolerates partial writes)
     let (start_time, end_time, status, config_json) =
-        load_run_meta_ssh(session, &run_path).await?;
+        load_run_meta_ssh(session, &run_path).await;
 
     // Load metrics
     let metrics = load_metrics_ssh(session, &run_path).await?;
@@ -359,16 +368,19 @@ async fn load_run_ssh_with_session(session: &mut Handle<Client>, run_name: &str)
 async fn load_run_meta_ssh(
     session: &mut Handle<Client>,
     run_path: &str,
-) -> Result<(
+) -> (
     Option<DateTime<Local>>,
     Option<DateTime<Local>>,
     RunStatus,
     Option<serde_json::Value>,
-)> {
-    let content = exec_command(session, &format!("cat {}/meta.json", run_path)).await?;
+) {
+    let Ok(content) = exec_command(session, &format!("cat {}/meta.json", run_path)).await else {
+        return (None, None, RunStatus::Unknown, None);
+    };
 
-    let meta: RunMeta =
-        serde_json::from_str(&content).context("Failed to parse meta.json")?;
+    let Ok(meta) = serde_json::from_str::<RunMeta>(&content) else {
+        return (None, None, RunStatus::Unknown, None);
+    };
 
     let start_time = meta
         .started_at
@@ -384,7 +396,6 @@ async fn load_run_meta_ssh(
         Some("completed") => RunStatus::Completed,
         Some("running") => RunStatus::Running,
         _ => {
-            // Infer from end_time
             if end_time.is_some() {
                 RunStatus::Completed
             } else {
@@ -393,7 +404,7 @@ async fn load_run_meta_ssh(
         }
     };
 
-    Ok((start_time, end_time, status, meta.config))
+    (start_time, end_time, status, meta.config)
 }
 
 async fn load_metrics_ssh(
@@ -489,8 +500,8 @@ async fn load_examples_ssh(
         )
         .await?;
 
-        // Parse JSONL
-        let examples = parse_examples_jsonl(&jsonl_content)?;
+        // Parse JSONL (silently skip malformed lines)
+        let examples = parse_examples_jsonl(&jsonl_content);
 
         // Example name is path without .jsonl extension
         let example_name = jsonl_path.strip_suffix(".jsonl").unwrap_or(jsonl_path);
@@ -500,7 +511,7 @@ async fn load_examples_ssh(
     Ok(examples_map)
 }
 
-fn parse_examples_jsonl(content: &str) -> Result<Vec<Example>> {
+fn parse_examples_jsonl(content: &str) -> Vec<Example> {
     let mut examples = Vec::new();
 
     for line in content.lines() {
@@ -508,14 +519,15 @@ fn parse_examples_jsonl(content: &str) -> Result<Vec<Example>> {
             continue;
         }
 
-        let row: ExampleRow = serde_json::from_str(line)?;
-        examples.push(Example {
-            step: row.step,
-            prompt: row.data.prompt,
-            response: row.data.response,
-        });
+        if let Ok(row) = serde_json::from_str::<ExampleRow>(line) {
+            examples.push(Example {
+                step: row.step,
+                prompt: row.data.prompt,
+                response: row.data.response,
+            });
+        }
     }
 
     examples.sort_by_key(|e| e.step);
-    Ok(examples)
+    examples
 }

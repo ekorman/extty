@@ -346,8 +346,19 @@ fn main() -> Result<()> {
     let mut app = App::new(data_source)?;
     let mut last_list_refresh = Instant::now();
     let mut last_data_refresh = Instant::now();
-    let list_refresh_interval = Duration::from_secs(3);
-    let data_refresh_interval = Duration::from_millis(500);
+
+    // Use longer intervals for SSH to keep UI responsive
+    let is_ssh = matches!(app.data_source, DataSource::Ssh(_));
+    let list_refresh_interval = if is_ssh {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(3)
+    };
+    let data_refresh_interval = if is_ssh {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(500)
+    };
 
     while !app.should_quit {
         // Update terminal size
