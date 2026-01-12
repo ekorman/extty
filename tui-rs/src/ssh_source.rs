@@ -330,7 +330,7 @@ async fn load_run_ssh_with_session(session: &mut Handle<Client>, run_name: &str)
         &format!("test -f {}/meta.json && echo ok || true", run_path)
     ).await?;
 
-    if !check_output.trim().contains("ok") {
+    if check_output.trim() != "ok" {
         return Err(anyhow!("Run {} does not have meta.json", run_name));
     }
 
