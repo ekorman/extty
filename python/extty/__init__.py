@@ -4,7 +4,18 @@ from extty.run import Run
 from extty.sync import push, list_local_runs
 
 __all__ = ["init", "log", "finish", "Run", "push", "list_local_runs"]
-__version__ = "0.1.0"
+
+# Version is managed by setuptools_scm
+try:
+    from importlib.metadata import version, PackageNotFoundError
+    try:
+        __version__ = version("extty")
+    except PackageNotFoundError:
+        # Package is not installed, use a default version
+        __version__ = "0.0.0+unknown"
+except ImportError:
+    # Fallback for Python < 3.8
+    __version__ = "0.0.0+unknown"
 
 _active_run: Run | None = None
 
