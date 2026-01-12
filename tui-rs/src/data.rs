@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
 use serde::Deserialize;
@@ -88,10 +88,10 @@ pub fn load_runs() -> Vec<Run> {
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(run) = load_run(&path) {
-                    runs.push(run);
-                }
+            if path.is_dir()
+                && let Some(run) = load_run(&path)
+            {
+                runs.push(run);
             }
         }
     }
@@ -102,12 +102,12 @@ pub fn load_runs() -> Vec<Run> {
 }
 
 // Reload a single run (public for refreshing)
-pub fn reload_run(path: &PathBuf) -> Option<Run> {
+pub fn reload_run(path: &Path) -> Option<Run> {
     load_run(path)
 }
 
 // Load a single run from a directory
-fn load_run(path: &PathBuf) -> Option<Run> {
+fn load_run(path: &Path) -> Option<Run> {
     let name = path.file_name()?.to_string_lossy().to_string();
     let metrics = load_metrics(path);
     let examples = load_examples(path);
@@ -116,7 +116,7 @@ fn load_run(path: &PathBuf) -> Option<Run> {
 
     Some(Run {
         name,
-        path: path.clone(),
+        path: path.to_path_buf(),
         metrics,
         examples,
         start_time,
@@ -126,14 +126,15 @@ fn load_run(path: &PathBuf) -> Option<Run> {
     })
 }
 
-fn load_run_meta(
-    path: &PathBuf,
-) -> (
+/// Return type for run metadata
+type RunMeta2 = (
     Option<DateTime<Local>>,
     Option<DateTime<Local>>,
     RunStatus,
     Option<serde_json::Value>,
-) {
+);
+
+fn load_run_meta(path: &Path) -> RunMeta2 {
     let meta_path = path.join("meta.json");
     let Ok(content) = fs::read_to_string(&meta_path) else {
         return (None, None, RunStatus::Unknown, None);
@@ -169,7 +170,7 @@ fn load_run_meta(
 }
 
 // Load all metrics from a run directory (recursively)
-fn load_metrics(run_path: &PathBuf) -> HashMap<String, Vec<MetricPoint>> {
+fn load_metrics(run_path: &Path) -> HashMap<String, Vec<MetricPoint>> {
     let mut metrics = HashMap::new();
     let metrics_dir = run_path.join("metrics");
 
@@ -234,7 +235,7 @@ fn load_metric_csv(path: &PathBuf) -> Result<Vec<MetricPoint>, csv::Error> {
 }
 
 // Load all examples from a run directory (recursively)
-fn load_examples(run_path: &PathBuf) -> HashMap<String, Vec<Example>> {
+fn load_examples(run_path: &Path) -> HashMap<String, Vec<Example>> {
     let mut examples = HashMap::new();
     let examples_dir = run_path.join("examples");
 
@@ -280,10 +281,7 @@ fn load_examples_recursive(
                     name
                 };
                 if let Ok(file_examples) = load_examples_jsonl(&path) {
-                    examples
-                        .entry(name)
-                        .or_insert_with(Vec::new)
-                        .extend(file_examples);
+                    examples.entry(name).or_default().extend(file_examples);
                 }
             }
         }

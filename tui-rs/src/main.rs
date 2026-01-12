@@ -168,7 +168,7 @@ impl App {
 
     fn handle_detail_key(&mut self, code: KeyCode, visible_rows: usize, cols: usize) {
         let card_count = self.card_count();
-        let total_rows = (card_count + cols - 1) / cols;
+        let total_rows = card_count.div_ceil(cols);
         let max_scroll = total_rows.saturating_sub(visible_rows);
 
         // Calculate visible row range
@@ -303,12 +303,12 @@ fn main() -> Result<()> {
         terminal.draw(|frame| render(&app, frame))?;
 
         // Handle input (with 100ms timeout for responsive feel)
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                // Only handle key press, not release
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key.code);
-                }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            // Only handle key press, not release
+            if key.kind == KeyEventKind::Press {
+                app.handle_key(key.code);
             }
         }
     }
@@ -454,7 +454,7 @@ fn render_detail(app: &App, frame: &mut Frame) {
     let cols = (grid_area.width / card_width).max(1) as usize;
     let cards = app.cards();
     let total_cards = cards.len();
-    let total_rows = (total_cards + cols - 1) / cols;
+    let total_rows = total_cards.div_ceil(cols);
     let visible_rows = (grid_area.height / card_height) as usize;
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let scroll = app.scroll_offset.min(max_scroll);
@@ -502,10 +502,10 @@ fn render_detail(app: &App, frame: &mut Frame) {
     render_cards_grid(app, frame, grid_area, &cards);
 
     // Config panel (if shown)
-    if let Some(config_area) = config_area {
-        if let Some(config) = &run.config {
-            render_config_panel(frame, config_area, config);
-        }
+    if let Some(config_area) = config_area
+        && let Some(config) = &run.config
+    {
+        render_config_panel(frame, config_area, config);
     }
 
     // Footer with styled keys
@@ -550,7 +550,7 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
     let card_height = 12u16;
     let cols = (area.width / card_width).max(1) as usize;
 
-    let total_rows = (cards.len() + cols - 1) / cols;
+    let total_rows = cards.len().div_ceil(cols);
     let visible_rows = (area.height / card_height) as usize;
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let scroll = app.scroll_offset.min(max_scroll);
