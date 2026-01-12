@@ -290,8 +290,10 @@ async fn ensure_session(config: &SshConfig) -> Result<()> {
             // Different server
             true
         } else {
-            // Same server - test if session is still alive
-            exec_command(session, "echo ok").await.is_err()
+            // Same server - test if session is still alive.
+            // Use a simple shell builtin that should always succeed if the
+            // session is healthy, minimizing dependence on remote shell setup.
+            exec_command(session, "true").await.is_err()
         }
     } else {
         // No cached session
