@@ -251,8 +251,12 @@ pub fn load_runs_ssh(config: &SshConfig) -> Result<Vec<Run>> {
             }
 
             // Load each run using the same session
-            if let Ok(run) = load_run_ssh_with_session(session, run_name).await {
-                runs.push(run);
+            match load_run_ssh_with_session(session, run_name).await {
+                Ok(run) => runs.push(run),
+                Err(e) => {
+                    // Log error but continue loading other runs
+                    eprintln!("Warning: Failed to load run '{}': {}", run_name, e);
+                }
             }
         }
 

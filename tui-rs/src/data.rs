@@ -89,8 +89,14 @@ pub fn load_runs() -> Vec<Run> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if let Some(run) = load_run(&path) {
-                    runs.push(run);
+                match load_run(&path) {
+                    Some(run) => runs.push(run),
+                    None => {
+                        // Log warning but continue loading other runs
+                        if let Some(name) = path.file_name() {
+                            eprintln!("Warning: Failed to load run: {}", name.to_string_lossy());
+                        }
+                    }
                 }
             }
         }
