@@ -76,10 +76,12 @@ impl SshConfig {
         let (username, hostname) = if parts.len() == 2 {
             (parts[0].to_string(), parts[1].to_string())
         } else if parts.len() == 1 {
-            // No username specified, use current user
+            // No username specified, try to get current user
             let username = std::env::var("USER")
                 .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| "root".to_string());
+                .map_err(|_| anyhow!(
+                    "Cannot determine username. Please specify in format: user@host"
+                ))?;
             (username, parts[0].to_string())
         } else {
             return Err(anyhow!("Invalid server format: {}", server));
