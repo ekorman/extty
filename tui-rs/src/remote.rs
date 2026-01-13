@@ -47,13 +47,16 @@ impl RemoteSync {
             let cursor = self.cursors.entry(run_name.clone()).or_default();
 
             let metrics = self.client.fetch_metrics(&run_name, cursor.metric_step)?;
-            cursor.metric_step = write_metric_series(&self.runs_dir, &run_name, metrics, cursor.metric_step)?;
+            cursor.metric_step =
+                write_metric_series(&self.runs_dir, &run_name, metrics, cursor.metric_step)?;
 
             let examples = self.client.fetch_examples(&run_name, cursor.example_step)?;
-            cursor.example_step = write_example_series(&self.runs_dir, &run_name, examples, cursor.example_step)?;
+            cursor.example_step =
+                write_example_series(&self.runs_dir, &run_name, examples, cursor.example_step)?;
 
             let system = self.client.fetch_system(&run_name, cursor.system_step)?;
-            cursor.system_step = write_system_points(&self.runs_dir, &run_name, system, cursor.system_step)?;
+            cursor.system_step =
+                write_system_points(&self.runs_dir, &run_name, system, cursor.system_step)?;
         }
         Ok(())
     }
@@ -202,16 +205,17 @@ fn write_metric_series(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         if file.metadata()?.len() == 0 {
             writeln!(file, "step,timestamp,value")?;
         }
         for point in series.points {
             max_step = max_step.max(point.step);
-            writeln!(file, "{},{:.6},{}", point.step, point.timestamp, point.value)?;
+            writeln!(
+                file,
+                "{},{:.6},{}",
+                point.step, point.timestamp, point.value
+            )?;
         }
     }
     Ok(max_step)
@@ -232,10 +236,7 @@ fn write_example_series(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         for record in series.records {
             max_step = max_step.max(record.step);
             let row = serde_json::json!({
@@ -260,10 +261,7 @@ fn write_system_points(
         return Ok(max_step);
     }
     let path = runs_dir.join(run_name).join("system.csv");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     if file.metadata()?.len() == 0 {
         writeln!(
             file,
@@ -287,7 +285,12 @@ fn write_system_points(
         writeln!(
             file,
             "{:.6},{:.2},{:.2},{},{},{}",
-            point.timestamp, point.ram_used_gb, point.ram_total_gb, gpu_mem_used, gpu_mem_total, gpu_util
+            point.timestamp,
+            point.ram_used_gb,
+            point.ram_total_gb,
+            gpu_mem_used,
+            gpu_mem_total,
+            gpu_util
         )?;
     }
     Ok(max_step)
@@ -304,8 +307,7 @@ fn write_meta(run_dir: &Path, run_name: &str) -> Result<()> {
         status: &'a str,
     }
 
-    let started_at = chrono::DateTime::<chrono::Utc>::from(SystemTime::now())
-        .to_rfc3339();
+    let started_at = chrono::DateTime::<chrono::Utc>::from(SystemTime::now()).to_rfc3339();
     let meta = Meta {
         project: "remote",
         run_name,
@@ -322,12 +324,18 @@ fn write_meta(run_dir: &Path, run_name: &str) -> Result<()> {
 
 fn metric_path(runs_dir: &Path, run_name: &str, metric: &str) -> PathBuf {
     let safe = sanitize_metric_name(metric);
-    runs_dir.join(run_name).join("metrics").join(format!("{}.csv", safe))
+    runs_dir
+        .join(run_name)
+        .join("metrics")
+        .join(format!("{}.csv", safe))
 }
 
 fn example_path(runs_dir: &Path, run_name: &str, group: &str) -> PathBuf {
     let safe = sanitize_metric_name(group);
-    runs_dir.join(run_name).join("examples").join(format!("{}.jsonl", safe))
+    runs_dir
+        .join(run_name)
+        .join("examples")
+        .join(format!("{}.jsonl", safe))
 }
 
 fn sanitize_metric_name(name: &str) -> String {

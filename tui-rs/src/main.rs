@@ -281,7 +281,9 @@ fn main() -> Result<()> {
     let remote_sync = if let Some(remote_url) = options.remote_url {
         let runs_dir = remote_runs_dir();
         std::env::set_var("EX_RUNS_DIR", &runs_dir);
-        let token = options.token.or_else(|| std::env::var("EX_REMOTE_TOKEN").ok());
+        let token = options
+            .token
+            .or_else(|| std::env::var("EX_REMOTE_TOKEN").ok());
         let mut sync = RemoteSync::new(remote_url, token, runs_dir)?;
         sync.sync()?;
         Some(sync)
