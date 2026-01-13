@@ -18,7 +18,7 @@ pub struct MetricPoint {
 pub struct Example {
     pub step: u64,
     pub prompt: String,
-    pub response: String,
+    pub responses: Vec<String>,
 }
 
 // Run status
@@ -297,10 +297,57 @@ struct ExampleRow {
     data: ExampleData,
 }
 
+/// Helper to deserialize a value that can be either a single string or a list of strings
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrVec;
+
+    impl<'de> de::Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or array of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value.to_owned()])
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut strings = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                strings.push(s);
+            }
+            Ok(strings)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
+}
+
 #[derive(Debug, Deserialize)]
 struct ExampleData {
-    prompt: String,
-    response: String,
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    prompt: Vec<String>,
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    response: Vec<String>,
 }
 
 // Load examples from a JSONL file
@@ -312,10 +359,12 @@ fn load_examples_jsonl(path: &PathBuf) -> Result<Vec<Example>, std::io::Error> {
     for line in reader.lines() {
         let line = line?;
         if let Ok(row) = serde_json::from_str::<ExampleRow>(&line) {
+            // Join multiple prompts if present (rare case)
+            let prompt = row.data.prompt.join("\n");
             examples.push(Example {
                 step: row.step,
-                prompt: row.data.prompt,
-                response: row.data.response,
+                prompt,
+                responses: row.data.response,
             });
         }
     }

@@ -45,7 +45,8 @@ struct App {
     runs: Vec<Run>,
     selected_run: usize,
     selected_card: usize,
-    selected_example: usize, // Index within an example group when focused
+    selected_example: usize,  // Index within an example group when focused
+    selected_response: usize, // Index within response variants for an example
     scroll_offset: usize,
     view: View,
     should_quit: bool,
@@ -64,6 +65,7 @@ impl App {
             selected_run: 0,
             selected_card: 0,
             selected_example: 0,
+            selected_response: 0,
             scroll_offset: 0,
             view: View::List,
             should_quit: false,
@@ -251,25 +253,50 @@ impl App {
             _ => 0,
         };
 
+        // Get current response count for the selected example
+        let response_count = match current_card {
+            Some(Card::Examples { name }) => self
+                .current_run()
+                .and_then(|r| r.examples.get(name))
+                .and_then(|e| e.get(self.selected_example))
+                .map(|ex| ex.responses.len())
+                .unwrap_or(0),
+            _ => 0,
+        };
+
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.view = View::Detail,
-            // Left/Right navigate between cards
-            KeyCode::Left if self.selected_card > 0 => {
-                self.selected_card -= 1;
-                self.selected_example = 0;
+            // Left/Right navigate between response variants
+            KeyCode::Left if response_count > 1 && self.selected_response > 0 => {
+                self.selected_response -= 1;
             }
-            KeyCode::Right if self.selected_card < card_count.saturating_sub(1) => {
-                self.selected_card += 1;
-                self.selected_example = 0;
+            KeyCode::Right
+                if response_count > 1
+                    && self.selected_response < response_count.saturating_sub(1) =>
+            {
+                self.selected_response += 1;
             }
             // Up/Down navigate within example groups
             KeyCode::Up if example_count > 0 && self.selected_example > 0 => {
                 self.selected_example -= 1;
+                self.selected_response = 0;
             }
             KeyCode::Down
                 if example_count > 0 && self.selected_example < example_count.saturating_sub(1) =>
             {
                 self.selected_example += 1;
+                self.selected_response = 0;
+            }
+            // Tab/Shift+Tab navigate between example groups (cards)
+            KeyCode::Tab if self.selected_card < card_count.saturating_sub(1) => {
+                self.selected_card += 1;
+                self.selected_example = 0;
+                self.selected_response = 0;
+            }
+            KeyCode::BackTab if self.selected_card > 0 => {
+                self.selected_card -= 1;
+                self.selected_example = 0;
+                self.selected_response = 0;
             }
             _ => {}
         }
@@ -838,8 +865,9 @@ fn render_examples_card(
     let content: Vec<Line> = if let Some(example) = examples.last() {
         let max_lines = area.height.saturating_sub(4) as usize;
         let prompt_preview: String = example.prompt.chars().take(50).collect();
-        let response_lines: Vec<&str> = example
-            .response
+        // Use the first response variant for preview
+        let first_response = example.responses.first().map(|s| s.as_str()).unwrap_or("");
+        let response_lines: Vec<&str> = first_response
             .lines()
             .take(max_lines.saturating_sub(2))
             .collect();
@@ -940,15 +968,21 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         app.selected_example,
                         examples.len(),
                         example,
+                        app.selected_response,
                     );
                 }
+                // Get response count for footer
+                let response_count = examples
+                    .get(app.selected_example)
+                    .map(|e| e.responses.len())
+                    .unwrap_or(0);
                 // Footer for examples
-                let footer = Line::from(vec![
+                let mut footer_spans = vec![
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("q", Style::default().fg(NEON_MAGENTA)),
                     Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                    Span::styled("Tab", Style::default().fg(NEON_CYAN)),
                     Span::styled("] card ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!("{}/{}", app.selected_card + 1, cards.len()),
@@ -962,7 +996,21 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         format!("{}/{}", app.selected_example + 1, examples.len()),
                         Style::default().fg(NEON_YELLOW),
                     ),
-                ]);
+                ];
+                // Add response variant navigation if multiple responses
+                if response_count > 1 {
+                    footer_spans.extend(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled("[", Style::default().fg(DIM_CYAN)),
+                        Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                        Span::styled("] variant ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{}/{}", app.selected_response + 1, response_count),
+                            Style::default().fg(NEON_MAGENTA),
+                        ),
+                    ]);
+                }
+                let footer = Line::from(footer_spans);
                 frame.render_widget(Paragraph::new(footer), chunks[1]);
             }
         }
@@ -976,6 +1024,7 @@ fn render_focused_example(
     index: usize,
     total: usize,
     example: &data::Example,
+    selected_response: usize,
 ) {
     // Layout: prompt and response
     let chunks = Layout::default()
@@ -1010,13 +1059,32 @@ fn render_focused_example(
         .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(prompt, chunks[0]);
 
-    // Response title
-    let response_title = Line::from(vec![Span::styled(
-        "◆ RESPONSE ",
-        Style::default().fg(NEON_GREEN).bold(),
-    )]);
+    // Response title with variant indicator if multiple responses
+    let response_title = if example.responses.len() > 1 {
+        Line::from(vec![
+            Span::styled("◆ RESPONSE ", Style::default().fg(NEON_GREEN).bold()),
+            Span::styled("│ ", Style::default().fg(DIM_CYAN)),
+            Span::styled("variant ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}/{}", selected_response + 1, example.responses.len()),
+                Style::default().fg(NEON_MAGENTA),
+            ),
+        ])
+    } else {
+        Line::from(vec![Span::styled(
+            "◆ RESPONSE ",
+            Style::default().fg(NEON_GREEN).bold(),
+        )])
+    };
 
-    let response = Paragraph::new(example.response.clone())
+    // Get the selected response text
+    let response_text = example
+        .responses
+        .get(selected_response)
+        .cloned()
+        .unwrap_or_else(|| example.responses.first().cloned().unwrap_or_default());
+
+    let response = Paragraph::new(response_text)
         .style(Style::default().fg(Color::Gray))
         .block(
             Block::default()
