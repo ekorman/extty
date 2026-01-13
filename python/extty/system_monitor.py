@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 import psutil
 
-if TYPE_CHECKING:
-    from extty.storage import RunStorage
+
+class SystemMetricSink(Protocol):
+    def log_system(
+        self,
+        ram_used_gb: float,
+        ram_total_gb: float,
+        gpu_mem_used_gb: float | None = None,
+        gpu_mem_total_gb: float | None = None,
+        gpu_util_pct: float | None = None,
+    ) -> None: ...
+
 
 try:
     import pynvml as _pynvml
@@ -28,7 +37,7 @@ class SystemMonitor:
 
     def __init__(
         self,
-        storage: RunStorage,
+        storage: SystemMetricSink,
         interval: float = 5.0,
     ) -> None:
         """
