@@ -1,13 +1,11 @@
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct RemoteSync {
@@ -42,31 +40,31 @@ impl RemoteSync {
 
     pub fn sync(&mut self) -> Result<()> {
         let runs = self.client.fetch_runs()?;
-        for run_name in runs {
-            self.ensure_run_dir(&run_name)?;
-            let cursor = self.cursors.entry(run_name.clone()).or_default();
+        for run in runs {
+            self.ensure_run_dir(&run)?;
+            let cursor = self.cursors.entry(run.name.clone()).or_default();
 
-            let metrics = self.client.fetch_metrics(&run_name, cursor.metric_step)?;
+            let metrics = self.client.fetch_metrics(&run.name, cursor.metric_step)?;
             cursor.metric_step =
-                write_metric_series(&self.runs_dir, &run_name, metrics, cursor.metric_step)?;
+                write_metric_series(&self.runs_dir, &run.name, metrics, cursor.metric_step)?;
 
-            let examples = self.client.fetch_examples(&run_name, cursor.example_step)?;
+            let examples = self.client.fetch_examples(&run.name, cursor.example_step)?;
             cursor.example_step =
-                write_example_series(&self.runs_dir, &run_name, examples, cursor.example_step)?;
+                write_example_series(&self.runs_dir, &run.name, examples, cursor.example_step)?;
 
-            let system = self.client.fetch_system(&run_name, cursor.system_step)?;
+            let system = self.client.fetch_system(&run.name, cursor.system_step)?;
             cursor.system_step =
-                write_system_points(&self.runs_dir, &run_name, system, cursor.system_step)?;
+                write_system_points(&self.runs_dir, &run.name, system, cursor.system_step)?;
         }
         Ok(())
     }
 
-    fn ensure_run_dir(&self, run_name: &str) -> Result<()> {
-        let run_dir = self.runs_dir.join(run_name);
+    fn ensure_run_dir(&self, run: &RunInfo) -> Result<()> {
+        let run_dir = self.runs_dir.join(&run.name);
         if !run_dir.exists() {
             fs::create_dir_all(run_dir.join("metrics"))?;
             fs::create_dir_all(run_dir.join("examples"))?;
-            write_meta(&run_dir, run_name)?;
+            write_meta(&run_dir, run)?;
         }
         Ok(())
     }
@@ -87,7 +85,7 @@ impl RemoteClient {
         })
     }
 
-    fn fetch_runs(&self) -> Result<Vec<String>> {
+    fn fetch_runs(&self) -> Result<Vec<RunInfo>> {
         let url = format!("{}/runs", self.base_url);
         let response = self
             .client
@@ -135,7 +133,17 @@ impl RemoteClient {
 
 #[derive(Debug, Deserialize)]
 struct RunsResponse {
-    runs: Vec<String>,
+    runs: Vec<RunInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunInfo {
+    name: String,
+    project: String,
+    config: serde_json::Value,
+    started_at: String,
+    finished_at: Option<String>,
+    status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,25 +304,24 @@ fn write_system_points(
     Ok(max_step)
 }
 
-fn write_meta(run_dir: &Path, run_name: &str) -> Result<()> {
+fn write_meta(run_dir: &Path, run: &RunInfo) -> Result<()> {
     #[derive(serde::Serialize)]
     struct Meta<'a> {
         project: &'a str,
         run_name: &'a str,
         config: serde_json::Value,
-        started_at: String,
+        started_at: &'a str,
         finished_at: Option<String>,
         status: &'a str,
     }
 
-    let started_at = chrono::DateTime::<chrono::Utc>::from(SystemTime::now()).to_rfc3339();
     let meta = Meta {
-        project: "remote",
-        run_name,
-        config: serde_json::Value::Null,
-        started_at,
-        finished_at: None,
-        status: "running",
+        project: &run.project,
+        run_name: &run.name,
+        config: run.config.clone(),
+        started_at: &run.started_at,
+        finished_at: run.finished_at.clone(),
+        status: &run.status,
     };
     let path = run_dir.join("meta.json");
     let content = serde_json::to_vec_pretty(&meta)?;

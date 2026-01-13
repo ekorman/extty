@@ -77,6 +77,26 @@ class RunBuffer:
 
 
 @dataclass(frozen=True)
+class RunSummary:
+    name: str
+    project: str
+    config: dict[str, Any]
+    started_at: str
+    finished_at: str | None
+    status: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "project": self.project,
+            "config": self.config,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
 class RunStarted:
     name: str
     project: str
@@ -170,6 +190,20 @@ class ServerState:
         with self.lock:
             return sorted(self.runs.keys())
 
+    def list_run_summaries(self) -> list[RunSummary]:
+        with self.lock:
+            return [
+                RunSummary(
+                    name=run.name,
+                    project=run.project,
+                    config=run.config,
+                    started_at=run.started_at,
+                    finished_at=run.finished_at,
+                    status=run.status,
+                )
+                for run in sorted(self.runs.values(), key=lambda item: item.name)
+            ]
+
     def metrics_since(self, run_name: str, step: int) -> dict[str, list[MetricPoint]]:
         with self.lock:
             run = self.runs.get(run_name)
@@ -255,8 +289,8 @@ def _make_handler(
             query = parse_qs(parsed.query)
 
             if segments == ["runs"]:
-                runs = state.list_runs()
-                _json_response(self, {"runs": runs})
+                runs = state.list_run_summaries()
+                _json_response(self, {"runs": [summary.to_dict() for summary in runs]})
                 return
 
             if len(segments) == 3 and segments[0] == "runs":
