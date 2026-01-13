@@ -350,6 +350,8 @@ def _run_server(
     )
     handler = _make_handler(state, token)
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
+    print("server port", server.server_port)
+    print("server token", token)
     ready_conn.send((server.server_address[1], token))
     ready_conn.close()
 
