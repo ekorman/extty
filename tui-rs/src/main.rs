@@ -48,7 +48,7 @@ struct App {
     should_quit: bool,
     show_config: bool,
     show_delete_confirm: bool,
-    pending_delete_run: Option<usize>, // Index of run to delete
+    pending_delete_run: Option<usize>, // Index into runs vector of run to delete
     // Terminal dimensions for layout calculations
     term_width: u16,
     term_height: u16,
