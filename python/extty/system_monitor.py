@@ -7,6 +7,7 @@ from typing import Protocol
 
 import psutil
 
+
 class SystemMetricSink(Protocol):
     def log_system(
         self,
@@ -16,6 +17,7 @@ class SystemMetricSink(Protocol):
         gpu_mem_total_gb: float | None = None,
         gpu_util_pct: float | None = None,
     ) -> None: ...
+
 
 try:
     import pynvml as _pynvml

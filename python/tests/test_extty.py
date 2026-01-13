@@ -27,7 +27,7 @@ class TestVersion:
     def test_version_format(self) -> None:
         """Test that version follows expected format (either x.y.z or x.y.devN+...)."""
         version = extty.__version__
-        # Version should be either a release version (e.g., "0.1.0") or 
+        # Version should be either a release version (e.g., "0.1.0") or
         # development version (e.g., "0.1.dev2+g8713e8cb9.d20260112")
         assert version != "0.0.0+unknown", "Version should be properly detected"
         # Should start with a digit

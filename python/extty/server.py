@@ -214,7 +214,9 @@ class ServerState:
                 for name, points in run.metrics.items()
             }
 
-    def examples_since(self, run_name: str, step: int) -> dict[str, list[ExampleRecord]]:
+    def examples_since(
+        self, run_name: str, step: int
+    ) -> dict[str, list[ExampleRecord]]:
         with self.lock:
             run = self.runs.get(run_name)
             if run is None:
@@ -273,7 +275,9 @@ def _parse_step(query: dict[str, list[str]]) -> int:
         return 0
 
 
-def _make_handler(state: ServerState, token: str) -> Callable[..., BaseHTTPRequestHandler]:
+def _make_handler(
+    state: ServerState, token: str
+) -> Callable[..., BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             if not self._authorized():
@@ -286,9 +290,7 @@ def _make_handler(state: ServerState, token: str) -> Callable[..., BaseHTTPReque
 
             if segments == ["runs"]:
                 runs = state.list_run_summaries()
-                _json_response(
-                    self, {"runs": [summary.to_dict() for summary in runs]}
-                )
+                _json_response(self, {"runs": [summary.to_dict() for summary in runs]})
                 return
 
             if len(segments) == 3 and segments[0] == "runs":
@@ -382,6 +384,8 @@ def _run_server(
     )
     handler = _make_handler(state, token)
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
+    print("server port", server.server_port)
+    print("server token", token)
     ready_conn.send((server.server_address[1], token))
     ready_conn.close()
 

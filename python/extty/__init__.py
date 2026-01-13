@@ -50,8 +50,7 @@ def init(
     server_host : str, default "0.0.0.0"
         Host interface for the server.
     server_port : int, default 0
-        Port for the server (0 chooses a random available port). When using 0,
-        access the assigned port via the returned run's ``server_info``.
+        Port for the server (0 chooses a random available port).
     server_token : str, optional
         Token for Authorization header; auto-generated if omitted.
     server_max_metric_points : int, default 10000
