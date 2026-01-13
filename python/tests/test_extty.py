@@ -17,6 +17,23 @@ from extty.storage import (
 )
 
 
+class TestVersion:
+    def test_version_is_set(self) -> None:
+        """Test that __version__ is set and is a string."""
+        assert hasattr(extty, "__version__")
+        assert isinstance(extty.__version__, str)
+        assert len(extty.__version__) > 0
+
+    def test_version_format(self) -> None:
+        """Test that version follows expected format (either x.y.z or x.y.devN+...)."""
+        version = extty.__version__
+        # Version should be either a release version (e.g., "0.1.0") or 
+        # development version (e.g., "0.1.dev2+g8713e8cb9.d20260112")
+        assert version != "0.0.0+unknown", "Version should be properly detected"
+        # Should start with a digit
+        assert version[0].isdigit(), f"Version should start with a digit: {version}"
+
+
 class TestSanitizeMetricName:
     def test_slashes_preserved(self) -> None:
         assert sanitize_metric_name("train/loss") == "train/loss"
