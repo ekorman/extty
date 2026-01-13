@@ -165,18 +165,18 @@ impl App {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 // Confirm deletion
-                if let Some(run_idx) = self.pending_delete_run {
-                    if let Some(run) = self.runs.get(run_idx) {
-                        let path = run.path.clone();
-                        if let Err(_) = data::delete_run(&path) {
-                            // Silently ignore deletion errors for now
-                        }
-                        // Refresh the runs list
-                        self.refresh_runs();
-                        // Return to List view if we were on Detail
-                        if self.view == View::Detail {
-                            self.view = View::List;
-                        }
+                if let Some(run_idx) = self.pending_delete_run
+                    && let Some(run) = self.runs.get(run_idx)
+                {
+                    let path = run.path.clone();
+                    if data::delete_run(&path).is_err() {
+                        // Silently ignore deletion errors for now
+                    }
+                    // Refresh the runs list
+                    self.refresh_runs();
+                    // Return to List view if we were on Detail
+                    if self.view == View::Detail {
+                        self.view = View::List;
                     }
                 }
                 self.show_delete_confirm = false;
