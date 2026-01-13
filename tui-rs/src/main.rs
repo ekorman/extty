@@ -265,6 +265,17 @@ impl App {
 }
 
 fn main() -> Result<()> {
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        // Check for any arguments starting with - or --
+        for arg in &args[1..] {
+            if arg.starts_with('-') {
+                anyhow::bail!("Unrecognized flag: {}", arg);
+            }
+        }
+    }
+
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
