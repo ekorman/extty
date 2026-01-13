@@ -12,3 +12,13 @@ serde_json = "1.0"
 csv = "1.3"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
+
+[package.metadata.release]
+# Skip crates.io publish (set to true when ready to publish)
+publish = false
+# Tag format
+tag-name = "v{{version}}"
+# Commit message format
+tag-message = "Release {{version}}"
+# Push to remote
+push = true
