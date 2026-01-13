@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -20,7 +21,9 @@ const NEON_YELLOW: Color = Color::Rgb(255, 255, 0);
 const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
+mod remote;
 use data::{MetricPoint, Run, load_runs};
+use remote::RemoteSync;
 
 // The views in our app
 #[derive(Clone, Copy, PartialEq)]
@@ -50,10 +53,11 @@ struct App {
     // Terminal dimensions for layout calculations
     term_width: u16,
     term_height: u16,
+    remote_sync: Option<RemoteSync>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(remote_sync: Option<RemoteSync>) -> Self {
         let runs = load_runs();
         App {
             runs,
@@ -66,6 +70,7 @@ impl App {
             show_config: false,
             term_width: 80,
             term_height: 24,
+            remote_sync,
         }
     }
 
@@ -94,6 +99,13 @@ impl App {
                 self.runs[self.selected_run] = updated;
             }
         }
+    }
+
+    fn sync_remote(&mut self) -> Result<()> {
+        if let Some(remote_sync) = self.remote_sync.as_mut() {
+            remote_sync.sync()?;
+        }
+        Ok(())
     }
 
     fn grid_layout(&self) -> (usize, usize) {
@@ -265,6 +277,23 @@ impl App {
 }
 
 fn main() -> Result<()> {
+    let options = parse_options()?;
+    let remote_sync = if let Some(remote_url) = options.remote_url {
+        let runs_dir = remote_runs_dir();
+        // SAFETY: We set the environment variable before spawning any threads.
+        unsafe {
+            std::env::set_var("EX_RUNS_DIR", &runs_dir);
+        }
+        let token = options
+            .token
+            .or_else(|| std::env::var("EX_REMOTE_TOKEN").ok());
+        let mut sync = RemoteSync::new(remote_url, token, runs_dir)?;
+        sync.sync()?;
+        Some(sync)
+    } else {
+        None
+    };
+
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -273,7 +302,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run event loop
-    let mut app = App::new();
+    let mut app = App::new(remote_sync);
     let mut last_list_refresh = Instant::now();
     let mut last_data_refresh = Instant::now();
     let list_refresh_interval = Duration::from_secs(3);
@@ -286,6 +315,7 @@ fn main() -> Result<()> {
 
         // Periodic refresh of run list (less frequent)
         if last_list_refresh.elapsed() >= list_refresh_interval {
+            let _ = app.sync_remote();
             app.refresh_runs();
             last_list_refresh = Instant::now();
             last_data_refresh = Instant::now();
@@ -295,6 +325,7 @@ fn main() -> Result<()> {
         if matches!(app.view, View::Detail | View::Focused)
             && last_data_refresh.elapsed() >= data_refresh_interval
         {
+            let _ = app.sync_remote();
             app.refresh_current_run();
             last_data_refresh = Instant::now();
         }
@@ -317,6 +348,42 @@ fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+struct Options {
+    remote_url: Option<String>,
+    token: Option<String>,
+}
+
+fn parse_options() -> Result<Options> {
+    let mut remote_url = None;
+    let mut token = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--remote" => {
+                remote_url = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--remote requires a URL"))?,
+                );
+            }
+            "--token" => {
+                token = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--token requires a value"))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(Options { remote_url, token })
+}
+
+fn remote_runs_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ex")
+        .join("remote_runs")
 }
 
 fn render(app: &App, frame: &mut Frame) {

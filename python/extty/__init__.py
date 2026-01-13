@@ -1,8 +1,10 @@
 """extty: Terminal-native ML experiment tracker."""
 
 from importlib.metadata import PackageNotFoundError, version
+from typing import Any
 
-from extty.run import Run
+from extty.run import Run, ServerConfig
+from extty.server import ServerSettings
 
 __all__ = ["init", "log", "finish", "Run", "push", "list_local_runs"]
 
@@ -20,8 +22,15 @@ def init(
     project: str,
     *,
     name: str | None = None,
-    config: dict | None = None,
+    config: dict[str, Any] | None = None,
     system_metrics: bool = True,
+    server: bool = False,
+    server_host: str = "0.0.0.0",
+    server_port: int = 0,
+    server_token: str | None = None,
+    server_max_metric_points: int = 10_000,
+    server_max_example_points: int = 5_000,
+    server_max_system_points: int = 2_000,
 ) -> Run:
     """
     Initialize a new experiment run.
@@ -36,6 +45,21 @@ def init(
         Hyperparameters and configuration to log.
     system_metrics : bool, default True
         Whether to automatically collect system metrics (RAM, GPU).
+    server : bool, default False
+        Whether to start an in-memory HTTP server for remote TUI access.
+    server_host : str, default "0.0.0.0"
+        Host interface for the server.
+    server_port : int, default 0
+        Port for the server (0 chooses a random available port). When using 0,
+        access the assigned port via the returned run's ``server_info``.
+    server_token : str, optional
+        Token for Authorization header; auto-generated if omitted.
+    server_max_metric_points : int, default 10000
+        Maximum points per metric series in memory.
+    server_max_example_points : int, default 5000
+        Maximum examples per series in memory.
+    server_max_system_points : int, default 2000
+        Maximum system metric samples in memory.
 
     Returns
     -------
@@ -45,11 +69,28 @@ def init(
     global _active_run
     if _active_run is not None:
         _active_run.finish()
-    _active_run = Run(project, name=name, config=config, system_metrics=system_metrics)
+    server_config = None
+    if server:
+        settings = ServerSettings(
+            host=server_host,
+            port=server_port,
+            token=server_token,
+            max_metric_points=server_max_metric_points,
+            max_example_points=server_max_example_points,
+            max_system_points=server_max_system_points,
+        )
+        server_config = ServerConfig(enabled=True, settings=settings)
+    _active_run = Run(
+        project,
+        name=name,
+        config=config,
+        system_metrics=system_metrics,
+        server=server_config,
+    )
     return _active_run
 
 
-def log(metrics: dict[str, float | dict], *, step: int) -> None:
+def log(metrics: dict[str, float | dict[str, Any]], *, step: int) -> None:
     """
     Log metrics or structured examples for the current step.
 
