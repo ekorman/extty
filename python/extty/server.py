@@ -180,7 +180,9 @@ class ServerState:
                 for name, points in run.metrics.items()
             }
 
-    def examples_since(self, run_name: str, step: int) -> dict[str, list[ExampleRecord]]:
+    def examples_since(
+        self, run_name: str, step: int
+    ) -> dict[str, list[ExampleRecord]]:
         with self.lock:
             run = self.runs.get(run_name)
             if run is None:
@@ -239,7 +241,9 @@ def _parse_step(query: dict[str, list[str]]) -> int:
         return 0
 
 
-def _make_handler(state: ServerState, token: str) -> Callable[..., BaseHTTPRequestHandler]:
+def _make_handler(
+    state: ServerState, token: str
+) -> Callable[..., BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             if not self._authorized():
