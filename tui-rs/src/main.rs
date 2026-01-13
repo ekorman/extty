@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -20,7 +21,9 @@ const NEON_YELLOW: Color = Color::Rgb(255, 255, 0);
 const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
+mod remote;
 use data::{MetricPoint, Run, load_runs};
+use remote::RemoteSync;
 
 // The views in our app
 #[derive(Clone, Copy, PartialEq)]
@@ -42,30 +45,38 @@ struct App {
     runs: Vec<Run>,
     selected_run: usize,
     selected_card: usize,
-    selected_example: usize, // Index within an example group when focused
+    selected_example: usize,  // Index within an example group when focused
+    selected_response: usize, // Index within response variants for an example
     scroll_offset: usize,
     view: View,
     should_quit: bool,
     show_config: bool,
+    show_delete_confirm: bool,
+    pending_delete_run: Option<usize>, // Index into runs vector of run to delete
     // Terminal dimensions for layout calculations
     term_width: u16,
     term_height: u16,
+    remote_sync: Option<RemoteSync>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(remote_sync: Option<RemoteSync>) -> Self {
         let runs = load_runs();
         App {
             runs,
             selected_run: 0,
             selected_card: 0,
             selected_example: 0,
+            selected_response: 0,
             scroll_offset: 0,
             view: View::List,
             should_quit: false,
             show_config: false,
+            show_delete_confirm: false,
+            pending_delete_run: None,
             term_width: 80,
             term_height: 24,
+            remote_sync,
         }
     }
 
@@ -94,6 +105,13 @@ impl App {
                 self.runs[self.selected_run] = updated;
             }
         }
+    }
+
+    fn sync_remote(&mut self) -> Result<()> {
+        if let Some(remote_sync) = self.remote_sync.as_mut() {
+            remote_sync.sync()?;
+        }
+        Ok(())
     }
 
     fn grid_layout(&self) -> (usize, usize) {
@@ -141,6 +159,12 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) {
+        // If delete confirmation is shown, handle that first
+        if self.show_delete_confirm {
+            self.handle_delete_confirm_key(code);
+            return;
+        }
+
         match self.view {
             View::List => self.handle_list_key(code),
             View::Detail => {
@@ -148,6 +172,36 @@ impl App {
                 self.handle_detail_key(code, visible_rows, cols);
             }
             View::Focused => self.handle_focused_key(code),
+        }
+    }
+
+    fn handle_delete_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                // Confirm deletion
+                if let Some(run_idx) = self.pending_delete_run
+                    && let Some(run) = self.runs.get(run_idx)
+                {
+                    let path = run.path.clone();
+                    if data::delete_run(&path).is_err() {
+                        // Silently ignore deletion errors for now
+                    }
+                    // Refresh the runs list
+                    self.refresh_runs();
+                    // Return to List view if we were on Detail
+                    if self.view == View::Detail {
+                        self.view = View::List;
+                    }
+                }
+                self.show_delete_confirm = false;
+                self.pending_delete_run = None;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                // Cancel deletion
+                self.show_delete_confirm = false;
+                self.pending_delete_run = None;
+            }
+            _ => {}
         }
     }
 
@@ -161,6 +215,11 @@ impl App {
             KeyCode::Enter if !self.runs.is_empty() => {
                 self.selected_card = 0;
                 self.view = View::Detail;
+            }
+            KeyCode::Char('d') if !self.runs.is_empty() => {
+                // Show delete confirmation
+                self.pending_delete_run = Some(self.selected_run);
+                self.show_delete_confirm = true;
             }
             _ => {}
         }
@@ -220,6 +279,11 @@ impl App {
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
             }
+            KeyCode::Char('d') if !self.runs.is_empty() => {
+                // Show delete confirmation
+                self.pending_delete_run = Some(self.selected_run);
+                self.show_delete_confirm = true;
+            }
             _ => {}
         }
     }
@@ -239,25 +303,50 @@ impl App {
             _ => 0,
         };
 
+        // Get current response count for the selected example
+        let response_count = match current_card {
+            Some(Card::Examples { name }) => self
+                .current_run()
+                .and_then(|r| r.examples.get(name))
+                .and_then(|e| e.get(self.selected_example))
+                .map(|ex| ex.responses.len())
+                .unwrap_or(0),
+            _ => 0,
+        };
+
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.view = View::Detail,
-            // Left/Right navigate between cards
-            KeyCode::Left if self.selected_card > 0 => {
-                self.selected_card -= 1;
-                self.selected_example = 0;
+            // Left/Right navigate between response variants
+            KeyCode::Left if response_count > 1 && self.selected_response > 0 => {
+                self.selected_response -= 1;
             }
-            KeyCode::Right if self.selected_card < card_count.saturating_sub(1) => {
-                self.selected_card += 1;
-                self.selected_example = 0;
+            KeyCode::Right
+                if response_count > 1
+                    && self.selected_response < response_count.saturating_sub(1) =>
+            {
+                self.selected_response += 1;
             }
             // Up/Down navigate within example groups
             KeyCode::Up if example_count > 0 && self.selected_example > 0 => {
                 self.selected_example -= 1;
+                self.selected_response = 0;
             }
             KeyCode::Down
                 if example_count > 0 && self.selected_example < example_count.saturating_sub(1) =>
             {
                 self.selected_example += 1;
+                self.selected_response = 0;
+            }
+            // Tab/Shift+Tab navigate between example groups (cards)
+            KeyCode::Tab if self.selected_card < card_count.saturating_sub(1) => {
+                self.selected_card += 1;
+                self.selected_example = 0;
+                self.selected_response = 0;
+            }
+            KeyCode::BackTab if self.selected_card > 0 => {
+                self.selected_card -= 1;
+                self.selected_example = 0;
+                self.selected_response = 0;
             }
             _ => {}
         }
@@ -265,6 +354,23 @@ impl App {
 }
 
 fn main() -> Result<()> {
+    let options = parse_options()?;
+    let remote_sync = if let Some(remote_url) = options.remote_url {
+        let runs_dir = remote_runs_dir();
+        // SAFETY: We set the environment variable before spawning any threads.
+        unsafe {
+            std::env::set_var("EX_RUNS_DIR", &runs_dir);
+        }
+        let token = options
+            .token
+            .or_else(|| std::env::var("EX_REMOTE_TOKEN").ok());
+        let mut sync = RemoteSync::new(remote_url, token, runs_dir)?;
+        sync.sync()?;
+        Some(sync)
+    } else {
+        None
+    };
+
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -273,7 +379,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run event loop
-    let mut app = App::new();
+    let mut app = App::new(remote_sync);
     let mut last_list_refresh = Instant::now();
     let mut last_data_refresh = Instant::now();
     let list_refresh_interval = Duration::from_secs(3);
@@ -286,6 +392,7 @@ fn main() -> Result<()> {
 
         // Periodic refresh of run list (less frequent)
         if last_list_refresh.elapsed() >= list_refresh_interval {
+            let _ = app.sync_remote();
             app.refresh_runs();
             last_list_refresh = Instant::now();
             last_data_refresh = Instant::now();
@@ -295,6 +402,7 @@ fn main() -> Result<()> {
         if matches!(app.view, View::Detail | View::Focused)
             && last_data_refresh.elapsed() >= data_refresh_interval
         {
+            let _ = app.sync_remote();
             app.refresh_current_run();
             last_data_refresh = Instant::now();
         }
@@ -319,11 +427,52 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+struct Options {
+    remote_url: Option<String>,
+    token: Option<String>,
+}
+
+fn parse_options() -> Result<Options> {
+    let mut remote_url = None;
+    let mut token = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--remote" => {
+                remote_url = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--remote requires a URL"))?,
+                );
+            }
+            "--token" => {
+                token = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--token requires a value"))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(Options { remote_url, token })
+}
+
+fn remote_runs_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ex")
+        .join("remote_runs")
+}
+
 fn render(app: &App, frame: &mut Frame) {
     match app.view {
         View::List => render_list(app, frame),
         View::Detail => render_detail(app, frame),
         View::Focused => render_focused(app, frame),
+    }
+
+    // Render delete confirmation dialog on top if showing
+    if app.show_delete_confirm {
+        render_delete_confirm(app, frame);
     }
 }
 
@@ -410,6 +559,9 @@ fn render_list(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_CYAN)),
         Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("d", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
         Span::styled("] quit", Style::default().fg(Color::DarkGray)),
@@ -520,6 +672,9 @@ fn render_detail(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_GREEN)),
         Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("d", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("c", Style::default().fg(NEON_CYAN)),
         Span::styled(
@@ -771,8 +926,9 @@ fn render_examples_card(
     let content: Vec<Line> = if let Some(example) = examples.last() {
         let max_lines = area.height.saturating_sub(4) as usize;
         let prompt_preview: String = example.prompt.chars().take(50).collect();
-        let response_lines: Vec<&str> = example
-            .response
+        // Use the first response variant for preview
+        let first_response = example.responses.first().map(|s| s.as_str()).unwrap_or("");
+        let response_lines: Vec<&str> = first_response
             .lines()
             .take(max_lines.saturating_sub(2))
             .collect();
@@ -873,15 +1029,21 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         app.selected_example,
                         examples.len(),
                         example,
+                        app.selected_response,
                     );
                 }
+                // Get response count for footer
+                let response_count = examples
+                    .get(app.selected_example)
+                    .map(|e| e.responses.len())
+                    .unwrap_or(0);
                 // Footer for examples
-                let footer = Line::from(vec![
+                let mut footer_spans = vec![
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("q", Style::default().fg(NEON_MAGENTA)),
                     Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                    Span::styled("Tab", Style::default().fg(NEON_CYAN)),
                     Span::styled("] card ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!("{}/{}", app.selected_card + 1, cards.len()),
@@ -895,7 +1057,21 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         format!("{}/{}", app.selected_example + 1, examples.len()),
                         Style::default().fg(NEON_YELLOW),
                     ),
-                ]);
+                ];
+                // Add response variant navigation if multiple responses
+                if response_count > 1 {
+                    footer_spans.extend(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled("[", Style::default().fg(DIM_CYAN)),
+                        Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                        Span::styled("] variant ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{}/{}", app.selected_response + 1, response_count),
+                            Style::default().fg(NEON_MAGENTA),
+                        ),
+                    ]);
+                }
+                let footer = Line::from(footer_spans);
                 frame.render_widget(Paragraph::new(footer), chunks[1]);
             }
         }
@@ -909,6 +1085,7 @@ fn render_focused_example(
     index: usize,
     total: usize,
     example: &data::Example,
+    selected_response: usize,
 ) {
     // Layout: prompt and response
     let chunks = Layout::default()
@@ -943,13 +1120,32 @@ fn render_focused_example(
         .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(prompt, chunks[0]);
 
-    // Response title
-    let response_title = Line::from(vec![Span::styled(
-        "◆ RESPONSE ",
-        Style::default().fg(NEON_GREEN).bold(),
-    )]);
+    // Response title with variant indicator if multiple responses
+    let response_title = if example.responses.len() > 1 {
+        Line::from(vec![
+            Span::styled("◆ RESPONSE ", Style::default().fg(NEON_GREEN).bold()),
+            Span::styled("│ ", Style::default().fg(DIM_CYAN)),
+            Span::styled("variant ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}/{}", selected_response + 1, example.responses.len()),
+                Style::default().fg(NEON_MAGENTA),
+            ),
+        ])
+    } else {
+        Line::from(vec![Span::styled(
+            "◆ RESPONSE ",
+            Style::default().fg(NEON_GREEN).bold(),
+        )])
+    };
 
-    let response = Paragraph::new(example.response.clone())
+    // Get the selected response text
+    let response_text = example
+        .responses
+        .get(selected_response)
+        .cloned()
+        .unwrap_or_else(|| example.responses.first().cloned().unwrap_or_default());
+
+    let response = Paragraph::new(response_text)
         .style(Style::default().fg(Color::Gray))
         .block(
             Block::default()
@@ -960,4 +1156,69 @@ fn render_focused_example(
         )
         .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(response, chunks[1]);
+}
+
+fn render_delete_confirm(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    // Get the run name to display
+    let run_name = app
+        .pending_delete_run
+        .and_then(|idx| app.runs.get(idx))
+        .map(|r| r.name.as_str())
+        .unwrap_or("unknown");
+
+    // Create centered popup
+    let area = frame.area();
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 7u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    // Clear the area behind the popup
+    frame.render_widget(Clear, popup_area);
+
+    // Create the popup content
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Delete run ", Style::default().fg(Color::White)),
+            Span::styled(run_name, Style::default().fg(NEON_CYAN).bold()),
+            Span::styled("? (y/n)", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "This action cannot be undone.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("y", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Yes  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("n", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] No  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(Color::Gray)),
+            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " ⚠ CONFIRM DELETE ",
+            Style::default().fg(NEON_MAGENTA).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_MAGENTA))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center);
+
+    frame.render_widget(paragraph, popup_area);
 }
