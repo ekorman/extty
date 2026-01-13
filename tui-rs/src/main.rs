@@ -1081,7 +1081,9 @@ fn render_delete_confirm(app: &App, frame: &mut Frame) {
         .border_style(Style::default().fg(NEON_MAGENTA))
         .style(Style::default().bg(Color::Black));
 
-    let paragraph = Paragraph::new(text).block(block).alignment(Alignment::Center);
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center);
 
     frame.render_widget(paragraph, popup_area);
 }
