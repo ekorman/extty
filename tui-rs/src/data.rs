@@ -106,6 +106,13 @@ pub fn reload_run(path: &Path) -> Option<Run> {
     load_run(path)
 }
 
+// Delete a run by removing its directory
+// WARNING: This operation cannot be undone and will recursively delete
+// all files and subdirectories within the run directory
+pub fn delete_run(path: &Path) -> Result<(), std::io::Error> {
+    fs::remove_dir_all(path)
+}
+
 // Load a single run from a directory
 fn load_run(path: &Path) -> Option<Run> {
     let name = path.file_name()?.to_string_lossy().to_string();
