@@ -1185,7 +1185,7 @@ fn render_delete_confirm(app: &App, frame: &mut Frame) {
         Line::from(vec![
             Span::styled("Delete run ", Style::default().fg(Color::White)),
             Span::styled(run_name, Style::default().fg(NEON_CYAN).bold()),
-            Span::styled("?", Style::default().fg(Color::White)),
+            Span::styled("? (y/n)", Style::default().fg(Color::White)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
