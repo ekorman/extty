@@ -7,24 +7,12 @@ app = modal.App("example")
 image = modal.Image.debian_slim().uv_sync().add_local_python_source("extty")
 
 
-# @app.function()
-# def foo():
-#     print(locals())
-#     print("a", modal.current_function_call_id())
-#     # with modal.forward(8000) as tunnel:
-#     #     import pdb
-
-#     #     pdb.set_trace()
-#     return "bar"
-
-
 @app.function(image=image)
 def main():
     extty.init(
         "demo-modal-project",
         server=True,
         config={"lr": 0.001, "batch_size": 32, "model": "bert-base"},
-        create_modal_tunnel=True,
     )
 
     for i in range(1000):

@@ -1,10 +1,6 @@
 """In-memory HTTP server for remote TUI access."""
 
 from __future__ import annotations
-# from typing import TYPE_CHECKING
-
-# if TYPE_CHECKING:
-#     from modal import App
 
 import json
 import queue
@@ -14,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.util import find_spec
 from multiprocessing import Pipe, Process, Queue
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
@@ -27,7 +24,6 @@ class ServerSettings:
     max_metric_points: int = 10_000
     max_example_points: int = 5_000
     max_system_points: int = 2_000
-    create_modal_tunnel: bool = False
 
     def resolved_token(self) -> str:
         return self.token or secrets.token_hex(16)
@@ -410,12 +406,16 @@ def _run_server(
 
     thread = threading.Thread(target=consume_events, daemon=True)
     thread.start()
-    if settings.create_modal_tunnel is not None:
+
+    def _check_inside_modal_fn():
+        import modal
+
+        return modal.current_function_call_id() is not None
+
+    if find_spec("modal") is not None and _check_inside_modal_fn():
         import modal
 
         with modal.forward(port) as tunnel:
-            print(f"port: {port}")
-            print(f"tunnel.port: {tunnel.port}")
             print(
                 f"Serving extty through modal tunnel: {tunnel.host}:{tunnel.port} with token {token}"
             )
