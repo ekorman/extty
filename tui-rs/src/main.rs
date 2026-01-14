@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -40,10 +41,19 @@ enum Card {
     Examples { name: String },
 }
 
+// Represents an item in the hierarchical list view
+#[derive(Clone, Debug)]
+enum ListEntry {
+    Project { name: String },
+    Run { run_index: usize },
+}
+
 // All application state lives here
 struct App {
     runs: Vec<Run>,
     selected_run: usize,
+    selected_list_item: usize, // Current position in the flattened list
+    expanded_projects: HashSet<String>, // Which projects are expanded
     selected_card: usize,
     selected_example: usize,  // Index within an example group when focused
     selected_response: usize, // Index within response variants for an example
@@ -65,6 +75,8 @@ impl App {
         App {
             runs,
             selected_run: 0,
+            selected_list_item: 0,
+            expanded_projects: HashSet::new(),
             selected_card: 0,
             selected_example: 0,
             selected_response: 0,
@@ -85,6 +97,38 @@ impl App {
         self.term_height = height;
     }
 
+    // Build the flattened list of entries (projects and runs)
+    fn list_entries(&self) -> Vec<ListEntry> {
+        use std::collections::BTreeMap;
+
+        // Group runs by project
+        let mut projects: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+
+        for (i, run) in self.runs.iter().enumerate() {
+            let project = run
+                .project
+                .clone()
+                .unwrap_or_else(|| "(no project)".to_string());
+            projects.entry(project).or_default().push(i);
+        }
+
+        let mut entries = Vec::new();
+
+        for (project_name, run_indices) in projects {
+            entries.push(ListEntry::Project {
+                name: project_name.clone(),
+            });
+
+            if self.expanded_projects.contains(&project_name) {
+                for run_index in run_indices {
+                    entries.push(ListEntry::Run { run_index });
+                }
+            }
+        }
+
+        entries
+    }
+
     fn refresh_runs(&mut self) {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
         self.runs = load_runs();
@@ -96,6 +140,10 @@ impl App {
                 self.selected_run = self.selected_run.min(self.runs.len().saturating_sub(1));
             }
         }
+
+        // Ensure selected_list_item is valid
+        let entries = self.list_entries();
+        self.selected_list_item = self.selected_list_item.min(entries.len().saturating_sub(1));
     }
 
     fn refresh_current_run(&mut self) {
@@ -206,20 +254,81 @@ impl App {
     }
 
     fn handle_list_key(&mut self, code: KeyCode) {
+        let entries = self.list_entries();
+        let entry_count = entries.len();
+
         match code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Up if self.selected_run > 0 => self.selected_run -= 1,
-            KeyCode::Down if self.selected_run < self.runs.len().saturating_sub(1) => {
-                self.selected_run += 1
+            KeyCode::Up if self.selected_list_item > 0 => {
+                self.selected_list_item -= 1;
             }
-            KeyCode::Enter if !self.runs.is_empty() => {
-                self.selected_card = 0;
-                self.view = View::Detail;
+            KeyCode::Down if self.selected_list_item < entry_count.saturating_sub(1) => {
+                self.selected_list_item += 1;
             }
-            KeyCode::Char('d') if !self.runs.is_empty() => {
-                // Show delete confirmation
-                self.pending_delete_run = Some(self.selected_run);
-                self.show_delete_confirm = true;
+            KeyCode::Tab | KeyCode::Right => {
+                // Toggle expansion of current project
+                if let Some(ListEntry::Project { name }) = entries.get(self.selected_list_item) {
+                    if self.expanded_projects.contains(name) {
+                        self.expanded_projects.remove(name);
+                    } else {
+                        self.expanded_projects.insert(name.clone());
+                    }
+                }
+            }
+            KeyCode::Left => {
+                // Collapse current project, or if on a run, go to parent project
+                match entries.get(self.selected_list_item) {
+                    Some(ListEntry::Project { name }) => {
+                        self.expanded_projects.remove(name);
+                    }
+                    Some(ListEntry::Run { run_index }) => {
+                        // Find parent project and collapse it, move selection to project
+                        if let Some(run) = self.runs.get(*run_index) {
+                            let project = run
+                                .project
+                                .clone()
+                                .unwrap_or_else(|| "(no project)".to_string());
+                            self.expanded_projects.remove(&project);
+                            // Find the project entry in the list and select it
+                            let new_entries = self.list_entries();
+                            for (i, entry) in new_entries.iter().enumerate() {
+                                if let ListEntry::Project { name } = entry
+                                    && *name == project
+                                {
+                                    self.selected_list_item = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            KeyCode::Enter => {
+                match entries.get(self.selected_list_item) {
+                    Some(ListEntry::Project { name }) => {
+                        // Toggle expansion when pressing Enter on a project
+                        if self.expanded_projects.contains(name) {
+                            self.expanded_projects.remove(name);
+                        } else {
+                            self.expanded_projects.insert(name.clone());
+                        }
+                    }
+                    Some(ListEntry::Run { run_index }) => {
+                        // Open the run detail view
+                        self.selected_run = *run_index;
+                        self.selected_card = 0;
+                        self.view = View::Detail;
+                    }
+                    None => {}
+                }
+            }
+            KeyCode::Char('d') => {
+                // Delete only works on runs, not projects
+                if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
+                    self.pending_delete_run = Some(*run_index);
+                    self.show_delete_confirm = true;
+                }
             }
             _ => {}
         }
@@ -478,62 +587,105 @@ fn render(app: &App, frame: &mut Frame) {
 
 fn render_list(app: &App, frame: &mut Frame) {
     let area = frame.area();
+    let entries = app.list_entries();
 
-    // Create list items from runs with styling
-    let items: Vec<ListItem> = app
-        .runs
+    // Create list items from hierarchical entries
+    let items: Vec<ListItem> = entries
         .iter()
         .enumerate()
-        .map(|(i, run)| {
-            let is_running = run.is_running();
-            let is_selected = i == app.selected_run;
+        .map(|(i, entry)| {
+            let is_selected = i == app.selected_list_item;
 
-            let (status_icon, status_color) = if is_running {
-                ("● ", NEON_GREEN)
-            } else {
-                ("○ ", Color::DarkGray)
-            };
+            match entry {
+                ListEntry::Project { name } => {
+                    let is_expanded = app.expanded_projects.contains(name);
+                    let icon = if is_expanded { "▼ " } else { "▶ " };
 
-            let name_style = if is_selected {
-                Style::default().fg(NEON_CYAN).bold()
-            } else if is_running {
-                Style::default().fg(NEON_GREEN)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
+                    // Count runs in this project
+                    let run_count = app
+                        .runs
+                        .iter()
+                        .filter(|r| r.project.as_deref().unwrap_or("(no project)") == name)
+                        .count();
 
-            let start_str = run
-                .start_time
-                .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_else(|| "—".to_string());
+                    // Check if any runs in this project are running
+                    let has_running = app
+                        .runs
+                        .iter()
+                        .filter(|r| r.project.as_deref().unwrap_or("(no project)") == name)
+                        .any(|r| r.is_running());
 
-            let end_str = if is_running {
-                "running...".to_string()
-            } else {
-                run.end_time
-                    .map(|t| t.format("%H:%M").to_string())
-                    .unwrap_or_else(|| "—".to_string())
-            };
+                    let name_style = if is_selected {
+                        Style::default().fg(NEON_MAGENTA).bold()
+                    } else if has_running {
+                        Style::default().fg(NEON_GREEN).bold()
+                    } else {
+                        Style::default().fg(NEON_CYAN).bold()
+                    };
 
-            let time_style = if is_running {
-                Style::default().fg(NEON_YELLOW)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(icon, Style::default().fg(NEON_MAGENTA)),
+                        Span::styled(name.clone(), name_style),
+                        Span::styled(
+                            format!("  ({} runs)", run_count),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                }
+                ListEntry::Run { run_index } => {
+                    let run = &app.runs[*run_index];
+                    let is_running = run.is_running();
 
-            ListItem::new(Line::from(vec![
-                Span::styled(status_icon, Style::default().fg(status_color)),
-                Span::styled(run.name.clone(), name_style),
-                Span::styled("  ", Style::default()),
-                Span::styled(start_str, Style::default().fg(Color::DarkGray)),
-                Span::styled(" → ", Style::default().fg(DIM_CYAN)),
-                Span::styled(end_str, time_style),
-            ]))
+                    let (status_icon, status_color) = if is_running {
+                        ("● ", NEON_GREEN)
+                    } else {
+                        ("○ ", Color::DarkGray)
+                    };
+
+                    let name_style = if is_selected {
+                        Style::default().fg(NEON_CYAN).bold()
+                    } else if is_running {
+                        Style::default().fg(NEON_GREEN)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+
+                    let start_str = run
+                        .start_time
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "—".to_string());
+
+                    let end_str = if is_running {
+                        "running...".to_string()
+                    } else {
+                        run.end_time
+                            .map(|t| t.format("%H:%M").to_string())
+                            .unwrap_or_else(|| "—".to_string())
+                    };
+
+                    let time_style = if is_running {
+                        Style::default().fg(NEON_YELLOW)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+
+                    // Indent runs under their project with tree branch
+                    ListItem::new(Line::from(vec![
+                        Span::styled("  └─ ", Style::default().fg(DIM_CYAN)),
+                        Span::styled(status_icon, Style::default().fg(status_color)),
+                        Span::styled(run.name.clone(), name_style),
+                        Span::styled("  ", Style::default()),
+                        Span::styled(start_str, Style::default().fg(Color::DarkGray)),
+                        Span::styled(" → ", Style::default().fg(DIM_CYAN)),
+                        Span::styled(end_str, time_style),
+                    ]))
+                }
+            }
         })
         .collect();
 
     let mut state = ListState::default();
-    state.select(Some(app.selected_run));
+    state.select(Some(app.selected_list_item));
 
     let list = List::new(items)
         .block(
@@ -556,6 +708,12 @@ fn render_list(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
         Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Tab/→", Style::default().fg(NEON_CYAN)),
+        Span::styled("] expand  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("←", Style::default().fg(NEON_CYAN)),
+        Span::styled("] collapse  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_CYAN)),
         Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
@@ -628,7 +786,7 @@ fn render_detail(app: &App, frame: &mut Frame) {
     let total_examples: usize = run.examples.values().map(|v| v.len()).sum();
     let header_text = Line::from(vec![
         Span::styled("◆ ", Style::default().fg(NEON_MAGENTA)),
-        Span::styled(&run.name, Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(run.display_name(), Style::default().fg(NEON_CYAN).bold()),
         Span::styled("  │  ", Style::default().fg(DIM_CYAN)),
         Span::styled(
             format!("{}", run.metrics.len()),

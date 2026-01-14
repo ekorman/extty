@@ -33,6 +33,7 @@ pub enum RunStatus {
 #[derive(Debug)]
 pub struct Run {
     pub name: String,
+    pub project: Option<String>,
     #[allow(dead_code)]
     pub path: PathBuf,
     pub metrics: HashMap<String, Vec<MetricPoint>>,
@@ -46,6 +47,13 @@ pub struct Run {
 impl Run {
     pub fn is_running(&self) -> bool {
         self.status == RunStatus::Running
+    }
+
+    pub fn display_name(&self) -> String {
+        match &self.project {
+            Some(project) => format!("{}/{}", project, self.name),
+            None => self.name.clone(),
+        }
     }
 }
 
@@ -119,10 +127,11 @@ fn load_run(path: &Path) -> Option<Run> {
     let metrics = load_metrics(path);
     let examples = load_examples(path);
 
-    let (start_time, end_time, status, config) = load_run_meta(path);
+    let (project, start_time, end_time, status, config) = load_run_meta(path);
 
     Some(Run {
         name,
+        project,
         path: path.to_path_buf(),
         metrics,
         examples,
@@ -135,6 +144,7 @@ fn load_run(path: &Path) -> Option<Run> {
 
 /// Return type for run metadata
 type RunMetadata = (
+    Option<String>,
     Option<DateTime<Local>>,
     Option<DateTime<Local>>,
     RunStatus,
@@ -144,11 +154,11 @@ type RunMetadata = (
 fn load_run_meta(path: &Path) -> RunMetadata {
     let meta_path = path.join("meta.json");
     let Ok(content) = fs::read_to_string(&meta_path) else {
-        return (None, None, RunStatus::Unknown, None);
+        return (None, None, None, RunStatus::Unknown, None);
     };
 
     let Ok(meta) = serde_json::from_str::<RunMeta>(&content) else {
-        return (None, None, RunStatus::Unknown, None);
+        return (None, None, None, RunStatus::Unknown, None);
     };
 
     let start_time = meta
@@ -173,7 +183,7 @@ fn load_run_meta(path: &Path) -> RunMetadata {
         }
     };
 
-    (start_time, end_time, status, meta.config)
+    (meta.project, start_time, end_time, status, meta.config)
 }
 
 // Load all metrics from a run directory (recursively)
