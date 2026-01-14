@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import secrets
 import threading
@@ -14,6 +15,8 @@ from importlib.util import find_spec
 from multiprocessing import Pipe, Process, Queue
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -416,8 +419,11 @@ def _run_server(
         import modal
 
         with modal.forward(port) as tunnel:
-            print(
-                f"Serving extty through modal tunnel: {tunnel.host}:{tunnel.port} with token {token}"
+            logger.info(
+                "Serving extty through modal tunnel: %s:%s with token %s",
+                tunnel.host,
+                tunnel.port,
+                token,
             )
             server.serve_forever()
     else:
