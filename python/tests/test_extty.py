@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Generator
 from pathlib import Path
@@ -214,6 +215,17 @@ class TestExttyServerMode:
             time.sleep(0.1)
         return last_payload
 
+    def _get_status(self, url: str, token: str | None) -> int:
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
     def test_server_endpoints_receive_logs(self) -> None:
         run = extty.init(
             "server-project",
@@ -227,6 +239,9 @@ class TestExttyServerMode:
         base_url = run.server_info.base_url
 
         try:
+            assert self._get_status(f"{base_url}/runs", None) == 401
+            assert self._get_status(f"{base_url}/runs", "bad-token") == 401
+
             extty.log({"loss": 0.5, "acc": 0.8}, step=1)
             extty.log({"val/example": {"prompt": "Hello", "response": "Hi"}}, step=2)
             extty.log({"loss": 0.4}, step=3)
