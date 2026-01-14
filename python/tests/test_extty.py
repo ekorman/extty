@@ -278,15 +278,16 @@ class TestExttyServerMode:
                     f"{base_url}/runs/server-run/examples?step=0", token
                 ),
                 lambda payload: any(
-                    example["name"] == "val/example"
-                    and len(example["records"]) == 1
+                    example["name"] == "val/example" and len(example["records"]) == 1
                     for example in payload.get("examples", [])
                 ),
             )
             example_records = {
                 example["name"]: example for example in examples_payload["examples"]
             }
-            assert example_records["val/example"]["records"][0]["data"]["response"] == "Hi"
+            assert (
+                example_records["val/example"]["records"][0]["data"]["response"] == "Hi"
+            )
 
             system_payload = self._wait_for(
                 lambda: self._get_json(
