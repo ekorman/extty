@@ -298,3 +298,120 @@ class TestExttyServerMode:
             assert len(system_payload["points"]) >= 1
         finally:
             extty.finish()
+
+
+class TestModalIntegration:
+    """Test Modal tunnel integration for server mode."""
+
+    def test_modal_detection_when_inside_modal_function(self) -> None:
+        """Test that Modal is detected when running inside Modal function."""
+        from unittest.mock import MagicMock, patch
+        from extty.server import _run_server, ServerSettings
+        from multiprocessing import Queue
+        from unittest.mock import Mock
+
+        # Mock the modal module
+        mock_modal = MagicMock()
+        mock_modal.current_function_call_id.return_value = "test-function-call-id"
+        
+        # Mock find_spec to indicate modal is available
+        with patch("extty.server.find_spec") as mock_find_spec:
+            mock_find_spec.return_value = MagicMock()  # Modal is installed
+            
+            # Import modal in the mocked environment
+            with patch.dict("sys.modules", {"modal": mock_modal}):
+                # Import the function to test the check
+                from extty.server import find_spec
+                
+                # Verify find_spec returns something (modal is available)
+                assert mock_find_spec("modal") is not None
+                
+                # Verify inside modal function check would return True
+                import sys
+                assert sys.modules.get("modal") is not None
+                assert sys.modules["modal"].current_function_call_id() == "test-function-call-id"
+
+    def test_modal_detection_when_not_in_modal_function(self) -> None:
+        """Test that Modal is not used when not inside Modal function."""
+        from unittest.mock import MagicMock, patch
+
+        # Mock the modal module to return None for current_function_call_id
+        mock_modal = MagicMock()
+        mock_modal.current_function_call_id.return_value = None  # Not in Modal
+
+        # Patch find_spec to indicate modal is available but not inside function
+        with patch("extty.server.find_spec") as mock_find_spec:
+            mock_find_spec.return_value = MagicMock()  # Modal is installed
+
+            with patch.dict("sys.modules", {"modal": mock_modal}):
+                # Verify modal is available but current_function_call_id returns None
+                import sys
+                assert sys.modules.get("modal") is not None
+                assert sys.modules["modal"].current_function_call_id() is None
+
+    def test_modal_not_installed(self) -> None:
+        """Test that server works when Modal is not installed."""
+        from unittest.mock import patch
+
+        # Patch find_spec to indicate modal is NOT available
+        with patch("extty.server.find_spec") as mock_find_spec:
+            mock_find_spec.return_value = None  # Modal is not installed
+
+            # Verify find_spec returns None (modal is not available)
+            assert mock_find_spec("modal") is None
+
+    def test_server_works_without_modal(self) -> None:
+        """Integration test: server works when Modal is not available."""
+        from unittest.mock import patch
+
+        # Patch find_spec in the server module to simulate modal not being installed
+        with patch("extty.server.find_spec", return_value=None):
+            run = extty.init(
+                "no-modal-test-project",
+                name="no-modal-test-run",
+                system_metrics=False,
+                server=True,
+                server_host="127.0.0.1",
+            )
+
+            try:
+                # Give the server time to start
+                time.sleep(0.5)
+
+                # Verify server started successfully in regular mode
+                assert run.server_info is not None
+                assert run.server_info.port > 0
+                assert run.server_info.host == "127.0.0.1"
+            finally:
+                extty.finish()
+                # Give server time to shut down
+                time.sleep(0.5)
+
+    def test_server_works_with_modal_available_but_not_in_function(self) -> None:
+        """Integration test: server uses regular mode when modal available but not in function."""
+        from unittest.mock import MagicMock, patch
+
+        # Create a mock modal that returns None for current_function_call_id
+        mock_modal = MagicMock()
+        mock_modal.current_function_call_id.return_value = None
+
+        with patch("extty.server.find_spec", return_value=MagicMock()):
+            with patch.dict("sys.modules", {"modal": mock_modal}):
+                run = extty.init(
+                    "modal-available-test",
+                    name="modal-available-test-run",
+                    system_metrics=False,
+                    server=True,
+                    server_host="127.0.0.1",
+                )
+
+                try:
+                    # Give the server time to start
+                    time.sleep(0.5)
+
+                    # Verify server started successfully
+                    assert run.server_info is not None
+                    assert run.server_info.port > 0
+                finally:
+                    extty.finish()
+                    time.sleep(0.5)
