@@ -22,3 +22,8 @@ root = ".."
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+modal = [
+    "modal>=1.3.0.post1",
+]

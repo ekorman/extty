@@ -1,11 +1,16 @@
 """In-memory HTTP server for remote TUI access."""
 
 from __future__ import annotations
+# from typing import TYPE_CHECKING
+
+# if TYPE_CHECKING:
+#     from modal import App
 
 import json
 import queue
 import secrets
 import threading
+import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +27,7 @@ class ServerSettings:
     max_metric_points: int = 10_000
     max_example_points: int = 5_000
     max_system_points: int = 2_000
+    create_modal_tunnel: bool = False
 
     def resolved_token(self) -> str:
         return self.token or secrets.token_hex(16)
@@ -384,7 +390,8 @@ def _run_server(
     )
     handler = _make_handler(state, token)
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
-    ready_conn.send((server.server_address[1], token))
+    port = server.server_address[1]
+    ready_conn.send((port, token))
     ready_conn.close()
 
     stop_event = threading.Event()
@@ -403,7 +410,18 @@ def _run_server(
 
     thread = threading.Thread(target=consume_events, daemon=True)
     thread.start()
-    server.serve_forever()
+    if settings.create_modal_tunnel is not None:
+        import modal
+
+        with modal.forward(port) as tunnel:
+            print(f"port: {port}")
+            print(f"tunnel.port: {tunnel.port}")
+            print(
+                f"Serving extty through modal tunnel: {tunnel.host}:{tunnel.port} with token {token}"
+            )
+            server.serve_forever()
+    else:
+        server.serve_forever()
     stop_event.set()
     thread.join(timeout=1.0)
     server.server_close()
@@ -516,6 +534,4 @@ class QueueStorage:
 
 
 def _now_timestamp() -> float:
-    import time
-
     return time.time()

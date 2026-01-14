@@ -28,6 +28,7 @@ def init(
     server_host: str = "0.0.0.0",
     server_port: int = 0,
     server_token: str | None = None,
+    create_modal_tunnel: bool = False,
     server_max_metric_points: int = 10_000,
     server_max_example_points: int = 5_000,
     server_max_system_points: int = 2_000,
@@ -77,6 +78,7 @@ def init(
             max_metric_points=server_max_metric_points,
             max_example_points=server_max_example_points,
             max_system_points=server_max_system_points,
+            create_modal_tunnel=create_modal_tunnel,
         )
         server_config = ServerConfig(enabled=True, settings=settings)
     _active_run = Run(
