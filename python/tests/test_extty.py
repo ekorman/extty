@@ -306,9 +306,6 @@ class TestModalIntegration:
     def test_modal_detection_when_inside_modal_function(self) -> None:
         """Test that Modal is detected when running inside Modal function."""
         from unittest.mock import MagicMock, patch
-        from extty.server import _run_server, ServerSettings
-        from multiprocessing import Queue
-        from unittest.mock import Mock
 
         # Mock the modal module
         mock_modal = MagicMock()
@@ -320,9 +317,6 @@ class TestModalIntegration:
             
             # Import modal in the mocked environment
             with patch.dict("sys.modules", {"modal": mock_modal}):
-                # Import the function to test the check
-                from extty.server import find_spec
-                
                 # Verify find_spec returns something (modal is available)
                 assert mock_find_spec("modal") is not None
                 
