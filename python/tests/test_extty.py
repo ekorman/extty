@@ -1,8 +1,12 @@
 """Tests for extty library."""
 
+import json
 import shutil
 import tempfile
-from collections.abc import Generator
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Generator
 from pathlib import Path
 from unittest import mock
 
@@ -187,3 +191,109 @@ class TestExttyAPI:
         extty._active_run = None
         with pytest.raises(RuntimeError, match="No active run"):
             extty.log({"loss": 0.5}, step=0)
+
+
+class TestExttyServerMode:
+    def _get_json(self, url: str, token: str) -> dict[str, object]:
+        request = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {token}"}
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _wait_for(
+        self,
+        fetcher: Callable[[], dict[str, object]],
+        predicate: Callable[[dict[str, object]], bool],
+    ) -> dict[str, object]:
+        deadline = time.time() + 6.0
+        last_payload: dict[str, object] = {}
+        while time.time() < deadline:
+            last_payload = fetcher()
+            if predicate(last_payload):
+                return last_payload
+            time.sleep(0.1)
+        return last_payload
+
+    def _get_status(self, url: str, token: str | None) -> int:
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    def test_server_endpoints_receive_logs(self) -> None:
+        run = extty.init(
+            "server-project",
+            name="server-run",
+            system_metrics=True,
+            server=True,
+            server_host="127.0.0.1",
+        )
+        assert run.server_info is not None
+        token = run.server_info.token
+        base_url = run.server_info.base_url
+
+        try:
+            assert self._get_status(f"{base_url}/runs", None) == 401
+            assert self._get_status(f"{base_url}/runs", "bad-token") == 401
+
+            extty.log({"loss": 0.5, "acc": 0.8}, step=1)
+            extty.log({"val/example": {"prompt": "Hello", "response": "Hi"}}, step=2)
+            extty.log({"loss": 0.4}, step=3)
+
+            runs_payload = self._wait_for(
+                lambda: self._get_json(f"{base_url}/runs", token),
+                lambda payload: any(
+                    run_data["name"] == "server-run"
+                    for run_data in payload.get("runs", [])
+                ),
+            )
+            assert any(
+                run_data["name"] == "server-run" for run_data in runs_payload["runs"]
+            )
+
+            metrics_payload = self._wait_for(
+                lambda: self._get_json(
+                    f"{base_url}/runs/server-run/metrics?step=0", token
+                ),
+                lambda payload: any(
+                    metric["name"] == "loss" and len(metric["points"]) == 2
+                    for metric in payload.get("metrics", [])
+                ),
+            )
+            metrics_by_name = {
+                metric["name"]: metric for metric in metrics_payload["metrics"]
+            }
+            assert metrics_by_name["loss"]["points"][0]["value"] == 0.5
+            assert metrics_by_name["loss"]["points"][1]["value"] == 0.4
+            assert metrics_by_name["acc"]["points"][0]["value"] == 0.8
+
+            examples_payload = self._wait_for(
+                lambda: self._get_json(
+                    f"{base_url}/runs/server-run/examples?step=0", token
+                ),
+                lambda payload: any(
+                    example["name"] == "val/example"
+                    and len(example["records"]) == 1
+                    for example in payload.get("examples", [])
+                ),
+            )
+            example_records = {
+                example["name"]: example for example in examples_payload["examples"]
+            }
+            assert example_records["val/example"]["records"][0]["data"]["response"] == "Hi"
+
+            system_payload = self._wait_for(
+                lambda: self._get_json(
+                    f"{base_url}/runs/server-run/system?step=0", token
+                ),
+                lambda payload: len(payload.get("points", [])) >= 1,
+            )
+            assert len(system_payload["points"]) >= 1
+        finally:
+            extty.finish()
