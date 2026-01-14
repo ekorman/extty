@@ -25,10 +25,12 @@ repos:
         entry: cargo fmt --manifest-path tui-rs/Cargo.toml --
         language: system
         types: [rust]
+        files: ^tui-rs/
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo clippy --manifest-path tui-rs/Cargo.toml -- -D warnings
         language: system
         types: [rust]
+        files: ^tui-rs/
         pass_filenames: false

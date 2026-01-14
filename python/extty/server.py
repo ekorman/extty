@@ -6,9 +6,11 @@ import json
 import queue
 import secrets
 import threading
+import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.util import find_spec
 from multiprocessing import Pipe, Process, Queue
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
@@ -384,9 +386,8 @@ def _run_server(
     )
     handler = _make_handler(state, token)
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
-    print("server port", server.server_port)
-    print("server token", token)
-    ready_conn.send((server.server_address[1], token))
+    port = server.server_address[1]
+    ready_conn.send((port, token))
     ready_conn.close()
 
     stop_event = threading.Event()
@@ -405,7 +406,22 @@ def _run_server(
 
     thread = threading.Thread(target=consume_events, daemon=True)
     thread.start()
-    server.serve_forever()
+
+    def _check_inside_modal_fn():
+        import modal
+
+        return modal.current_function_call_id() is not None
+
+    if find_spec("modal") is not None and _check_inside_modal_fn():
+        import modal
+
+        with modal.forward(port) as tunnel:
+            print(
+                f"Serving extty through modal tunnel: {tunnel.host}:{tunnel.port} with token {token}"
+            )
+            server.serve_forever()
+    else:
+        server.serve_forever()
     stop_event.set()
     thread.join(timeout=1.0)
     server.server_close()
@@ -518,6 +534,4 @@ class QueueStorage:
 
 
 def _now_timestamp() -> float:
-    import time
-
     return time.time()
