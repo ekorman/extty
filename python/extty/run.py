@@ -1,6 +1,7 @@
 """Run class - manages single run state."""
 
 from __future__ import annotations
+import time
 
 import threading
 from dataclasses import dataclass
@@ -168,10 +169,15 @@ class Run:
                 self._storage.write_meta(self._meta)
             if isinstance(self._storage, FinishableStorage):
                 self._storage.finish(self._meta.finished_at, self._meta.status)
-        self._storage.close()
+
         if self._server_manager is not None:
+            # sleep a little so that the finished state can be picked up
+            time.sleep(5)
+            self._storage.close()
             self._server_manager.stop()
             self._server_manager = None
+        else:
+            self._storage.close()
 
     def __enter__(self) -> Run:
         return self

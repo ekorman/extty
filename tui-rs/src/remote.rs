@@ -55,6 +55,11 @@ impl RemoteSync {
 
             let system = self.client.fetch_system(&run.name, cursor.system_step)?;
             cursor.system_step = write_system_points(&run_dir, system, cursor.system_step)?;
+
+            // Update meta.json if the run has finished
+            if run.status != "running" {
+                update_meta(&run_dir, &run)?;
+            }
         }
         Ok(())
     }
@@ -335,6 +340,25 @@ fn write_meta(run_dir: &Path, run: &RunInfo, remote_url: &str) -> Result<()> {
     let path = run_dir.join("meta.json");
     let content = serde_json::to_vec_pretty(&meta)?;
     fs::write(path, content)?;
+    Ok(())
+}
+
+fn update_meta(run_dir: &Path, run: &RunInfo) -> Result<()> {
+    let path = run_dir.join("meta.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&path)?;
+    let mut meta: serde_json::Value = serde_json::from_str(&content)?;
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert(
+            "finished_at".to_string(),
+            serde_json::json!(run.finished_at),
+        );
+        obj.insert("status".to_string(), serde_json::json!(run.status));
+    }
+    let updated = serde_json::to_vec_pretty(&meta)?;
+    fs::write(path, updated)?;
     Ok(())
 }
 

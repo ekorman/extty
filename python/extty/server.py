@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import queue
 import secrets
+import signal
 import threading
 import time
 from dataclasses import dataclass, field
@@ -378,6 +379,9 @@ def _run_server(
     event_queue: Queue[ServerEvent],
     ready_conn: Any,
 ) -> None:
+    # Ignore SIGINT in the server process so interrupts only affect the main process
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     token = settings.resolved_token()
     state = ServerState(
         max_metric_points=settings.max_metric_points,
