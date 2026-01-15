@@ -34,6 +34,13 @@ enum View {
     Focused,
 }
 
+// Which section is focused in the focused example view
+#[derive(Clone, Copy, PartialEq)]
+enum FocusedSection {
+    Prompt,
+    Response,
+}
+
 // A card in the detail grid - either a chart or an example group
 #[derive(Clone)]
 enum Card {
@@ -58,6 +65,9 @@ struct App {
     selected_example: usize,  // Index within an example group when focused
     selected_response: usize, // Index within response variants for an example
     scroll_offset: usize,
+    focused_section: FocusedSection, // Which section (prompt/response) is focused
+    prompt_scroll_offset: usize,     // Scroll offset for prompt in focused view
+    response_scroll_offset: usize,   // Scroll offset for response in focused view
     view: View,
     should_quit: bool,
     show_config: bool,
@@ -81,6 +91,9 @@ impl App {
             selected_example: 0,
             selected_response: 0,
             scroll_offset: 0,
+            focused_section: FocusedSection::Response,
+            prompt_scroll_offset: 0,
+            response_scroll_offset: 0,
             view: View::List,
             should_quit: false,
             show_config: false,
@@ -424,38 +437,91 @@ impl App {
         };
 
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.view = View::Detail,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.view = View::Detail;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
+            }
+            // Tab toggles focus between prompt and response sections
+            KeyCode::Tab => {
+                self.focused_section = match self.focused_section {
+                    FocusedSection::Prompt => FocusedSection::Response,
+                    FocusedSection::Response => FocusedSection::Prompt,
+                };
+            }
+            // j/k for scrolling the focused section
+            KeyCode::Char('j') => match self.focused_section {
+                FocusedSection::Prompt => {
+                    self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_add(1);
+                }
+                FocusedSection::Response => {
+                    self.response_scroll_offset = self.response_scroll_offset.saturating_add(1);
+                }
+            },
+            KeyCode::Char('k') => match self.focused_section {
+                FocusedSection::Prompt => {
+                    self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_sub(1);
+                }
+                FocusedSection::Response => {
+                    self.response_scroll_offset = self.response_scroll_offset.saturating_sub(1);
+                }
+            },
+            // PageDown/PageUp for faster scrolling
+            KeyCode::PageDown => match self.focused_section {
+                FocusedSection::Prompt => {
+                    self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_add(10);
+                }
+                FocusedSection::Response => {
+                    self.response_scroll_offset = self.response_scroll_offset.saturating_add(10);
+                }
+            },
+            KeyCode::PageUp => match self.focused_section {
+                FocusedSection::Prompt => {
+                    self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_sub(10);
+                }
+                FocusedSection::Response => {
+                    self.response_scroll_offset = self.response_scroll_offset.saturating_sub(10);
+                }
+            },
             // Left/Right navigate between response variants
             KeyCode::Left if response_count > 1 && self.selected_response > 0 => {
                 self.selected_response -= 1;
+                self.response_scroll_offset = 0;
             }
             KeyCode::Right
                 if response_count > 1
                     && self.selected_response < response_count.saturating_sub(1) =>
             {
                 self.selected_response += 1;
+                self.response_scroll_offset = 0;
             }
             // Up/Down navigate within example groups
             KeyCode::Up if example_count > 0 && self.selected_example > 0 => {
                 self.selected_example -= 1;
                 self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
             }
             KeyCode::Down
                 if example_count > 0 && self.selected_example < example_count.saturating_sub(1) =>
             {
                 self.selected_example += 1;
                 self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
             }
-            // Tab/Shift+Tab navigate between example groups (cards)
-            KeyCode::Tab if self.selected_card < card_count.saturating_sub(1) => {
-                self.selected_card += 1;
+            // Shift+Tab navigate between example groups (cards)
+            KeyCode::BackTab if card_count > 1 => {
+                // Cycle through cards
+                self.selected_card = if self.selected_card == 0 {
+                    card_count.saturating_sub(1)
+                } else {
+                    self.selected_card - 1
+                };
                 self.selected_example = 0;
                 self.selected_response = 0;
-            }
-            KeyCode::BackTab if self.selected_card > 0 => {
-                self.selected_card -= 1;
-                self.selected_example = 0;
-                self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
             }
             _ => {}
         }
@@ -1188,6 +1254,9 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         examples.len(),
                         example,
                         app.selected_response,
+                        app.focused_section,
+                        app.prompt_scroll_offset,
+                        app.response_scroll_offset,
                     );
                 }
                 // Get response count for footer
@@ -1196,17 +1265,21 @@ fn render_focused(app: &App, frame: &mut Frame) {
                     .map(|e| e.responses.len())
                     .unwrap_or(0);
                 // Footer for examples
+                let focus_label = match app.focused_section {
+                    FocusedSection::Prompt => "prompt",
+                    FocusedSection::Response => "response",
+                };
                 let mut footer_spans = vec![
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("q", Style::default().fg(NEON_MAGENTA)),
                     Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("j/k", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("Tab", Style::default().fg(NEON_CYAN)),
-                    Span::styled("] card ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{}/{}", app.selected_card + 1, cards.len()),
-                        Style::default().fg(NEON_GREEN),
-                    ),
+                    Span::styled("] focus:", Style::default().fg(Color::DarkGray)),
+                    Span::styled(focus_label, Style::default().fg(NEON_GREEN)),
                     Span::styled("  ", Style::default()),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
@@ -1236,6 +1309,7 @@ fn render_focused(app: &App, frame: &mut Frame) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_focused_example(
     frame: &mut Frame,
     area: Rect,
@@ -1244,6 +1318,9 @@ fn render_focused_example(
     total: usize,
     example: &data::Example,
     selected_response: usize,
+    focused_section: FocusedSection,
+    prompt_scroll_offset: usize,
+    response_scroll_offset: usize,
 ) {
     // Layout: prompt and response
     let chunks = Layout::default()
@@ -1252,6 +1329,8 @@ fn render_focused_example(
         .split(area);
 
     // Prompt title
+    let prompt_focused = focused_section == FocusedSection::Prompt;
+    let prompt_border_color = if prompt_focused { NEON_CYAN } else { DIM_CYAN };
     let prompt_title = Line::from(vec![
         Span::styled("◆ PROMPT ", Style::default().fg(NEON_YELLOW).bold()),
         Span::styled("│ ", Style::default().fg(DIM_CYAN)),
@@ -1273,12 +1352,19 @@ fn render_focused_example(
                 .title(prompt_title)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(DIM_CYAN)),
+                .border_style(Style::default().fg(prompt_border_color)),
         )
-        .wrap(ratatui::widgets::Wrap { trim: false });
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((prompt_scroll_offset as u16, 0));
     frame.render_widget(prompt, chunks[0]);
 
     // Response title with variant indicator if multiple responses
+    let response_focused = focused_section == FocusedSection::Response;
+    let response_border_color = if response_focused {
+        NEON_CYAN
+    } else {
+        DIM_CYAN
+    };
     let response_title = if example.responses.len() > 1 {
         Line::from(vec![
             Span::styled("◆ RESPONSE ", Style::default().fg(NEON_GREEN).bold()),
@@ -1310,9 +1396,10 @@ fn render_focused_example(
                 .title(response_title)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(DIM_CYAN)),
+                .border_style(Style::default().fg(response_border_color)),
         )
-        .wrap(ratatui::widgets::Wrap { trim: false });
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((response_scroll_offset as u16, 0));
     frame.render_widget(response, chunks[1]);
 }
 
