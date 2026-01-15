@@ -114,7 +114,7 @@ class Run:
 
     def log(
         self,
-        metrics: dict[str, float | dict[str, Any]],
+        metrics: dict[str, Any],
         *,
         step: int,
     ) -> None:
@@ -123,8 +123,10 @@ class Run:
 
         Parameters
         ----------
-        metrics : dict[str, float | dict[str, Any]]
-            Dictionary of metric names to values or structured example payloads.
+        metrics : dict[str, Any]
+            Dictionary of metric names to values. Values can be:
+            - float/int: logged as metric
+            - Example/BatchExample: logged as structured example
         step : int
             The current training step.
 
@@ -136,11 +138,11 @@ class Run:
         with self._lock:
             if self._finished:
                 raise RuntimeError("Cannot log to a finished run.")
-            for name, metric_value in metrics.items():
-                if isinstance(metric_value, dict):
-                    self._storage.log_example(name, metric_value, step)
+            for name, value in metrics.items():
+                if hasattr(value, "to_dict"):
+                    self._storage.log_example(name, value.to_dict(), step)
                 else:
-                    self._storage.log_metric(name, float(metric_value), step)
+                    self._storage.log_metric(name, float(value), step)
 
     def finish(self) -> None:
         """

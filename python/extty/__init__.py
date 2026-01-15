@@ -3,10 +3,20 @@
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
+from extty.example import BatchExample, Example
 from extty.run import Run, ServerConfig
 from extty.server import ServerSettings
 
-__all__ = ["init", "log", "finish", "Run", "push", "list_local_runs"]
+__all__ = [
+    "init",
+    "log",
+    "finish",
+    "Run",
+    "push",
+    "list_local_runs",
+    "Example",
+    "BatchExample",
+]
 
 # Version is managed by setuptools_scm
 try:
@@ -86,17 +96,23 @@ def init(
         system_metrics=system_metrics,
         server=server_config,
     )
+    print(
+        f"extty initialized with run {project}/{_active_run.name}, writing to {_active_run.run_dir}"
+    )
     return _active_run
 
 
-def log(metrics: dict[str, float | dict[str, Any]], *, step: int) -> None:
+def log(metrics: dict[str, Any], *, step: int) -> None:
     """
     Log metrics or structured examples for the current step.
 
     Parameters
     ----------
-    metrics : dict[str, float | dict]
-        Dictionary of metric names to values or structured example payloads.
+    metrics : dict[str, Any]
+        Dictionary of metric names to values. Values can be:
+        - float/int: logged as metric
+        - Example: single prompt with grouped responses
+        - BatchExample: batch of prompts with grouped responses
     step : int
         The current training step.
     """

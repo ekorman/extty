@@ -140,7 +140,9 @@ class TestExttyAPI:
         with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
             run = extty.init("test-project", name="my-run", system_metrics=False)
             assert run.name == "my-run"
-            assert (tmp_path / "runs" / "my-run" / "meta.json").exists()
+            assert (
+                tmp_path / "runs" / "test-project" / "my-run" / "meta.json"
+            ).exists()
             extty.finish()
 
     def test_log_writes_metrics(self, tmp_path: Path) -> None:
@@ -150,7 +152,9 @@ class TestExttyAPI:
             extty.log({"loss": 0.3, "acc": 0.9}, step=1)
             extty.finish()
 
-            loss_csv = tmp_path / "runs" / "log-test" / "metrics" / "loss.csv"
+            loss_csv = (
+                tmp_path / "runs" / "test-project" / "log-test" / "metrics" / "loss.csv"
+            )
             assert loss_csv.exists()
             lines = loss_csv.read_text().strip().split("\n")
             assert len(lines) == 3
@@ -159,7 +163,11 @@ class TestExttyAPI:
         with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
             extty.init("test-project", name="example-test", system_metrics=False)
             extty.log(
-                {"val/example": {"prompt": "Capital of France?", "response": "Paris"}},
+                {
+                    "val/example": extty.Example(
+                        prompt="Capital of France?", responses=["Paris"]
+                    )
+                },
                 step=10,
             )
             extty.finish()
@@ -167,6 +175,7 @@ class TestExttyAPI:
             example_path = (
                 tmp_path
                 / "runs"
+                / "test-project"
                 / "example-test"
                 / "examples"
                 / "val"
@@ -174,7 +183,7 @@ class TestExttyAPI:
             )
             assert example_path.exists()
             content = example_path.read_text()
-            assert '"response": "Paris"' in content
+            assert '"Paris"' in content
 
     def test_context_manager(self, tmp_path: Path) -> None:
         import json
@@ -183,7 +192,7 @@ class TestExttyAPI:
             with extty.init("test-project", name="ctx-test", system_metrics=False):
                 extty.log({"loss": 0.5}, step=0)
 
-            meta_path = tmp_path / "runs" / "ctx-test" / "meta.json"
+            meta_path = tmp_path / "runs" / "test-project" / "ctx-test" / "meta.json"
             meta = json.loads(meta_path.read_text())
             assert meta["status"] == "completed"
 
@@ -243,7 +252,9 @@ class TestExttyServerMode:
             assert self._get_status(f"{base_url}/runs", "bad-token") == 401
 
             extty.log({"loss": 0.5, "acc": 0.8}, step=1)
-            extty.log({"val/example": {"prompt": "Hello", "response": "Hi"}}, step=2)
+            extty.log(
+                {"val/example": extty.Example(prompt="Hello", responses=["Hi"])}, step=2
+            )
             extty.log({"loss": 0.4}, step=3)
 
             runs_payload = self._wait_for(
@@ -285,9 +296,9 @@ class TestExttyServerMode:
             example_records = {
                 example["name"]: example for example in examples_payload["examples"]
             }
-            assert (
-                example_records["val/example"]["records"][0]["data"]["response"] == "Hi"
-            )
+            assert example_records["val/example"]["records"][0]["data"]["response"] == [
+                ["Hi"]
+            ]
 
             system_payload = self._wait_for(
                 lambda: self._get_json(
@@ -308,20 +319,24 @@ class TestModalIntegration:
         # Mock the modal module
         mock_modal = mock.MagicMock()
         mock_modal.current_function_call_id.return_value = "test-function-call-id"
-        
+
         # Mock find_spec to indicate modal is available
         with mock.patch("extty.server.find_spec") as mock_find_spec:
             mock_find_spec.return_value = mock.MagicMock()  # Modal is installed
-            
+
             # Import modal in the mocked environment
             with mock.patch.dict("sys.modules", {"modal": mock_modal}):
                 # Verify find_spec returns something (modal is available)
                 assert mock_find_spec("modal") is not None
-                
+
                 # Verify inside modal function check would return True
                 import sys
+
                 assert sys.modules.get("modal") is not None
-                assert sys.modules["modal"].current_function_call_id() == "test-function-call-id"
+                assert (
+                    sys.modules["modal"].current_function_call_id()
+                    == "test-function-call-id"
+                )
 
     def test_modal_detection_when_not_in_modal_function(self) -> None:
         """Test that Modal is not used when not inside Modal function."""
@@ -336,6 +351,7 @@ class TestModalIntegration:
             with mock.patch.dict("sys.modules", {"modal": mock_modal}):
                 # Verify modal is available but current_function_call_id returns None
                 import sys
+
                 assert sys.modules.get("modal") is not None
                 assert sys.modules["modal"].current_function_call_id() is None
 
