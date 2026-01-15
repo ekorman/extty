@@ -63,6 +63,7 @@ struct App {
     expanded_projects: HashSet<String>, // Which projects are expanded
     selected_card: usize,
     selected_example: usize,  // Index within an example group when focused
+    selected_prompt: usize,   // Index within prompts batch for an example
     selected_response: usize, // Index within response variants for an example
     scroll_offset: usize,
     focused_section: FocusedSection, // Which section (prompt/response) is focused
@@ -89,6 +90,7 @@ impl App {
             expanded_projects: HashSet::new(),
             selected_card: 0,
             selected_example: 0,
+            selected_prompt: 0,
             selected_response: 0,
             scroll_offset: 0,
             focused_section: FocusedSection::Response,
@@ -425,13 +427,25 @@ impl App {
             _ => 0,
         };
 
-        // Get current response count for the selected example
+        // Get current prompt count for the selected example
+        let prompt_count = match current_card {
+            Some(Card::Examples { name }) => self
+                .current_run()
+                .and_then(|r| r.examples.get(name))
+                .and_then(|e| e.get(self.selected_example))
+                .map(|ex| ex.prompts.len())
+                .unwrap_or(0),
+            _ => 0,
+        };
+
+        // Get current response count for the selected example and prompt
         let response_count = match current_card {
             Some(Card::Examples { name }) => self
                 .current_run()
                 .and_then(|r| r.examples.get(name))
                 .and_then(|e| e.get(self.selected_example))
-                .map(|ex| ex.responses.len())
+                .and_then(|ex| ex.responses.get(self.selected_prompt))
+                .map(|r| r.len())
                 .unwrap_or(0),
             _ => 0,
         };
@@ -498,6 +512,7 @@ impl App {
             // Up/Down navigate within example groups
             KeyCode::Up if example_count > 0 && self.selected_example > 0 => {
                 self.selected_example -= 1;
+                self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
@@ -506,6 +521,22 @@ impl App {
                 if example_count > 0 && self.selected_example < example_count.saturating_sub(1) =>
             {
                 self.selected_example += 1;
+                self.selected_prompt = 0;
+                self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
+            }
+            // [ and ] navigate between prompts in batch
+            KeyCode::Char('[') if prompt_count > 1 && self.selected_prompt > 0 => {
+                self.selected_prompt -= 1;
+                self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
+            }
+            KeyCode::Char(']')
+                if prompt_count > 1 && self.selected_prompt < prompt_count.saturating_sub(1) =>
+            {
+                self.selected_prompt += 1;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
@@ -519,6 +550,7 @@ impl App {
                     self.selected_card - 1
                 };
                 self.selected_example = 0;
+                self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
@@ -1164,9 +1196,16 @@ fn render_examples_card(
     // Show the latest example as preview
     let content: Vec<Line> = if let Some(example) = examples.last() {
         let max_lines = area.height.saturating_sub(4) as usize;
-        let prompt_preview: String = example.prompt.chars().take(50).collect();
-        // Use the first response variant for preview
-        let first_response = example.responses.first().map(|s| s.as_str()).unwrap_or("");
+        // Use the first prompt for preview
+        let first_prompt = example.prompts.first().map(|s| s.as_str()).unwrap_or("");
+        let prompt_preview: String = first_prompt.chars().take(50).collect();
+        // Use the first response of first prompt for preview
+        let first_response = example
+            .responses
+            .first()
+            .and_then(|r| r.first())
+            .map(|s| s.as_str())
+            .unwrap_or("");
         let response_lines: Vec<&str> = first_response
             .lines()
             .take(max_lines.saturating_sub(2))
@@ -1197,13 +1236,25 @@ fn render_examples_card(
         ))]
     };
 
-    let title = Line::from(vec![
-        Span::styled(format!("{} ", name), title_style),
-        Span::styled(
-            format!("({} total)", examples.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
+    // Build title with batch info if applicable
+    let batch_size = examples.last().map(|e| e.prompts.len()).unwrap_or(0);
+    let title = if batch_size > 1 {
+        Line::from(vec![
+            Span::styled(format!("{} ", name), title_style),
+            Span::styled(
+                format!("({} total, batch={})", examples.len(), batch_size),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(format!("{} ", name), title_style),
+            Span::styled(
+                format!("({} total)", examples.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    };
 
     let block = Block::default()
         .title(title)
@@ -1268,16 +1319,22 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         app.selected_example,
                         examples.len(),
                         example,
+                        app.selected_prompt,
                         app.selected_response,
                         app.focused_section,
                         app.prompt_scroll_offset,
                         app.response_scroll_offset,
                     );
                 }
-                // Get response count for footer
+                // Get prompt and response counts for footer
+                let prompt_count = examples
+                    .get(app.selected_example)
+                    .map(|e| e.prompts.len())
+                    .unwrap_or(0);
                 let response_count = examples
                     .get(app.selected_example)
-                    .map(|e| e.responses.len())
+                    .and_then(|e| e.responses.get(app.selected_prompt))
+                    .map(|r| r.len())
                     .unwrap_or(0);
                 // Footer for examples
                 let focus_label = match app.focused_section {
@@ -1304,6 +1361,19 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         Style::default().fg(NEON_YELLOW),
                     ),
                 ];
+                // Add prompt navigation if multiple prompts in batch
+                if prompt_count > 1 {
+                    footer_spans.extend(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled("[", Style::default().fg(DIM_CYAN)),
+                        Span::styled("[]", Style::default().fg(NEON_CYAN)),
+                        Span::styled("] prompt ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{}/{}", app.selected_prompt + 1, prompt_count),
+                            Style::default().fg(NEON_YELLOW),
+                        ),
+                    ]);
+                }
                 // Add response variant navigation if multiple responses
                 if response_count > 1 {
                     footer_spans.extend(vec![
@@ -1332,6 +1402,7 @@ fn render_focused_example(
     index: usize,
     total: usize,
     example: &data::Example,
+    selected_prompt: usize,
     selected_response: usize,
     focused_section: FocusedSection,
     prompt_scroll_offset: usize,
@@ -1343,11 +1414,23 @@ fn render_focused_example(
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
-    // Prompt title
+    // Prompt title - show batch position if multiple prompts
     let prompt_focused = focused_section == FocusedSection::Prompt;
     let prompt_border_color = if prompt_focused { NEON_CYAN } else { DIM_CYAN };
-    let prompt_title = Line::from(vec![
-        Span::styled("◆ PROMPT ", Style::default().fg(NEON_YELLOW).bold()),
+    let mut prompt_title_spans = vec![Span::styled(
+        "◆ PROMPT ",
+        Style::default().fg(NEON_YELLOW).bold(),
+    )];
+    if example.prompts.len() > 1 {
+        prompt_title_spans.extend(vec![
+            Span::styled(
+                format!("{}/{}", selected_prompt + 1, example.prompts.len()),
+                Style::default().fg(NEON_YELLOW),
+            ),
+            Span::styled(" ", Style::default()),
+        ]);
+    }
+    prompt_title_spans.extend(vec![
         Span::styled("│ ", Style::default().fg(DIM_CYAN)),
         Span::styled(group_name, Style::default().fg(NEON_MAGENTA)),
         Span::styled(
@@ -1359,8 +1442,14 @@ fn render_focused_example(
         Span::styled("step ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", example.step), Style::default().fg(NEON_CYAN)),
     ]);
+    let prompt_title = Line::from(prompt_title_spans);
 
-    let prompt = Paragraph::new(example.prompt.clone())
+    let prompt_text = example
+        .prompts
+        .get(selected_prompt)
+        .cloned()
+        .unwrap_or_default();
+    let prompt = Paragraph::new(prompt_text)
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
@@ -1373,6 +1462,13 @@ fn render_focused_example(
         .scroll((prompt_scroll_offset as u16, 0));
     frame.render_widget(prompt, chunks[0]);
 
+    // Get responses for the selected prompt
+    let responses_for_prompt = example
+        .responses
+        .get(selected_prompt)
+        .cloned()
+        .unwrap_or_default();
+
     // Response title with variant indicator if multiple responses
     let response_focused = focused_section == FocusedSection::Response;
     let response_border_color = if response_focused {
@@ -1380,13 +1476,13 @@ fn render_focused_example(
     } else {
         DIM_CYAN
     };
-    let response_title = if example.responses.len() > 1 {
+    let response_title = if responses_for_prompt.len() > 1 {
         Line::from(vec![
             Span::styled("◆ RESPONSE ", Style::default().fg(NEON_GREEN).bold()),
             Span::styled("│ ", Style::default().fg(DIM_CYAN)),
-            Span::styled("variant ", Style::default().fg(Color::DarkGray)),
+            Span::styled("group ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{}/{}", selected_response + 1, example.responses.len()),
+                format!("{}/{}", selected_response + 1, responses_for_prompt.len()),
                 Style::default().fg(NEON_MAGENTA),
             ),
         ])
@@ -1398,11 +1494,10 @@ fn render_focused_example(
     };
 
     // Get the selected response text
-    let response_text = example
-        .responses
+    let response_text = responses_for_prompt
         .get(selected_response)
         .cloned()
-        .unwrap_or_else(|| example.responses.first().cloned().unwrap_or_default());
+        .unwrap_or_default();
 
     let response = Paragraph::new(response_text)
         .style(Style::default().fg(Color::Gray))

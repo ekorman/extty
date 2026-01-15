@@ -13,12 +13,12 @@ pub struct MetricPoint {
     pub value: f64,
 }
 
-// A prompt/response example
+// A prompt/response example (supports batched prompts and grouped responses)
 #[derive(Debug, Clone)]
 pub struct Example {
     pub step: u64,
-    pub prompt: String,
-    pub responses: Vec<String>,
+    pub prompts: Vec<String>,
+    pub responses: Vec<Vec<String>>,
 }
 
 // Run status
@@ -401,12 +401,97 @@ where
     deserializer.deserialize_any(StringOrVec)
 }
 
+/// Helper to deserialize responses: string, array of strings, or array of arrays of strings
+/// - "r1" → [[r1]]
+/// - ["r1", "r2"] → [[r1, r2]] (old format: variants for single prompt)
+/// - [["r1a", "r1b"], ["r2a"]] → as-is (new format: batch of prompts with variants)
+fn deserialize_responses<'de, D>(deserializer: D) -> Result<Vec<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct ResponsesVisitor;
+
+    impl<'de> de::Visitor<'de> for ResponsesVisitor {
+        type Value = Vec<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string, array of strings, or array of arrays of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![vec![value.to_owned()]])
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![vec![value]])
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut result: Vec<Vec<String>> = Vec::new();
+            let mut is_nested: Option<bool> = None;
+            let mut flat_strings: Vec<String> = Vec::new();
+
+            while let Some(elem) = seq.next_element::<serde_json::Value>()? {
+                match elem {
+                    serde_json::Value::String(s) => {
+                        if is_nested == Some(true) {
+                            return Err(de::Error::custom(
+                                "mixed string and array elements in response",
+                            ));
+                        }
+                        is_nested = Some(false);
+                        flat_strings.push(s);
+                    }
+                    serde_json::Value::Array(arr) => {
+                        if is_nested == Some(false) {
+                            return Err(de::Error::custom(
+                                "mixed string and array elements in response",
+                            ));
+                        }
+                        is_nested = Some(true);
+                        let inner: Vec<String> = arr
+                            .into_iter()
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => Ok(s),
+                                _ => Err(de::Error::custom("expected string in inner array")),
+                            })
+                            .collect::<Result<_, _>>()?;
+                        result.push(inner);
+                    }
+                    _ => {
+                        return Err(de::Error::custom("expected string or array in response"));
+                    }
+                }
+            }
+
+            if is_nested == Some(false) || is_nested.is_none() {
+                Ok(vec![flat_strings])
+            } else {
+                Ok(result)
+            }
+        }
+    }
+
+    deserializer.deserialize_any(ResponsesVisitor)
+}
+
 #[derive(Debug, Deserialize)]
 struct ExampleData {
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     prompt: Vec<String>,
-    #[serde(deserialize_with = "deserialize_string_or_vec")]
-    response: Vec<String>,
+    #[serde(deserialize_with = "deserialize_responses")]
+    response: Vec<Vec<String>>,
 }
 
 // Load examples from a JSONL file
@@ -418,11 +503,9 @@ fn load_examples_jsonl(path: &PathBuf) -> Result<Vec<Example>, std::io::Error> {
     for line in reader.lines() {
         let line = line?;
         if let Ok(row) = serde_json::from_str::<ExampleRow>(&line) {
-            // Join multiple prompts if present (rare case)
-            let prompt = row.data.prompt.join("\n");
             examples.push(Example {
                 step: row.step,
-                prompt,
+                prompts: row.data.prompt,
                 responses: row.data.response,
             });
         }
