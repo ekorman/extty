@@ -93,7 +93,8 @@ class Run:
                 started_at=started_at,
             )
         else:
-            run_dir = get_runs_dir() / self.name
+            project_dir = project if project else "_default"
+            run_dir = get_runs_dir() / project_dir / self.name
             self._storage = RunStorage(run_dir=run_dir)
             self._meta = MetaData(
                 project=project,

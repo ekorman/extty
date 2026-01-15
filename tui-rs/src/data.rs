@@ -42,6 +42,7 @@ pub struct Run {
     pub end_time: Option<DateTime<Local>>,
     pub status: RunStatus,
     pub config: Option<serde_json::Value>,
+    pub remote_url: Option<String>,
 }
 
 impl Run {
@@ -67,45 +68,77 @@ struct RunMeta {
     finished_at: Option<String>,
     status: Option<String>,
     config: Option<serde_json::Value>,
+    remote_url: Option<String>,
 }
 
-// Get the directory where runs are stored
+// Get the directory where local runs are stored
 fn runs_dir() -> PathBuf {
-    // Default to ~/.ex/runs, can be overridden with EX_RUNS_DIR
-    if let Ok(dir) = std::env::var("EX_RUNS_DIR") {
-        PathBuf::from(dir)
-    } else {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".ex")
-            .join("runs")
-    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ex")
+        .join("runs")
 }
 
-// Load all runs from the runs directory
-pub fn load_runs() -> Vec<Run> {
-    let dir = runs_dir();
+// Get the directory where remote runs are cached
+fn remote_runs_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ex")
+        .join("remote_runs")
+}
 
+// Load all runs from both local and remote directories
+pub fn load_runs() -> Vec<Run> {
+    let mut runs = Vec::new();
+
+    // Load from local runs directory
+    runs.extend(load_runs_from_dir(&runs_dir()));
+
+    // Load from remote runs directory
+    runs.extend(load_runs_from_dir(&remote_runs_dir()));
+
+    // Sort by name (which includes timestamp) descending
+    runs.sort_by(|a, b| b.name.cmp(&a.name));
+    runs
+}
+
+// Load all runs from a specific directory (supports both flat and nested structures)
+fn load_runs_from_dir(dir: &Path) -> Vec<Run> {
     if !dir.exists() {
         return vec![];
     }
 
     let mut runs = Vec::new();
 
-    // Each subdirectory is a run
-    if let Ok(entries) = fs::read_dir(&dir) {
+    if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir()
-                && let Some(run) = load_run(&path)
-            {
-                runs.push(run);
+            if !path.is_dir() {
+                continue;
+            }
+
+            // Check if this is a run directory (has meta.json) or project directory
+            if path.join("meta.json").exists() {
+                // Old flat structure: runs/<run_name>/
+                if let Some(run) = load_run(&path) {
+                    runs.push(run);
+                }
+            } else {
+                // New nested structure: runs/<project>/<run_name>/
+                if let Ok(run_entries) = fs::read_dir(&path) {
+                    for run_entry in run_entries.flatten() {
+                        let run_path = run_entry.path();
+                        if run_path.is_dir()
+                            && let Some(run) = load_run(&run_path)
+                        {
+                            runs.push(run);
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Sort by name (which includes timestamp) descending
-    runs.sort_by(|a, b| b.name.cmp(&a.name));
     runs
 }
 
@@ -127,7 +160,7 @@ fn load_run(path: &Path) -> Option<Run> {
     let metrics = load_metrics(path);
     let examples = load_examples(path);
 
-    let (project, start_time, end_time, status, config) = load_run_meta(path);
+    let (project, start_time, end_time, status, config, remote_url) = load_run_meta(path);
 
     Some(Run {
         name,
@@ -139,26 +172,28 @@ fn load_run(path: &Path) -> Option<Run> {
         end_time,
         status,
         config,
+        remote_url,
     })
 }
 
 /// Return type for run metadata
 type RunMetadata = (
-    Option<String>,
-    Option<DateTime<Local>>,
-    Option<DateTime<Local>>,
-    RunStatus,
-    Option<serde_json::Value>,
+    Option<String>,            // project
+    Option<DateTime<Local>>,   // start_time
+    Option<DateTime<Local>>,   // end_time
+    RunStatus,                 // status
+    Option<serde_json::Value>, // config
+    Option<String>,            // remote_url
 );
 
 fn load_run_meta(path: &Path) -> RunMetadata {
     let meta_path = path.join("meta.json");
     let Ok(content) = fs::read_to_string(&meta_path) else {
-        return (None, None, None, RunStatus::Unknown, None);
+        return (None, None, None, RunStatus::Unknown, None, None);
     };
 
     let Ok(meta) = serde_json::from_str::<RunMeta>(&content) else {
-        return (None, None, None, RunStatus::Unknown, None);
+        return (None, None, None, RunStatus::Unknown, None, None);
     };
 
     let start_time = meta
@@ -183,7 +218,14 @@ fn load_run_meta(path: &Path) -> RunMetadata {
         }
     };
 
-    (meta.project, start_time, end_time, status, meta.config)
+    (
+        meta.project,
+        start_time,
+        end_time,
+        status,
+        meta.config,
+        meta.remote_url,
+    )
 }
 
 // Load all metrics from a run directory (recursively)

@@ -12,6 +12,7 @@ pub struct RemoteSync {
     client: RemoteClient,
     runs_dir: PathBuf,
     cursors: HashMap<String, RunCursor>,
+    base_url: String,
 }
 
 #[derive(Debug, Default)]
@@ -30,11 +31,12 @@ struct RemoteClient {
 
 impl RemoteSync {
     pub fn new(base_url: String, token: Option<String>, runs_dir: PathBuf) -> Result<Self> {
-        let client = RemoteClient::new(base_url, token)?;
+        let client = RemoteClient::new(base_url.clone(), token)?;
         Ok(Self {
             client,
             runs_dir,
             cursors: HashMap::new(),
+            base_url,
         })
     }
 
@@ -42,31 +44,43 @@ impl RemoteSync {
         let runs = self.client.fetch_runs()?;
         for run in runs {
             self.ensure_run_dir(&run)?;
+            let run_dir = self.run_dir(&run);
             let cursor = self.cursors.entry(run.name.clone()).or_default();
 
             let metrics = self.client.fetch_metrics(&run.name, cursor.metric_step)?;
-            cursor.metric_step =
-                write_metric_series(&self.runs_dir, &run.name, metrics, cursor.metric_step)?;
+            cursor.metric_step = write_metric_series(&run_dir, metrics, cursor.metric_step)?;
 
             let examples = self.client.fetch_examples(&run.name, cursor.example_step)?;
-            cursor.example_step =
-                write_example_series(&self.runs_dir, &run.name, examples, cursor.example_step)?;
+            cursor.example_step = write_example_series(&run_dir, examples, cursor.example_step)?;
 
             let system = self.client.fetch_system(&run.name, cursor.system_step)?;
-            cursor.system_step =
-                write_system_points(&self.runs_dir, &run.name, system, cursor.system_step)?;
+            cursor.system_step = write_system_points(&run_dir, system, cursor.system_step)?;
         }
         Ok(())
     }
 
     fn ensure_run_dir(&self, run: &RunInfo) -> Result<()> {
-        let run_dir = self.runs_dir.join(&run.name);
+        let project_dir = if run.project.is_empty() {
+            "_default"
+        } else {
+            &run.project
+        };
+        let run_dir = self.runs_dir.join(project_dir).join(&run.name);
         if !run_dir.exists() {
             fs::create_dir_all(run_dir.join("metrics"))?;
             fs::create_dir_all(run_dir.join("examples"))?;
-            write_meta(&run_dir, run)?;
+            write_meta(&run_dir, run, &self.base_url)?;
         }
         Ok(())
+    }
+
+    fn run_dir(&self, run: &RunInfo) -> PathBuf {
+        let project_dir = if run.project.is_empty() {
+            "_default"
+        } else {
+            &run.project
+        };
+        self.runs_dir.join(project_dir).join(&run.name)
     }
 }
 
@@ -199,8 +213,7 @@ struct SystemResponse {
 }
 
 fn write_metric_series(
-    runs_dir: &Path,
-    run_name: &str,
+    run_dir: &Path,
     response: MetricsResponse,
     current_step: u64,
 ) -> Result<u64> {
@@ -209,7 +222,7 @@ fn write_metric_series(
         if series.points.is_empty() {
             continue;
         }
-        let path = metric_path(runs_dir, run_name, &series.name);
+        let path = metric_path(run_dir, &series.name);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -230,8 +243,7 @@ fn write_metric_series(
 }
 
 fn write_example_series(
-    runs_dir: &Path,
-    run_name: &str,
+    run_dir: &Path,
     response: ExamplesResponse,
     current_step: u64,
 ) -> Result<u64> {
@@ -240,7 +252,7 @@ fn write_example_series(
         if series.records.is_empty() {
             continue;
         }
-        let path = example_path(runs_dir, run_name, &series.name);
+        let path = example_path(run_dir, &series.name);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -258,17 +270,12 @@ fn write_example_series(
     Ok(max_step)
 }
 
-fn write_system_points(
-    runs_dir: &Path,
-    run_name: &str,
-    response: SystemResponse,
-    current_step: u64,
-) -> Result<u64> {
+fn write_system_points(run_dir: &Path, response: SystemResponse, current_step: u64) -> Result<u64> {
     let mut max_step = current_step;
     if response.points.is_empty() {
         return Ok(max_step);
     }
-    let path = runs_dir.join(run_name).join("system.csv");
+    let path = run_dir.join("system.csv");
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     if file.metadata()?.len() == 0 {
         writeln!(
@@ -304,7 +311,7 @@ fn write_system_points(
     Ok(max_step)
 }
 
-fn write_meta(run_dir: &Path, run: &RunInfo) -> Result<()> {
+fn write_meta(run_dir: &Path, run: &RunInfo, remote_url: &str) -> Result<()> {
     #[derive(serde::Serialize)]
     struct Meta<'a> {
         project: &'a str,
@@ -313,6 +320,7 @@ fn write_meta(run_dir: &Path, run: &RunInfo) -> Result<()> {
         started_at: &'a str,
         finished_at: Option<String>,
         status: &'a str,
+        remote_url: &'a str,
     }
 
     let meta = Meta {
@@ -322,6 +330,7 @@ fn write_meta(run_dir: &Path, run: &RunInfo) -> Result<()> {
         started_at: &run.started_at,
         finished_at: run.finished_at.clone(),
         status: &run.status,
+        remote_url,
     };
     let path = run_dir.join("meta.json");
     let content = serde_json::to_vec_pretty(&meta)?;
@@ -329,20 +338,14 @@ fn write_meta(run_dir: &Path, run: &RunInfo) -> Result<()> {
     Ok(())
 }
 
-fn metric_path(runs_dir: &Path, run_name: &str, metric: &str) -> PathBuf {
+fn metric_path(run_dir: &Path, metric: &str) -> PathBuf {
     let safe = sanitize_metric_name(metric);
-    runs_dir
-        .join(run_name)
-        .join("metrics")
-        .join(format!("{}.csv", safe))
+    run_dir.join("metrics").join(format!("{}.csv", safe))
 }
 
-fn example_path(runs_dir: &Path, run_name: &str, group: &str) -> PathBuf {
+fn example_path(run_dir: &Path, group: &str) -> PathBuf {
     let safe = sanitize_metric_name(group);
-    runs_dir
-        .join(run_name)
-        .join("examples")
-        .join(format!("{}.jsonl", safe))
+    run_dir.join("examples").join(format!("{}.jsonl", safe))
 }
 
 fn sanitize_metric_name(name: &str) -> String {

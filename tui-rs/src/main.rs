@@ -532,10 +532,6 @@ fn main() -> Result<()> {
     let options = parse_options()?;
     let remote_sync = if let Some(remote_url) = options.remote_url {
         let runs_dir = remote_runs_dir();
-        // SAFETY: We set the environment variable before spawning any threads.
-        unsafe {
-            std::env::set_var("EX_RUNS_DIR", &runs_dir);
-        }
         let token = options
             .token
             .or_else(|| std::env::var("EX_REMOTE_TOKEN").ok());
@@ -736,7 +732,7 @@ fn render_list(app: &App, frame: &mut Frame) {
                     };
 
                     // Indent runs under their project with tree branch
-                    ListItem::new(Line::from(vec![
+                    let mut spans = vec![
                         Span::styled("  └─ ", Style::default().fg(DIM_CYAN)),
                         Span::styled(status_icon, Style::default().fg(status_color)),
                         Span::styled(run.name.clone(), name_style),
@@ -744,7 +740,15 @@ fn render_list(app: &App, frame: &mut Frame) {
                         Span::styled(start_str, Style::default().fg(Color::DarkGray)),
                         Span::styled(" → ", Style::default().fg(DIM_CYAN)),
                         Span::styled(end_str, time_style),
-                    ]))
+                    ];
+                    if let Some(url) = &run.remote_url {
+                        spans.push(Span::styled("  @ ", Style::default().fg(DIM_CYAN)));
+                        spans.push(Span::styled(
+                            url.clone(),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    ListItem::new(Line::from(spans))
                 }
             }
         })
@@ -850,7 +854,7 @@ fn render_detail(app: &App, frame: &mut Frame) {
     };
 
     let total_examples: usize = run.examples.values().map(|v| v.len()).sum();
-    let header_text = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled("◆ ", Style::default().fg(NEON_MAGENTA)),
         Span::styled(run.display_name(), Style::default().fg(NEON_CYAN).bold()),
         Span::styled("  │  ", Style::default().fg(DIM_CYAN)),
@@ -864,8 +868,19 @@ fn render_detail(app: &App, frame: &mut Frame) {
             Style::default().fg(NEON_YELLOW),
         ),
         Span::styled(" examples", Style::default().fg(Color::DarkGray)),
-        Span::styled(&scroll_indicator, Style::default().fg(NEON_MAGENTA)),
-    ]);
+    ];
+    if let Some(url) = &run.remote_url {
+        header_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        header_spans.push(Span::styled(
+            url.clone(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    header_spans.push(Span::styled(
+        &scroll_indicator,
+        Style::default().fg(NEON_MAGENTA),
+    ));
+    let header_text = Line::from(header_spans);
     let header = Paragraph::new(header_text).block(
         Block::default()
             .borders(Borders::ALL)
