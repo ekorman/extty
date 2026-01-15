@@ -653,7 +653,9 @@ fn parse_options() -> Result<Options> {
                         .ok_or_else(|| anyhow::anyhow!("--token requires a value"))?,
                 );
             }
-            _ => {}
+            other => {
+                return Err(anyhow::anyhow!("Unknown option: {}", other));
+            }
         }
     }
     Ok(Options { remote_url, token })
