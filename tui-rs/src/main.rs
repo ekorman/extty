@@ -23,7 +23,7 @@ const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
 mod remote;
-use data::{MetricPoint, Run, load_runs};
+use data::{MetricPoint, Run};
 use remote::RemoteSync;
 
 // The views in our app
@@ -78,11 +78,12 @@ struct App {
     term_width: u16,
     term_height: u16,
     remote_sync: Option<RemoteSync>,
+    active_remote_url: Option<String>, // When set, only show runs from this remote
 }
 
 impl App {
-    fn new(remote_sync: Option<RemoteSync>) -> Self {
-        let runs = load_runs();
+    fn new(remote_sync: Option<RemoteSync>, active_remote_url: Option<String>) -> Self {
+        let runs = data::load_runs(active_remote_url.as_deref());
         App {
             runs,
             selected_run: 0,
@@ -104,6 +105,7 @@ impl App {
             term_width: 80,
             term_height: 24,
             remote_sync,
+            active_remote_url,
         }
     }
 
@@ -146,7 +148,7 @@ impl App {
 
     fn refresh_runs(&mut self) {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
-        self.runs = load_runs();
+        self.runs = data::load_runs(self.active_remote_url.as_deref());
 
         if let Some(name) = current_name {
             if let Some(idx) = self.runs.iter().position(|r| r.name == name) {
@@ -562,6 +564,7 @@ impl App {
 
 fn main() -> Result<()> {
     let options = parse_options()?;
+    let active_remote_url = options.remote_url.clone();
     let remote_sync = if let Some(remote_url) = options.remote_url {
         let runs_dir = remote_runs_dir();
         let token = options
@@ -582,7 +585,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run event loop
-    let mut app = App::new(remote_sync);
+    let mut app = App::new(remote_sync, active_remote_url);
     let mut last_list_refresh = Instant::now();
     let mut last_data_refresh = Instant::now();
     let list_refresh_interval = Duration::from_secs(3);

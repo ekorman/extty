@@ -87,15 +87,28 @@ fn remote_runs_dir() -> PathBuf {
         .join("remote_runs")
 }
 
-// Load all runs from both local and remote directories
-pub fn load_runs() -> Vec<Run> {
+// Load all runs, optionally filtering to only runs from a specific remote
+pub fn load_runs(active_remote_url: Option<&str>) -> Vec<Run> {
     let mut runs = Vec::new();
 
-    // Load from local runs directory
-    runs.extend(load_runs_from_dir(&runs_dir()));
+    // Load from local runs directory (unless filtering to a specific remote)
+    if active_remote_url.is_none() {
+        runs.extend(load_runs_from_dir(&runs_dir()));
+    }
 
     // Load from remote runs directory
-    runs.extend(load_runs_from_dir(&remote_runs_dir()));
+    let remote_runs = load_runs_from_dir(&remote_runs_dir());
+
+    // If we have an active remote URL, filter to only runs from that remote
+    if let Some(url) = active_remote_url {
+        runs.extend(
+            remote_runs
+                .into_iter()
+                .filter(|r| r.remote_url.as_deref() == Some(url)),
+        );
+    } else {
+        runs.extend(remote_runs);
+    }
 
     // Sort by name (which includes timestamp) descending
     runs.sort_by(|a, b| b.name.cmp(&a.name));
