@@ -81,11 +81,12 @@ struct App {
 }
 
 impl App {
-    fn new(remote_sync: Option<RemoteSync>) -> Self {
+    fn new(remote_sync: Option<RemoteSync>, initial_view: Option<(View, usize)>) -> Self {
         let runs = load_runs();
+        let (view, selected_run) = initial_view.unwrap_or((View::List, 0));
         App {
             runs,
-            selected_run: 0,
+            selected_run,
             selected_list_item: 0,
             expanded_projects: HashSet::new(),
             selected_card: 0,
@@ -96,7 +97,7 @@ impl App {
             focused_section: FocusedSection::Response,
             prompt_scroll_offset: 0,
             response_scroll_offset: 0,
-            view: View::List,
+            view,
             should_quit: false,
             show_config: false,
             show_delete_confirm: false,
@@ -562,6 +563,7 @@ impl App {
 
 fn main() -> Result<()> {
     let options = parse_options()?;
+    let using_remote = options.remote_url.is_some();
     let remote_sync = if let Some(remote_url) = options.remote_url {
         let runs_dir = remote_runs_dir();
         let token = options
@@ -574,6 +576,22 @@ fn main() -> Result<()> {
         None
     };
 
+    // If using --remote, skip the listing and go directly to the most recent remote run
+    let initial_view = if using_remote {
+        let runs = load_runs();
+        // Find the most recent run from remote (has remote_url set)
+        let remote_run_idx = runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| run.remote_url.is_some())
+            .max_by_key(|(_, run)| &run.name)
+            .map(|(idx, _)| idx);
+
+        remote_run_idx.map(|idx| (View::Detail, idx))
+    } else {
+        None
+    };
+
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -582,7 +600,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run event loop
-    let mut app = App::new(remote_sync);
+    let mut app = App::new(remote_sync, initial_view);
     let mut last_list_refresh = Instant::now();
     let mut last_data_refresh = Instant::now();
     let list_refresh_interval = Duration::from_secs(3);
