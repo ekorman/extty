@@ -94,9 +94,9 @@ class SystemMonitor:
 
     def _run(self) -> None:
         """Main loop for the monitoring thread."""
+        self._sample()
         while not self._stop_event.wait(self._interval):
             self._sample()
-        self._sample()
 
     def _sample(self) -> None:
         """Take a single sample of system metrics."""

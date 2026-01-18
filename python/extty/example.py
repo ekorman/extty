@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+Reward = float | dict[str, float]
+
 
 @dataclass(frozen=True)
 class Example:
@@ -17,13 +19,27 @@ class Example:
         The input prompt.
     responses : list[str]
         List of response variants for this prompt.
+    rewards : list[Reward] | None
+        Optional reward for each response. Can be a float or a dict mapping
+        reward component names to their values.
     """
 
     prompt: str
     responses: list[str]
+    rewards: list[Reward] | None = None
+
+    def __post_init__(self) -> None:
+        if self.rewards is not None and len(self.rewards) != len(self.responses):
+            raise ValueError(
+                f"rewards length ({len(self.rewards)}) != "
+                f"responses length ({len(self.responses)})"
+            )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"prompt": [self.prompt], "response": [self.responses]}
+        result: dict[str, Any] = {"prompt": [self.prompt], "response": [self.responses]}
+        if self.rewards is not None:
+            result["reward"] = [self.rewards]
+        return result
 
 
 @dataclass(frozen=True)
@@ -38,10 +54,15 @@ class BatchExample:
     responses : list[list[str]]
         For each prompt, a list of response variants.
         Must have same length as prompts.
+    rewards : list[list[Reward]] | None
+        Optional rewards for each response of each prompt.
+        Outer list must match prompts length, inner lists must match
+        corresponding responses lengths.
     """
 
     prompts: list[str]
     responses: list[list[str]]
+    rewards: list[list[Reward]] | None = None
 
     def __post_init__(self) -> None:
         if len(self.prompts) != len(self.responses):
@@ -49,6 +70,23 @@ class BatchExample:
                 f"prompts length ({len(self.prompts)}) != "
                 f"responses length ({len(self.responses)})"
             )
+        if self.rewards is not None:
+            if len(self.rewards) != len(self.prompts):
+                raise ValueError(
+                    f"rewards length ({len(self.rewards)}) != "
+                    f"prompts length ({len(self.prompts)})"
+                )
+            for i, (resp_group, reward_group) in enumerate(
+                zip(self.responses, self.rewards)
+            ):
+                if len(reward_group) != len(resp_group):
+                    raise ValueError(
+                        f"rewards[{i}] length ({len(reward_group)}) != "
+                        f"responses[{i}] length ({len(resp_group)})"
+                    )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"prompt": self.prompts, "response": self.responses}
+        result: dict[str, Any] = {"prompt": self.prompts, "response": self.responses}
+        if self.rewards is not None:
+            result["reward"] = self.rewards
+        return result

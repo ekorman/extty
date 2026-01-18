@@ -236,79 +236,258 @@ class TestExttyServerMode:
             return error.code
 
     def test_server_endpoints_receive_logs(self) -> None:
-        run = extty.init(
-            "server-project",
-            name="server-run",
-            system_metrics=True,
-            server=True,
-            server_host="127.0.0.1",
-        )
-        assert run.server_info is not None
-        token = run.server_info.token
-        base_url = run.server_info.base_url
-
-        try:
-            assert self._get_status(f"{base_url}/runs", None) == 401
-            assert self._get_status(f"{base_url}/runs", "bad-token") == 401
-
-            extty.log({"loss": 0.5, "acc": 0.8}, step=1)
-            extty.log(
-                {"val/example": extty.Example(prompt="Hello", responses=["Hi"])}, step=2
+        with mock.patch("extty.run.time.sleep"):
+            run = extty.init(
+                "server-project",
+                name="server-run",
+                system_metrics=True,
+                server=True,
+                server_host="127.0.0.1",
             )
-            extty.log({"loss": 0.4}, step=3)
+            assert run.server_info is not None
+            token = run.server_info.token
+            base_url = run.server_info.base_url
 
-            runs_payload = self._wait_for(
-                lambda: self._get_json(f"{base_url}/runs", token),
-                lambda payload: any(
+            try:
+                assert self._get_status(f"{base_url}/runs", None) == 401
+                assert self._get_status(f"{base_url}/runs", "bad-token") == 401
+
+                extty.log({"loss": 0.5, "acc": 0.8}, step=1)
+                extty.log(
+                    {"val/example": extty.Example(prompt="Hello", responses=["Hi"])},
+                    step=2,
+                )
+                extty.log({"loss": 0.4}, step=3)
+
+                runs_payload = self._wait_for(
+                    lambda: self._get_json(f"{base_url}/runs", token),
+                    lambda payload: any(
+                        run_data["name"] == "server-run"
+                        for run_data in payload.get("runs", [])
+                    ),
+                )
+                assert any(
                     run_data["name"] == "server-run"
-                    for run_data in payload.get("runs", [])
-                ),
-            )
-            assert any(
-                run_data["name"] == "server-run" for run_data in runs_payload["runs"]
-            )
+                    for run_data in runs_payload["runs"]
+                )
 
-            metrics_payload = self._wait_for(
-                lambda: self._get_json(
-                    f"{base_url}/runs/server-run/metrics?step=0", token
-                ),
-                lambda payload: any(
-                    metric["name"] == "loss" and len(metric["points"]) == 2
-                    for metric in payload.get("metrics", [])
-                ),
-            )
-            metrics_by_name = {
-                metric["name"]: metric for metric in metrics_payload["metrics"]
-            }
-            assert metrics_by_name["loss"]["points"][0]["value"] == 0.5
-            assert metrics_by_name["loss"]["points"][1]["value"] == 0.4
-            assert metrics_by_name["acc"]["points"][0]["value"] == 0.8
+                metrics_payload = self._wait_for(
+                    lambda: self._get_json(
+                        f"{base_url}/runs/server-run/metrics?step=0", token
+                    ),
+                    lambda payload: any(
+                        metric["name"] == "loss" and len(metric["points"]) == 2
+                        for metric in payload.get("metrics", [])
+                    ),
+                )
+                metrics_by_name = {
+                    metric["name"]: metric for metric in metrics_payload["metrics"]
+                }
+                assert metrics_by_name["loss"]["points"][0]["value"] == 0.5
+                assert metrics_by_name["loss"]["points"][1]["value"] == 0.4
+                assert metrics_by_name["acc"]["points"][0]["value"] == 0.8
 
-            examples_payload = self._wait_for(
-                lambda: self._get_json(
-                    f"{base_url}/runs/server-run/examples?step=0", token
-                ),
-                lambda payload: any(
-                    example["name"] == "val/example" and len(example["records"]) == 1
-                    for example in payload.get("examples", [])
-                ),
-            )
-            example_records = {
-                example["name"]: example for example in examples_payload["examples"]
-            }
-            assert example_records["val/example"]["records"][0]["data"]["response"] == [
-                ["Hi"]
+                examples_payload = self._wait_for(
+                    lambda: self._get_json(
+                        f"{base_url}/runs/server-run/examples?step=0", token
+                    ),
+                    lambda payload: any(
+                        example["name"] == "val/example"
+                        and len(example["records"]) == 1
+                        for example in payload.get("examples", [])
+                    ),
+                )
+                example_records = {
+                    example["name"]: example for example in examples_payload["examples"]
+                }
+                assert example_records["val/example"]["records"][0]["data"][
+                    "response"
+                ] == [["Hi"]]
+
+                system_payload = self._wait_for(
+                    lambda: self._get_json(
+                        f"{base_url}/runs/server-run/system?step=0", token
+                    ),
+                    lambda payload: len(payload.get("points", [])) >= 1,
+                )
+                assert len(system_payload["points"]) >= 1
+            finally:
+                extty.finish()
+
+
+class TestExampleRewards:
+    """Tests for Example and BatchExample reward functionality."""
+
+    def test_example_with_scalar_rewards(self) -> None:
+        """Test Example with scalar reward values."""
+        example = extty.Example(
+            prompt="What is 2+2?",
+            responses=["4", "Four", "The answer is 4"],
+            rewards=[0.95, 0.85, 0.90],
+        )
+        assert example.rewards == [0.95, 0.85, 0.90]
+        result = example.to_dict()
+        assert result["reward"] == [[0.95, 0.85, 0.90]]
+
+    def test_example_with_component_rewards(self) -> None:
+        """Test Example with component-based rewards (dict)."""
+        example = extty.Example(
+            prompt="Write a factorial function",
+            responses=["def factorial(n): ...", "def fact(n): ..."],
+            rewards=[
+                {"acc": 1.0, "fmt": 0.9, "eff": 0.7},
+                {"acc": 1.0, "fmt": 0.5, "eff": 0.95},
+            ],
+        )
+        assert example.rewards is not None
+        assert example.rewards[0] == {"acc": 1.0, "fmt": 0.9, "eff": 0.7}
+        result = example.to_dict()
+        assert result["reward"] == [
+            [
+                {"acc": 1.0, "fmt": 0.9, "eff": 0.7},
+                {"acc": 1.0, "fmt": 0.5, "eff": 0.95},
             ]
+        ]
 
-            system_payload = self._wait_for(
-                lambda: self._get_json(
-                    f"{base_url}/runs/server-run/system?step=0", token
-                ),
-                lambda payload: len(payload.get("points", [])) >= 1,
+    def test_example_without_rewards(self) -> None:
+        """Test Example without rewards (backward compatibility)."""
+        example = extty.Example(
+            prompt="Hello",
+            responses=["Hi", "Hello!"],
+        )
+        assert example.rewards is None
+        result = example.to_dict()
+        assert "reward" not in result
+
+    def test_example_rewards_length_mismatch_raises(self) -> None:
+        """Test that mismatched rewards/responses length raises ValueError."""
+        with pytest.raises(ValueError, match="rewards length .* != responses length"):
+            extty.Example(
+                prompt="Test",
+                responses=["A", "B", "C"],
+                rewards=[0.5, 0.6],  # Only 2 rewards for 3 responses
             )
-            assert len(system_payload["points"]) >= 1
-        finally:
+
+    def test_batch_example_with_scalar_rewards(self) -> None:
+        """Test BatchExample with scalar rewards."""
+        batch = extty.BatchExample(
+            prompts=["What is 2+2?", "What is 3+3?"],
+            responses=[["4", "Four"], ["6", "Six"]],
+            rewards=[[0.95, 0.85], [0.90, 0.80]],
+        )
+        assert batch.rewards == [[0.95, 0.85], [0.90, 0.80]]
+        result = batch.to_dict()
+        assert result["reward"] == [[0.95, 0.85], [0.90, 0.80]]
+
+    def test_batch_example_with_component_rewards(self) -> None:
+        """Test BatchExample with component-based rewards."""
+        batch = extty.BatchExample(
+            prompts=["Prompt 1", "Prompt 2"],
+            responses=[["R1a", "R1b"], ["R2a"]],
+            rewards=[
+                [{"acc": 1.0, "fmt": 0.9}, {"acc": 0.8, "fmt": 0.7}],
+                [{"acc": 0.95, "fmt": 0.85}],
+            ],
+        )
+        assert batch.rewards is not None
+        assert batch.rewards[0][0] == {"acc": 1.0, "fmt": 0.9}
+        result = batch.to_dict()
+        assert "reward" in result
+
+    def test_batch_example_without_rewards(self) -> None:
+        """Test BatchExample without rewards (backward compatibility)."""
+        batch = extty.BatchExample(
+            prompts=["P1", "P2"],
+            responses=[["R1"], ["R2"]],
+        )
+        assert batch.rewards is None
+        result = batch.to_dict()
+        assert "reward" not in result
+
+    def test_batch_example_rewards_outer_length_mismatch_raises(self) -> None:
+        """Test that mismatched outer rewards/prompts length raises ValueError."""
+        with pytest.raises(ValueError, match="rewards length .* != prompts length"):
+            extty.BatchExample(
+                prompts=["P1", "P2", "P3"],
+                responses=[["R1"], ["R2"], ["R3"]],
+                rewards=[[0.5], [0.6]],  # Only 2 reward groups for 3 prompts
+            )
+
+    def test_batch_example_rewards_inner_length_mismatch_raises(self) -> None:
+        """Test that mismatched inner rewards/responses length raises ValueError."""
+        with pytest.raises(
+            ValueError, match=r"rewards\[1\] length .* != responses\[1\] length"
+        ):
+            extty.BatchExample(
+                prompts=["P1", "P2"],
+                responses=[["R1a", "R1b"], ["R2a", "R2b", "R2c"]],
+                rewards=[
+                    [0.5, 0.6],
+                    [0.7, 0.8],
+                ],  # Second group has 2 rewards for 3 responses
+            )
+
+    def test_log_example_with_rewards(self, tmp_path: Path) -> None:
+        """Integration test: log Example with rewards and verify JSONL output."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="reward-test", system_metrics=False)
+            extty.log(
+                {
+                    "val/example": extty.Example(
+                        prompt="What is 2+2?",
+                        responses=["4", "Four"],
+                        rewards=[0.95, 0.80],
+                    )
+                },
+                step=10,
+            )
             extty.finish()
+
+            example_path = (
+                tmp_path
+                / "runs"
+                / "test-project"
+                / "reward-test"
+                / "examples"
+                / "val"
+                / "example.jsonl"
+            )
+            assert example_path.exists()
+            content = example_path.read_text()
+            data = json.loads(content)
+            assert data["data"]["reward"] == [[0.95, 0.80]]
+
+    def test_log_example_with_component_rewards(self, tmp_path: Path) -> None:
+        """Integration test: log Example with component rewards."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init(
+                "test-project", name="component-reward-test", system_metrics=False
+            )
+            extty.log(
+                {
+                    "train/code": extty.Example(
+                        prompt="Write factorial",
+                        responses=["def factorial(n): ..."],
+                        rewards=[{"acc": 1.0, "fmt": 0.9, "eff": 0.85}],
+                    )
+                },
+                step=100,
+            )
+            extty.finish()
+
+            example_path = (
+                tmp_path
+                / "runs"
+                / "test-project"
+                / "component-reward-test"
+                / "examples"
+                / "train"
+                / "code.jsonl"
+            )
+            assert example_path.exists()
+            content = example_path.read_text()
+            data = json.loads(content)
+            assert data["data"]["reward"] == [[{"acc": 1.0, "fmt": 0.9, "eff": 0.85}]]
 
 
 class TestModalIntegration:
@@ -366,8 +545,10 @@ class TestModalIntegration:
 
     def test_server_works_without_modal(self) -> None:
         """Integration test: server works when Modal is not available."""
-        # Patch find_spec in the server module to simulate modal not being installed
-        with mock.patch("extty.server.find_spec", return_value=None):
+        with (
+            mock.patch("extty.server.find_spec", return_value=None),
+            mock.patch("extty.run.time.sleep"),
+        ):
             run = extty.init(
                 "no-modal-test-project",
                 name="no-modal-test-run",
@@ -377,41 +558,32 @@ class TestModalIntegration:
             )
 
             try:
-                # Give the server time to start
-                time.sleep(0.5)
-
-                # Verify server started successfully in regular mode
                 assert run.server_info is not None
                 assert run.server_info.port > 0
                 assert run.server_info.host == "127.0.0.1"
             finally:
                 extty.finish()
-                # Give server time to shut down
-                time.sleep(0.5)
 
     def test_server_works_with_modal_available_but_not_in_function(self) -> None:
         """Integration test: server uses regular mode when modal available but not in function."""
-        # Create a mock modal that returns None for current_function_call_id
         mock_modal = mock.MagicMock()
         mock_modal.current_function_call_id.return_value = None
 
-        with mock.patch("extty.server.find_spec", return_value=mock.MagicMock()):
-            with mock.patch.dict("sys.modules", {"modal": mock_modal}):
-                run = extty.init(
-                    "modal-available-test",
-                    name="modal-available-test-run",
-                    system_metrics=False,
-                    server=True,
-                    server_host="127.0.0.1",
-                )
+        with (
+            mock.patch("extty.server.find_spec", return_value=mock.MagicMock()),
+            mock.patch.dict("sys.modules", {"modal": mock_modal}),
+            mock.patch("extty.run.time.sleep"),
+        ):
+            run = extty.init(
+                "modal-available-test",
+                name="modal-available-test-run",
+                system_metrics=False,
+                server=True,
+                server_host="127.0.0.1",
+            )
 
-                try:
-                    # Give the server time to start
-                    time.sleep(0.5)
-
-                    # Verify server started successfully
-                    assert run.server_info is not None
-                    assert run.server_info.port > 0
-                finally:
-                    extty.finish()
-                    time.sleep(0.5)
+            try:
+                assert run.server_info is not None
+                assert run.server_info.port > 0
+            finally:
+                extty.finish()
