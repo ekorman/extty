@@ -315,6 +315,181 @@ class TestExttyServerMode:
                 extty.finish()
 
 
+class TestExampleRewards:
+    """Tests for Example and BatchExample reward functionality."""
+
+    def test_example_with_scalar_rewards(self) -> None:
+        """Test Example with scalar reward values."""
+        example = extty.Example(
+            prompt="What is 2+2?",
+            responses=["4", "Four", "The answer is 4"],
+            rewards=[0.95, 0.85, 0.90],
+        )
+        assert example.rewards == [0.95, 0.85, 0.90]
+        result = example.to_dict()
+        assert result["reward"] == [[0.95, 0.85, 0.90]]
+
+    def test_example_with_component_rewards(self) -> None:
+        """Test Example with component-based rewards (dict)."""
+        example = extty.Example(
+            prompt="Write a factorial function",
+            responses=["def factorial(n): ...", "def fact(n): ..."],
+            rewards=[
+                {"acc": 1.0, "fmt": 0.9, "eff": 0.7},
+                {"acc": 1.0, "fmt": 0.5, "eff": 0.95},
+            ],
+        )
+        assert example.rewards is not None
+        assert example.rewards[0] == {"acc": 1.0, "fmt": 0.9, "eff": 0.7}
+        result = example.to_dict()
+        assert result["reward"] == [
+            [
+                {"acc": 1.0, "fmt": 0.9, "eff": 0.7},
+                {"acc": 1.0, "fmt": 0.5, "eff": 0.95},
+            ]
+        ]
+
+    def test_example_without_rewards(self) -> None:
+        """Test Example without rewards (backward compatibility)."""
+        example = extty.Example(
+            prompt="Hello",
+            responses=["Hi", "Hello!"],
+        )
+        assert example.rewards is None
+        result = example.to_dict()
+        assert "reward" not in result
+
+    def test_example_rewards_length_mismatch_raises(self) -> None:
+        """Test that mismatched rewards/responses length raises ValueError."""
+        with pytest.raises(ValueError, match="rewards length .* != responses length"):
+            extty.Example(
+                prompt="Test",
+                responses=["A", "B", "C"],
+                rewards=[0.5, 0.6],  # Only 2 rewards for 3 responses
+            )
+
+    def test_batch_example_with_scalar_rewards(self) -> None:
+        """Test BatchExample with scalar rewards."""
+        batch = extty.BatchExample(
+            prompts=["What is 2+2?", "What is 3+3?"],
+            responses=[["4", "Four"], ["6", "Six"]],
+            rewards=[[0.95, 0.85], [0.90, 0.80]],
+        )
+        assert batch.rewards == [[0.95, 0.85], [0.90, 0.80]]
+        result = batch.to_dict()
+        assert result["reward"] == [[0.95, 0.85], [0.90, 0.80]]
+
+    def test_batch_example_with_component_rewards(self) -> None:
+        """Test BatchExample with component-based rewards."""
+        batch = extty.BatchExample(
+            prompts=["Prompt 1", "Prompt 2"],
+            responses=[["R1a", "R1b"], ["R2a"]],
+            rewards=[
+                [{"acc": 1.0, "fmt": 0.9}, {"acc": 0.8, "fmt": 0.7}],
+                [{"acc": 0.95, "fmt": 0.85}],
+            ],
+        )
+        assert batch.rewards is not None
+        assert batch.rewards[0][0] == {"acc": 1.0, "fmt": 0.9}
+        result = batch.to_dict()
+        assert "reward" in result
+
+    def test_batch_example_without_rewards(self) -> None:
+        """Test BatchExample without rewards (backward compatibility)."""
+        batch = extty.BatchExample(
+            prompts=["P1", "P2"],
+            responses=[["R1"], ["R2"]],
+        )
+        assert batch.rewards is None
+        result = batch.to_dict()
+        assert "reward" not in result
+
+    def test_batch_example_rewards_outer_length_mismatch_raises(self) -> None:
+        """Test that mismatched outer rewards/prompts length raises ValueError."""
+        with pytest.raises(ValueError, match="rewards length .* != prompts length"):
+            extty.BatchExample(
+                prompts=["P1", "P2", "P3"],
+                responses=[["R1"], ["R2"], ["R3"]],
+                rewards=[[0.5], [0.6]],  # Only 2 reward groups for 3 prompts
+            )
+
+    def test_batch_example_rewards_inner_length_mismatch_raises(self) -> None:
+        """Test that mismatched inner rewards/responses length raises ValueError."""
+        with pytest.raises(
+            ValueError, match=r"rewards\[1\] length .* != responses\[1\] length"
+        ):
+            extty.BatchExample(
+                prompts=["P1", "P2"],
+                responses=[["R1a", "R1b"], ["R2a", "R2b", "R2c"]],
+                rewards=[
+                    [0.5, 0.6],
+                    [0.7, 0.8],
+                ],  # Second group has 2 rewards for 3 responses
+            )
+
+    def test_log_example_with_rewards(self, tmp_path: Path) -> None:
+        """Integration test: log Example with rewards and verify JSONL output."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="reward-test", system_metrics=False)
+            extty.log(
+                {
+                    "val/example": extty.Example(
+                        prompt="What is 2+2?",
+                        responses=["4", "Four"],
+                        rewards=[0.95, 0.80],
+                    )
+                },
+                step=10,
+            )
+            extty.finish()
+
+            example_path = (
+                tmp_path
+                / "runs"
+                / "test-project"
+                / "reward-test"
+                / "examples"
+                / "val"
+                / "example.jsonl"
+            )
+            assert example_path.exists()
+            content = example_path.read_text()
+            data = json.loads(content)
+            assert data["data"]["reward"] == [[0.95, 0.80]]
+
+    def test_log_example_with_component_rewards(self, tmp_path: Path) -> None:
+        """Integration test: log Example with component rewards."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init(
+                "test-project", name="component-reward-test", system_metrics=False
+            )
+            extty.log(
+                {
+                    "train/code": extty.Example(
+                        prompt="Write factorial",
+                        responses=["def factorial(n): ..."],
+                        rewards=[{"acc": 1.0, "fmt": 0.9, "eff": 0.85}],
+                    )
+                },
+                step=100,
+            )
+            extty.finish()
+
+            example_path = (
+                tmp_path
+                / "runs"
+                / "test-project"
+                / "component-reward-test"
+                / "examples"
+                / "train"
+                / "code.jsonl"
+            )
+            assert example_path.exists()
+            content = example_path.read_text()
+            data = json.loads(content)
+            assert data["data"]["reward"] == [[{"acc": 1.0, "fmt": 0.9, "eff": 0.85}]]
+
+
 class TestModalIntegration:
     """Test Modal tunnel integration for server mode."""
 
