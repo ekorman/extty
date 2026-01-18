@@ -13,12 +13,28 @@ pub struct MetricPoint {
     pub value: f64,
 }
 
+#[derive(Debug, Clone)]
+pub enum Reward {
+    Scalar(f64),
+    Components(HashMap<String, f64>),
+}
+
+impl Reward {
+    pub fn total(&self) -> f64 {
+        match self {
+            Reward::Scalar(v) => *v,
+            Reward::Components(map) => map.values().sum(),
+        }
+    }
+}
+
 // A prompt/response example (supports batched prompts and grouped responses)
 #[derive(Debug, Clone)]
 pub struct Example {
     pub step: u64,
     pub prompts: Vec<String>,
     pub responses: Vec<Vec<String>>,
+    pub rewards: Option<Vec<Reward>>,
 }
 
 // Run status
@@ -486,12 +502,117 @@ where
     deserializer.deserialize_any(ResponsesVisitor)
 }
 
+/// Helper to deserialize rewards: can be a single f64, a dict of f64 values, or an array of either
+fn deserialize_rewards<'de, D>(deserializer: D) -> Result<Option<Vec<Reward>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct RewardsVisitor;
+
+    impl<'de> de::Visitor<'de> for RewardsVisitor {
+        type Value = Option<Vec<Reward>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a number, object, or array of numbers/objects")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(vec![Reward::Scalar(value)]))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(vec![Reward::Scalar(value as f64)]))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(vec![Reward::Scalar(value as f64)]))
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::MapAccess<'de>,
+        {
+            let mut components = HashMap::new();
+            while let Some((key, value)) = map.next_entry::<String, f64>()? {
+                components.insert(key, value);
+            }
+            Ok(Some(vec![Reward::Components(components)]))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut rewards = Vec::new();
+            while let Some(elem) = seq.next_element::<serde_json::Value>()? {
+                let reward = match elem {
+                    serde_json::Value::Number(n) => {
+                        Reward::Scalar(n.as_f64().ok_or_else(|| {
+                            de::Error::custom("expected f64-compatible number in reward array")
+                        })?)
+                    }
+                    serde_json::Value::Object(obj) => {
+                        let mut components = HashMap::new();
+                        for (k, v) in obj {
+                            let val = v.as_f64().ok_or_else(|| {
+                                de::Error::custom("expected f64 value in reward object")
+                            })?;
+                            components.insert(k, val);
+                        }
+                        Reward::Components(components)
+                    }
+                    _ => {
+                        return Err(de::Error::custom(
+                            "expected number or object in reward array",
+                        ));
+                    }
+                };
+                rewards.push(reward);
+            }
+            if rewards.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(rewards))
+            }
+        }
+    }
+
+    deserializer.deserialize_any(RewardsVisitor)
+}
+
 #[derive(Debug, Deserialize)]
 struct ExampleData {
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     prompt: Vec<String>,
     #[serde(deserialize_with = "deserialize_responses")]
     response: Vec<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_rewards")]
+    reward: Option<Vec<Reward>>,
 }
 
 // Load examples from a JSONL file
@@ -507,6 +628,7 @@ fn load_examples_jsonl(path: &PathBuf) -> Result<Vec<Example>, std::io::Error> {
                 step: row.step,
                 prompts: row.data.prompt,
                 responses: row.data.response,
+                rewards: row.data.reward,
             });
         }
     }

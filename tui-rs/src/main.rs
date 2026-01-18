@@ -23,7 +23,7 @@ const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
 mod remote;
-use data::{MetricPoint, Run, load_runs};
+use data::{Example, MetricPoint, Reward, Run, load_runs};
 use remote::RemoteSync;
 
 // The views in our app
@@ -1185,7 +1185,7 @@ fn render_examples_card(
     frame: &mut Frame,
     area: Rect,
     name: &str,
-    examples: &[data::Example],
+    examples: &[Example],
     selected: bool,
 ) {
     let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
@@ -1238,25 +1238,35 @@ fn render_examples_card(
         ))]
     };
 
+    // Calculate average reward if rewards exist
+    let avg_reward = compute_average_reward(examples);
+
     // Build title with batch info if applicable
     let batch_size = examples.last().map(|e| e.prompts.len()).unwrap_or(0);
-    let title = if batch_size > 1 {
-        Line::from(vec![
-            Span::styled(format!("{} ", name), title_style),
-            Span::styled(
-                format!("({} total, batch={})", examples.len(), batch_size),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
+    let mut title_spans = vec![Span::styled(format!("{} ", name), title_style)];
+
+    if batch_size > 1 {
+        title_spans.push(Span::styled(
+            format!("({} total, batch={})", examples.len(), batch_size),
+            Style::default().fg(Color::DarkGray),
+        ));
     } else {
-        Line::from(vec![
-            Span::styled(format!("{} ", name), title_style),
-            Span::styled(
-                format!("({} total)", examples.len()),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    };
+        title_spans.push(Span::styled(
+            format!("({} total)", examples.len()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    if let Some(avg) = avg_reward {
+        let reward_color = reward_color(avg);
+        title_spans.push(Span::styled(" ", Style::default()));
+        title_spans.push(Span::styled(
+            format!("[avg: {:.2}]", avg),
+            Style::default().fg(reward_color),
+        ));
+    }
+
+    let title = Line::from(title_spans);
 
     let block = Block::default()
         .title(title)
@@ -1269,6 +1279,34 @@ fn render_examples_card(
         .wrap(ratatui::widgets::Wrap { trim: true });
 
     frame.render_widget(paragraph, area);
+}
+
+fn compute_average_reward(examples: &[Example]) -> Option<f64> {
+    let mut total = 0.0;
+    let mut count = 0;
+    for example in examples {
+        if let Some(rewards) = &example.rewards {
+            for reward in rewards {
+                total += reward.total();
+                count += 1;
+            }
+        }
+    }
+    if count > 0 {
+        Some(total / count as f64)
+    } else {
+        None
+    }
+}
+
+fn reward_color(reward: f64) -> Color {
+    if reward >= 0.7 {
+        NEON_GREEN
+    } else if reward >= 0.3 {
+        NEON_YELLOW
+    } else {
+        NEON_MAGENTA
+    }
 }
 
 fn render_focused(app: &App, frame: &mut Frame) {
@@ -1403,7 +1441,7 @@ fn render_focused_example(
     group_name: &str,
     index: usize,
     total: usize,
-    example: &data::Example,
+    example: &Example,
     selected_prompt: usize,
     selected_response: usize,
     focused_section: FocusedSection,
@@ -1471,6 +1509,12 @@ fn render_focused_example(
         .cloned()
         .unwrap_or_default();
 
+    // Get the reward for the selected response variant (if it exists)
+    let current_reward = example
+        .rewards
+        .as_ref()
+        .and_then(|rewards| rewards.get(selected_response));
+
     // Response title with variant indicator if multiple responses
     let response_focused = focused_section == FocusedSection::Response;
     let response_border_color = if response_focused {
@@ -1478,22 +1522,59 @@ fn render_focused_example(
     } else {
         DIM_CYAN
     };
-    let response_title = if responses_for_prompt.len() > 1 {
-        Line::from(vec![
-            Span::styled("◆ RESPONSE ", Style::default().fg(NEON_GREEN).bold()),
+
+    let mut response_title_spans = vec![Span::styled(
+        "◆ RESPONSE ",
+        Style::default().fg(NEON_GREEN).bold(),
+    )];
+
+    if responses_for_prompt.len() > 1 {
+        response_title_spans.extend(vec![
             Span::styled("│ ", Style::default().fg(DIM_CYAN)),
             Span::styled("group ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{}/{}", selected_response + 1, responses_for_prompt.len()),
                 Style::default().fg(NEON_MAGENTA),
             ),
-        ])
-    } else {
-        Line::from(vec![Span::styled(
-            "◆ RESPONSE ",
-            Style::default().fg(NEON_GREEN).bold(),
-        )])
-    };
+        ]);
+    }
+
+    if let Some(reward) = current_reward {
+        response_title_spans.push(Span::styled(" │ ", Style::default().fg(DIM_CYAN)));
+        match reward {
+            Reward::Scalar(v) => {
+                let color = reward_color(*v);
+                response_title_spans.push(Span::styled(
+                    "reward: ",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                response_title_spans.push(Span::styled(
+                    format!("{:.2}", v),
+                    Style::default().fg(color),
+                ));
+            }
+            Reward::Components(map) => {
+                let mut parts: Vec<(&String, &f64)> = map.iter().collect();
+                parts.sort_by_key(|(k, _)| *k);
+                for (i, (key, value)) in parts.iter().enumerate() {
+                    let color = reward_color(**value);
+                    if i > 0 {
+                        response_title_spans.push(Span::styled("  ", Style::default()));
+                    }
+                    response_title_spans.push(Span::styled(
+                        format!("{}: ", key),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    response_title_spans.push(Span::styled(
+                        format!("{:.1}", value),
+                        Style::default().fg(color),
+                    ));
+                }
+            }
+        }
+    }
+
+    let response_title = Line::from(response_title_spans);
 
     // Get the selected response text
     let response_text = responses_for_prompt
