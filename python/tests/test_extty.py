@@ -236,79 +236,83 @@ class TestExttyServerMode:
             return error.code
 
     def test_server_endpoints_receive_logs(self) -> None:
-        run = extty.init(
-            "server-project",
-            name="server-run",
-            system_metrics=True,
-            server=True,
-            server_host="127.0.0.1",
-        )
-        assert run.server_info is not None
-        token = run.server_info.token
-        base_url = run.server_info.base_url
-
-        try:
-            assert self._get_status(f"{base_url}/runs", None) == 401
-            assert self._get_status(f"{base_url}/runs", "bad-token") == 401
-
-            extty.log({"loss": 0.5, "acc": 0.8}, step=1)
-            extty.log(
-                {"val/example": extty.Example(prompt="Hello", responses=["Hi"])}, step=2
+        with mock.patch("extty.run.time.sleep"):
+            run = extty.init(
+                "server-project",
+                name="server-run",
+                system_metrics=True,
+                server=True,
+                server_host="127.0.0.1",
             )
-            extty.log({"loss": 0.4}, step=3)
+            assert run.server_info is not None
+            token = run.server_info.token
+            base_url = run.server_info.base_url
 
-            runs_payload = self._wait_for(
-                lambda: self._get_json(f"{base_url}/runs", token),
-                lambda payload: any(
+            try:
+                assert self._get_status(f"{base_url}/runs", None) == 401
+                assert self._get_status(f"{base_url}/runs", "bad-token") == 401
+
+                extty.log({"loss": 0.5, "acc": 0.8}, step=1)
+                extty.log(
+                    {"val/example": extty.Example(prompt="Hello", responses=["Hi"])},
+                    step=2,
+                )
+                extty.log({"loss": 0.4}, step=3)
+
+                runs_payload = self._wait_for(
+                    lambda: self._get_json(f"{base_url}/runs", token),
+                    lambda payload: any(
+                        run_data["name"] == "server-run"
+                        for run_data in payload.get("runs", [])
+                    ),
+                )
+                assert any(
                     run_data["name"] == "server-run"
-                    for run_data in payload.get("runs", [])
-                ),
-            )
-            assert any(
-                run_data["name"] == "server-run" for run_data in runs_payload["runs"]
-            )
+                    for run_data in runs_payload["runs"]
+                )
 
-            metrics_payload = self._wait_for(
-                lambda: self._get_json(
-                    f"{base_url}/runs/server-run/metrics?step=0", token
-                ),
-                lambda payload: any(
-                    metric["name"] == "loss" and len(metric["points"]) == 2
-                    for metric in payload.get("metrics", [])
-                ),
-            )
-            metrics_by_name = {
-                metric["name"]: metric for metric in metrics_payload["metrics"]
-            }
-            assert metrics_by_name["loss"]["points"][0]["value"] == 0.5
-            assert metrics_by_name["loss"]["points"][1]["value"] == 0.4
-            assert metrics_by_name["acc"]["points"][0]["value"] == 0.8
+                metrics_payload = self._wait_for(
+                    lambda: self._get_json(
+                        f"{base_url}/runs/server-run/metrics?step=0", token
+                    ),
+                    lambda payload: any(
+                        metric["name"] == "loss" and len(metric["points"]) == 2
+                        for metric in payload.get("metrics", [])
+                    ),
+                )
+                metrics_by_name = {
+                    metric["name"]: metric for metric in metrics_payload["metrics"]
+                }
+                assert metrics_by_name["loss"]["points"][0]["value"] == 0.5
+                assert metrics_by_name["loss"]["points"][1]["value"] == 0.4
+                assert metrics_by_name["acc"]["points"][0]["value"] == 0.8
 
-            examples_payload = self._wait_for(
-                lambda: self._get_json(
-                    f"{base_url}/runs/server-run/examples?step=0", token
-                ),
-                lambda payload: any(
-                    example["name"] == "val/example" and len(example["records"]) == 1
-                    for example in payload.get("examples", [])
-                ),
-            )
-            example_records = {
-                example["name"]: example for example in examples_payload["examples"]
-            }
-            assert example_records["val/example"]["records"][0]["data"]["response"] == [
-                ["Hi"]
-            ]
+                examples_payload = self._wait_for(
+                    lambda: self._get_json(
+                        f"{base_url}/runs/server-run/examples?step=0", token
+                    ),
+                    lambda payload: any(
+                        example["name"] == "val/example"
+                        and len(example["records"]) == 1
+                        for example in payload.get("examples", [])
+                    ),
+                )
+                example_records = {
+                    example["name"]: example for example in examples_payload["examples"]
+                }
+                assert example_records["val/example"]["records"][0]["data"][
+                    "response"
+                ] == [["Hi"]]
 
-            system_payload = self._wait_for(
-                lambda: self._get_json(
-                    f"{base_url}/runs/server-run/system?step=0", token
-                ),
-                lambda payload: len(payload.get("points", [])) >= 1,
-            )
-            assert len(system_payload["points"]) >= 1
-        finally:
-            extty.finish()
+                system_payload = self._wait_for(
+                    lambda: self._get_json(
+                        f"{base_url}/runs/server-run/system?step=0", token
+                    ),
+                    lambda payload: len(payload.get("points", [])) >= 1,
+                )
+                assert len(system_payload["points"]) >= 1
+            finally:
+                extty.finish()
 
 
 class TestModalIntegration:
@@ -366,8 +370,10 @@ class TestModalIntegration:
 
     def test_server_works_without_modal(self) -> None:
         """Integration test: server works when Modal is not available."""
-        # Patch find_spec in the server module to simulate modal not being installed
-        with mock.patch("extty.server.find_spec", return_value=None):
+        with (
+            mock.patch("extty.server.find_spec", return_value=None),
+            mock.patch("extty.run.time.sleep"),
+        ):
             run = extty.init(
                 "no-modal-test-project",
                 name="no-modal-test-run",
@@ -377,41 +383,32 @@ class TestModalIntegration:
             )
 
             try:
-                # Give the server time to start
-                time.sleep(0.5)
-
-                # Verify server started successfully in regular mode
                 assert run.server_info is not None
                 assert run.server_info.port > 0
                 assert run.server_info.host == "127.0.0.1"
             finally:
                 extty.finish()
-                # Give server time to shut down
-                time.sleep(0.5)
 
     def test_server_works_with_modal_available_but_not_in_function(self) -> None:
         """Integration test: server uses regular mode when modal available but not in function."""
-        # Create a mock modal that returns None for current_function_call_id
         mock_modal = mock.MagicMock()
         mock_modal.current_function_call_id.return_value = None
 
-        with mock.patch("extty.server.find_spec", return_value=mock.MagicMock()):
-            with mock.patch.dict("sys.modules", {"modal": mock_modal}):
-                run = extty.init(
-                    "modal-available-test",
-                    name="modal-available-test-run",
-                    system_metrics=False,
-                    server=True,
-                    server_host="127.0.0.1",
-                )
+        with (
+            mock.patch("extty.server.find_spec", return_value=mock.MagicMock()),
+            mock.patch.dict("sys.modules", {"modal": mock_modal}),
+            mock.patch("extty.run.time.sleep"),
+        ):
+            run = extty.init(
+                "modal-available-test",
+                name="modal-available-test-run",
+                system_metrics=False,
+                server=True,
+                server_host="127.0.0.1",
+            )
 
-                try:
-                    # Give the server time to start
-                    time.sleep(0.5)
-
-                    # Verify server started successfully
-                    assert run.server_info is not None
-                    assert run.server_info.port > 0
-                finally:
-                    extty.finish()
-                    time.sleep(0.5)
+            try:
+                assert run.server_info is not None
+                assert run.server_info.port > 0
+            finally:
+                extty.finish()
