@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -25,6 +27,20 @@ mod data;
 mod remote;
 use data::{Example, MetricPoint, Reward, Run, load_runs};
 use remote::RemoteSync;
+
+enum SyncMessage {
+    SyncCompleted,
+}
+
+fn run_sync_loop(mut remote_sync: RemoteSync, tx: mpsc::Sender<SyncMessage>) {
+    loop {
+        thread::sleep(Duration::from_millis(500));
+
+        if remote_sync.sync().is_ok() && tx.send(SyncMessage::SyncCompleted).is_err() {
+            break;
+        }
+    }
+}
 
 // The views in our app
 #[derive(Clone, Copy, PartialEq)]
@@ -77,11 +93,10 @@ struct App {
     // Terminal dimensions for layout calculations
     term_width: u16,
     term_height: u16,
-    remote_sync: Option<RemoteSync>,
 }
 
 impl App {
-    fn new(remote_sync: Option<RemoteSync>) -> Self {
+    fn new() -> Self {
         let runs = load_runs();
         App {
             runs,
@@ -103,7 +118,6 @@ impl App {
             pending_delete_run: None,
             term_width: 80,
             term_height: 24,
-            remote_sync,
         }
     }
 
@@ -168,13 +182,6 @@ impl App {
                 self.runs[self.selected_run] = updated;
             }
         }
-    }
-
-    fn sync_remote(&mut self) -> Result<()> {
-        if let Some(remote_sync) = self.remote_sync.as_mut() {
-            remote_sync.sync()?;
-        }
-        Ok(())
     }
 
     fn grid_layout(&self) -> (usize, usize) {
@@ -562,14 +569,17 @@ impl App {
 
 fn main() -> Result<()> {
     let options = parse_options()?;
-    let remote_sync = if let Some(remote_url) = options.remote_url {
+
+    let sync_rx: Option<Receiver<SyncMessage>> = if let Some(remote_url) = options.remote_url {
         let runs_dir = remote_runs_dir();
         let token = options
             .token
             .or_else(|| std::env::var("EX_REMOTE_TOKEN").ok());
-        let mut sync = RemoteSync::new(remote_url, token, runs_dir)?;
-        sync.sync()?;
-        Some(sync)
+        let mut remote_sync = RemoteSync::new(remote_url, token, runs_dir)?;
+        remote_sync.sync()?;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || run_sync_loop(remote_sync, tx));
+        Some(rx)
     } else {
         None
     };
@@ -582,32 +592,30 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run event loop
-    let mut app = App::new(remote_sync);
+    let mut app = App::new();
     let mut last_list_refresh = Instant::now();
-    let mut last_data_refresh = Instant::now();
     let list_refresh_interval = Duration::from_secs(3);
-    let data_refresh_interval = Duration::from_millis(500);
 
     while !app.should_quit {
         // Update terminal size
         let size = terminal.size()?;
         app.update_size(size.width, size.height);
 
-        // Periodic refresh of run list (less frequent)
-        if last_list_refresh.elapsed() >= list_refresh_interval {
-            let _ = app.sync_remote();
-            app.refresh_runs();
-            last_list_refresh = Instant::now();
-            last_data_refresh = Instant::now();
+        // Check for sync messages from background thread (non-blocking)
+        if let Some(rx) = &sync_rx
+            && let Ok(SyncMessage::SyncCompleted) = rx.try_recv()
+        {
+            if matches!(app.view, View::Detail | View::Focused) {
+                app.refresh_current_run();
+            } else {
+                app.refresh_runs();
+            }
         }
 
-        // Faster refresh of current run data when viewing details
-        if matches!(app.view, View::Detail | View::Focused)
-            && last_data_refresh.elapsed() >= data_refresh_interval
-        {
-            let _ = app.sync_remote();
-            app.refresh_current_run();
-            last_data_refresh = Instant::now();
+        // Periodic refresh of run list for local runs (less frequent)
+        if last_list_refresh.elapsed() >= list_refresh_interval {
+            app.refresh_runs();
+            last_list_refresh = Instant::now();
         }
 
         // Draw the UI
@@ -888,10 +896,22 @@ fn render_detail(app: &App, frame: &mut Frame) {
     };
 
     let total_examples: usize = run.examples.values().map(|v| v.len()).sum();
+    let latest_step = run
+        .metrics
+        .values()
+        .flat_map(|pts| pts.last())
+        .map(|p| p.step)
+        .max()
+        .unwrap_or(0);
     let mut header_spans = vec![
         Span::styled("◆ ", Style::default().fg(NEON_MAGENTA)),
         Span::styled(run.display_name(), Style::default().fg(NEON_CYAN).bold()),
         Span::styled("  │  ", Style::default().fg(DIM_CYAN)),
+        Span::styled(
+            format!("{}", latest_step),
+            Style::default().fg(NEON_MAGENTA),
+        ),
+        Span::styled(" steps  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}", run.metrics.len()),
             Style::default().fg(NEON_GREEN),

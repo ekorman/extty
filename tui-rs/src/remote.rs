@@ -45,7 +45,10 @@ impl RemoteSync {
         for run in runs {
             self.ensure_run_dir(&run)?;
             let run_dir = self.run_dir(&run);
-            let cursor = self.cursors.entry(run.name.clone()).or_default();
+            let cursor = self
+                .cursors
+                .entry(run.name.clone())
+                .or_insert_with(|| read_cursor_from_disk(&run_dir));
 
             let metrics = self.client.fetch_metrics(&run.name, cursor.metric_step)?;
             cursor.metric_step = write_metric_series(&run_dir, metrics, cursor.metric_step)?;
@@ -387,4 +390,94 @@ fn sanitize_metric_name(name: &str) -> String {
         }
     }
     sanitized
+}
+
+fn read_cursor_from_disk(run_dir: &Path) -> RunCursor {
+    RunCursor {
+        metric_step: read_max_step_from_metrics(run_dir),
+        example_step: read_max_step_from_examples(run_dir),
+        system_step: read_row_count(&run_dir.join("system.csv")),
+    }
+}
+
+fn read_max_step_from_metrics(run_dir: &Path) -> u64 {
+    let metrics_dir = run_dir.join("metrics");
+    if !metrics_dir.exists() {
+        return 0;
+    }
+    find_csv_files(&metrics_dir)
+        .into_iter()
+        .filter_map(|path| read_max_step_from_csv(&path))
+        .max()
+        .unwrap_or(0)
+}
+
+fn read_max_step_from_examples(run_dir: &Path) -> u64 {
+    let examples_dir = run_dir.join("examples");
+    if !examples_dir.exists() {
+        return 0;
+    }
+    find_jsonl_files(&examples_dir)
+        .into_iter()
+        .filter_map(|path| read_max_step_from_jsonl(&path))
+        .max()
+        .unwrap_or(0)
+}
+
+fn find_csv_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(find_csv_files(&path));
+            } else if path.extension().is_some_and(|ext| ext == "csv") {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn find_jsonl_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(find_jsonl_files(&path));
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn read_max_step_from_csv(path: &Path) -> Option<u64> {
+    let content = fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .skip(1) // skip header
+        .filter_map(|line| line.split(',').next()?.parse::<u64>().ok())
+        .max()
+}
+
+fn read_max_step_from_jsonl(path: &Path) -> Option<u64> {
+    let content = fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .filter_map(|line| {
+            let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+            obj.get("step")?.as_u64()
+        })
+        .max()
+}
+
+fn read_row_count(path: &Path) -> u64 {
+    let Ok(content) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let count = content.lines().skip(1).count(); // skip header
+    count as u64
 }
