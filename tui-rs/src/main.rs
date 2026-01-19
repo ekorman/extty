@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,43 +30,14 @@ use remote::RemoteSync;
 
 enum SyncMessage {
     SyncCompleted,
-    Error,
 }
 
-fn run_sync_loop(
-    remote_url: String,
-    token: Option<String>,
-    runs_dir: PathBuf,
-    tx: mpsc::Sender<SyncMessage>,
-) {
-    let mut remote_sync = match RemoteSync::new(remote_url, token, runs_dir) {
-        Ok(sync) => sync,
-        Err(_) => {
-            let _ = tx.send(SyncMessage::Error);
-            return;
-        }
-    };
-
-    if remote_sync.sync().is_err() {
-        let _ = tx.send(SyncMessage::Error);
-    } else {
-        let _ = tx.send(SyncMessage::SyncCompleted);
-    }
-
+fn run_sync_loop(mut remote_sync: RemoteSync, tx: mpsc::Sender<SyncMessage>) {
     loop {
         thread::sleep(Duration::from_millis(500));
 
-        match remote_sync.sync() {
-            Ok(()) => {
-                if tx.send(SyncMessage::SyncCompleted).is_err() {
-                    break;
-                }
-            }
-            Err(_) => {
-                if tx.send(SyncMessage::Error).is_err() {
-                    break;
-                }
-            }
+        if remote_sync.sync().is_ok() && tx.send(SyncMessage::SyncCompleted).is_err() {
+            break;
         }
     }
 }
@@ -604,8 +575,10 @@ fn main() -> Result<()> {
         let token = options
             .token
             .or_else(|| std::env::var("EX_REMOTE_TOKEN").ok());
+        let mut remote_sync = RemoteSync::new(remote_url, token, runs_dir)?;
+        remote_sync.sync()?;
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || run_sync_loop(remote_url, token, runs_dir, tx));
+        thread::spawn(move || run_sync_loop(remote_sync, tx));
         Some(rx)
     } else {
         None
@@ -629,18 +602,13 @@ fn main() -> Result<()> {
         app.update_size(size.width, size.height);
 
         // Check for sync messages from background thread (non-blocking)
-        if let Some(rx) = &sync_rx {
-            match rx.try_recv() {
-                Ok(SyncMessage::SyncCompleted) => {
-                    if matches!(app.view, View::Detail | View::Focused) {
-                        app.refresh_current_run();
-                    } else {
-                        app.refresh_runs();
-                    }
-                }
-                Ok(SyncMessage::Error) => {}
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {}
+        if let Some(rx) = &sync_rx
+            && let Ok(SyncMessage::SyncCompleted) = rx.try_recv()
+        {
+            if matches!(app.view, View::Detail | View::Focused) {
+                app.refresh_current_run();
+            } else {
+                app.refresh_runs();
             }
         }
 
@@ -928,10 +896,22 @@ fn render_detail(app: &App, frame: &mut Frame) {
     };
 
     let total_examples: usize = run.examples.values().map(|v| v.len()).sum();
+    let latest_step = run
+        .metrics
+        .values()
+        .flat_map(|pts| pts.last())
+        .map(|p| p.step)
+        .max()
+        .unwrap_or(0);
     let mut header_spans = vec![
         Span::styled("◆ ", Style::default().fg(NEON_MAGENTA)),
         Span::styled(run.display_name(), Style::default().fg(NEON_CYAN).bold()),
         Span::styled("  │  ", Style::default().fg(DIM_CYAN)),
+        Span::styled(
+            format!("{}", latest_step),
+            Style::default().fg(NEON_MAGENTA),
+        ),
+        Span::styled(" steps  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}", run.metrics.len()),
             Style::default().fg(NEON_GREEN),
