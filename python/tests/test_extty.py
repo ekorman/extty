@@ -587,3 +587,91 @@ class TestModalIntegration:
                 assert run.server_info.port > 0
             finally:
                 extty.finish()
+
+
+class TestExperimentDecorator:
+    def test_decorator_initializes_and_finishes_run(self, tmp_path: Path) -> None:
+        """Test that the decorator properly initializes and finishes a run."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment(
+                "test-project", name="decorator-test", system_metrics=False
+            )
+            def my_experiment(lr: float = 0.01, epochs: int = 10) -> str:
+                return "done"
+
+            result = my_experiment(lr=0.001, epochs=5)
+
+            assert result == "done"
+            # Verify run was finished (no active run)
+            assert extty._active_run is None
+            # Verify meta.json was created
+            meta_path = (
+                tmp_path / "runs" / "test-project" / "decorator-test" / "meta.json"
+            )
+            assert meta_path.exists()
+
+    def test_decorator_logs_kwargs_as_config(self, tmp_path: Path) -> None:
+        """Test that kwargs passed to the decorated function are logged as config."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment("test-project", name="config-test", system_metrics=False)
+            def my_experiment(lr: float = 0.01, batch_size: int = 32) -> None:
+                pass
+
+            my_experiment(lr=0.001, batch_size=64)
+
+            meta_path = tmp_path / "runs" / "test-project" / "config-test" / "meta.json"
+            meta = json.loads(meta_path.read_text())
+            assert meta["config"]["lr"] == 0.001
+            assert meta["config"]["batch_size"] == 64
+
+    def test_decorator_warns_on_positional_args(self, tmp_path: Path) -> None:
+        """Test that positional arguments trigger a warning."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment("test-project", name="args-test", system_metrics=False)
+            def my_experiment(lr: float, epochs: int) -> None:
+                pass
+
+            with pytest.warns(UserWarning, match="non-keyword args"):
+                my_experiment(0.01, epochs=10)
+
+    def test_decorator_finishes_run_on_exception(self, tmp_path: Path) -> None:
+        """Test that the run is finished even when an exception is raised."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment(
+                "test-project", name="exception-test", system_metrics=False
+            )
+            def my_experiment() -> None:
+                raise ValueError("Something went wrong")
+
+            with pytest.raises(ValueError, match="Something went wrong"):
+                my_experiment()
+
+            # Verify run was still finished
+            assert extty._active_run is None
+
+    def test_decorator_preserves_function_metadata(self) -> None:
+        """Test that functools.wraps preserves the original function metadata."""
+
+        @extty.experiment("test-project", system_metrics=False)
+        def my_documented_experiment(lr: float = 0.01) -> int:
+            """This is my experiment docstring."""
+            return 42
+
+        assert my_documented_experiment.__name__ == "my_documented_experiment"
+        assert my_documented_experiment.__doc__ == "This is my experiment docstring."
+
+    def test_decorator_returns_correct_value(self, tmp_path: Path) -> None:
+        """Test that the decorator returns the function's return value."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment("test-project", name="return-test", system_metrics=False)
+            def my_experiment() -> dict:
+                return {"accuracy": 0.95, "loss": 0.05}
+
+            result = my_experiment()
+
+            assert result == {"accuracy": 0.95, "loss": 0.05}
