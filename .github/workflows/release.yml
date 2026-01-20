@@ -13,6 +13,7 @@ env:
 
 jobs:
   build-tui:
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
         include:
@@ -95,9 +96,9 @@ jobs:
         run: twine upload --verbose dist/*
 
   upload-r2:
+    if: github.event_name == 'workflow_dispatch'
     needs: build-tui
     runs-on: ubuntu-latest
-    # if: startsWith(github.ref, 'refs/tags/')
 
     steps:
       - name: Download all artifacts
