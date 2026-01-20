@@ -1306,9 +1306,11 @@ fn compute_average_reward(examples: &[Example]) -> Option<f64> {
     let mut count = 0;
     for example in examples {
         if let Some(rewards) = &example.rewards {
-            for reward in rewards {
-                total += reward.total();
-                count += 1;
+            for prompt_rewards in rewards {
+                for reward in prompt_rewards {
+                    total += reward.total();
+                    count += 1;
+                }
             }
         }
     }
@@ -1440,7 +1442,7 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         Span::styled("  ", Style::default()),
                         Span::styled("[", Style::default().fg(DIM_CYAN)),
                         Span::styled("←→", Style::default().fg(NEON_CYAN)),
-                        Span::styled("] variant ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("] group ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
                             format!("{}/{}", app.selected_response + 1, response_count),
                             Style::default().fg(NEON_MAGENTA),
@@ -1533,7 +1535,8 @@ fn render_focused_example(
     let current_reward = example
         .rewards
         .as_ref()
-        .and_then(|rewards| rewards.get(selected_response));
+        .and_then(|rewards| rewards.get(selected_prompt))
+        .and_then(|prompt_rewards| prompt_rewards.get(selected_response));
 
     // Response title with variant indicator if multiple responses
     let response_focused = focused_section == FocusedSection::Response;
