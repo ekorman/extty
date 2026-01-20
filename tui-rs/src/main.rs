@@ -1442,7 +1442,7 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         Span::styled("  ", Style::default()),
                         Span::styled("[", Style::default().fg(DIM_CYAN)),
                         Span::styled("←→", Style::default().fg(NEON_CYAN)),
-                        Span::styled("] variant ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("] group ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
                             format!("{}/{}", app.selected_response + 1, response_count),
                             Style::default().fg(NEON_MAGENTA),
