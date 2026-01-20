@@ -1,8 +1,7 @@
 """extty: Terminal-native ML experiment tracker."""
 
-import warnings
-
 import functools
+import warnings
 
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Callable, ParamSpec, TypeVar
