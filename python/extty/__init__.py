@@ -1,7 +1,11 @@
 """extty: Terminal-native ML experiment tracker."""
 
+import warnings
+
+import functools
+
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any
+from typing import Any, Callable, ParamSpec, TypeVar
 
 from extty.example import BatchExample, Example
 from extty.run import Run, ServerConfig
@@ -128,3 +132,49 @@ def finish() -> None:
         raise RuntimeError("No active run to finish.")
     _active_run.finish()
     _active_run = None
+
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+def experiment(
+    project: str,
+    name: str | None = None,
+    system_metrics: bool = True,
+    server: bool = False,
+    server_host: str = "0.0.0.0",
+    server_port: int = 0,
+    server_token: str | None = None,
+    server_max_metric_points: int = 10_000,
+    server_max_example_points: int = 5_000,
+    server_max_system_points: int = 2_000,
+) -> Callable[[Callable[P, T]], Callable[P, T]]:
+    def dec(fn: Callable[P, T]) -> Callable[P, T]:
+        @functools.wraps(fn)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            if len(args) > 0:
+                warnings.warn(
+                    f"non-keyword args passed to {fn} will not be logged to `extty`."
+                )
+            try:
+                init(
+                    project=project,
+                    name=name,
+                    config=kwargs,
+                    system_metrics=system_metrics,
+                    server=server,
+                    server_host=server_host,
+                    server_port=server_port,
+                    server_token=server_token,
+                    server_max_metric_points=server_max_metric_points,
+                    server_max_example_points=server_max_example_points,
+                    server_max_system_points=server_max_system_points,
+                )
+                return fn(*args, **kwargs)
+            finally:
+                finish()
+
+        return wrapper
+
+    return dec
