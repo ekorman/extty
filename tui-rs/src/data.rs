@@ -34,7 +34,7 @@ pub struct Example {
     pub step: u64,
     pub prompts: Vec<String>,
     pub responses: Vec<Vec<String>>,
-    pub rewards: Option<Vec<Reward>>,
+    pub rewards: Option<Vec<Vec<Reward>>>,
 }
 
 // Run status
@@ -502,8 +502,34 @@ where
     deserializer.deserialize_any(ResponsesVisitor)
 }
 
-/// Helper to deserialize rewards: can be a single f64, a dict of f64 values, or an array of either
-fn deserialize_rewards<'de, D>(deserializer: D) -> Result<Option<Vec<Reward>>, D::Error>
+/// Parse a single reward value (number or object) from a serde_json::Value
+fn parse_single_reward<E: serde::de::Error>(elem: serde_json::Value) -> Result<Reward, E> {
+    match elem {
+        serde_json::Value::Number(n) => {
+            Ok(Reward::Scalar(n.as_f64().ok_or_else(|| {
+                E::custom("expected f64-compatible number in reward")
+            })?))
+        }
+        serde_json::Value::Object(obj) => {
+            let mut components = HashMap::new();
+            for (k, v) in obj {
+                let val = v
+                    .as_f64()
+                    .ok_or_else(|| E::custom("expected f64 value in reward object"))?;
+                components.insert(k, val);
+            }
+            Ok(Reward::Components(components))
+        }
+        _ => Err(E::custom("expected number or object for reward")),
+    }
+}
+
+/// Helper to deserialize rewards: supports nested arrays for batched examples
+/// - 0.5 → [[Scalar(0.5)]]
+/// - {"a": 0.5} → [[Components({a: 0.5})]]
+/// - [0.5, 0.6] → [[Scalar(0.5), Scalar(0.6)]] (flat array for single prompt)
+/// - [[0.5, 0.6], [0.7]] → as-is (nested for batched prompts)
+fn deserialize_rewards<'de, D>(deserializer: D) -> Result<Option<Vec<Vec<Reward>>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -512,10 +538,10 @@ where
     struct RewardsVisitor;
 
     impl<'de> de::Visitor<'de> for RewardsVisitor {
-        type Value = Option<Vec<Reward>>;
+        type Value = Option<Vec<Vec<Reward>>>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a number, object, or array of numbers/objects")
+            formatter.write_str("a number, object, array of numbers/objects, or nested array")
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -536,21 +562,21 @@ where
         where
             E: de::Error,
         {
-            Ok(Some(vec![Reward::Scalar(value)]))
+            Ok(Some(vec![vec![Reward::Scalar(value)]]))
         }
 
         fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
         where
             E: de::Error,
         {
-            Ok(Some(vec![Reward::Scalar(value as f64)]))
+            Ok(Some(vec![vec![Reward::Scalar(value as f64)]]))
         }
 
         fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
         where
             E: de::Error,
         {
-            Ok(Some(vec![Reward::Scalar(value as f64)]))
+            Ok(Some(vec![vec![Reward::Scalar(value as f64)]]))
         }
 
         fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -561,43 +587,50 @@ where
             while let Some((key, value)) = map.next_entry::<String, f64>()? {
                 components.insert(key, value);
             }
-            Ok(Some(vec![Reward::Components(components)]))
+            Ok(Some(vec![vec![Reward::Components(components)]]))
         }
 
         fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
         where
             A: de::SeqAccess<'de>,
         {
-            let mut rewards = Vec::new();
+            let mut outer: Vec<Vec<Reward>> = Vec::new();
+            let mut is_nested: Option<bool> = None;
+            let mut flat_rewards: Vec<Reward> = Vec::new();
+
             while let Some(elem) = seq.next_element::<serde_json::Value>()? {
-                let reward = match elem {
-                    serde_json::Value::Number(n) => {
-                        Reward::Scalar(n.as_f64().ok_or_else(|| {
-                            de::Error::custom("expected f64-compatible number in reward array")
-                        })?)
-                    }
-                    serde_json::Value::Object(obj) => {
-                        let mut components = HashMap::new();
-                        for (k, v) in obj {
-                            let val = v.as_f64().ok_or_else(|| {
-                                de::Error::custom("expected f64 value in reward object")
-                            })?;
-                            components.insert(k, val);
+                match &elem {
+                    serde_json::Value::Array(inner_arr) => {
+                        if is_nested == Some(false) {
+                            return Err(de::Error::custom(
+                                "mixed nested and flat elements in reward array",
+                            ));
                         }
-                        Reward::Components(components)
+                        is_nested = Some(true);
+                        let mut inner_rewards = Vec::new();
+                        for inner_elem in inner_arr.clone() {
+                            inner_rewards.push(parse_single_reward(inner_elem)?);
+                        }
+                        outer.push(inner_rewards);
                     }
                     _ => {
-                        return Err(de::Error::custom(
-                            "expected number or object in reward array",
-                        ));
+                        if is_nested == Some(true) {
+                            return Err(de::Error::custom(
+                                "mixed nested and flat elements in reward array",
+                            ));
+                        }
+                        is_nested = Some(false);
+                        flat_rewards.push(parse_single_reward(elem)?);
                     }
-                };
-                rewards.push(reward);
+                }
             }
-            if rewards.is_empty() {
+
+            if flat_rewards.is_empty() && outer.is_empty() {
                 Ok(None)
+            } else if is_nested == Some(true) {
+                Ok(Some(outer))
             } else {
-                Ok(Some(rewards))
+                Ok(Some(vec![flat_rewards]))
             }
         }
     }
@@ -612,7 +645,7 @@ struct ExampleData {
     #[serde(deserialize_with = "deserialize_responses")]
     response: Vec<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_rewards")]
-    reward: Option<Vec<Reward>>,
+    reward: Option<Vec<Vec<Reward>>>,
 }
 
 // Load examples from a JSONL file
