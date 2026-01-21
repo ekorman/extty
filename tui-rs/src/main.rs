@@ -258,6 +258,90 @@ impl App {
         run.metrics.len() + run.examples.len() + eval_count
     }
 
+    // Calculate wrapped line count for text given a width
+    fn wrapped_line_count(text: &str, width: usize) -> usize {
+        if width == 0 {
+            return 0;
+        }
+        let mut count = 0;
+        for line in text.lines() {
+            if line.is_empty() {
+                count += 1;
+            } else {
+                // Estimate wrapped lines (chars / width, rounded up)
+                count += line.chars().count().div_ceil(width)
+            }
+        }
+        // Handle case where text doesn't end with newline but has content
+        if count == 0 && !text.is_empty() {
+            count = 1;
+        }
+        count
+    }
+
+    // Get max scroll offset for prompt/response in focused view
+    fn focused_max_scroll(&self, is_prompt: bool) -> usize {
+        let cards = self.cards();
+        let current_card = cards.get(self.selected_card);
+
+        // Calculate visible height (40% for prompt, 60% for response, minus borders)
+        let total_height = self.term_height.saturating_sub(6) as usize; // header + footer
+        let visible_height = if is_prompt {
+            (total_height * 40 / 100).saturating_sub(2) // 40%, minus borders
+        } else {
+            (total_height * 60 / 100).saturating_sub(2) // 60%, minus borders
+        };
+
+        // Width for wrapping (minus borders and some padding)
+        let wrap_width = self.term_width.saturating_sub(4) as usize;
+
+        let text = match current_card {
+            Some(Card::Examples { name }) => {
+                if let Some(examples) = self.current_run().and_then(|r| r.examples.get(name)) {
+                    if let Some(example) = examples.get(self.selected_example) {
+                        if is_prompt {
+                            example
+                                .prompts
+                                .get(self.selected_prompt)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            example
+                                .responses
+                                .get(self.selected_prompt)
+                                .and_then(|r| r.get(self.selected_response))
+                                .cloned()
+                                .unwrap_or_default()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            }
+            Some(Card::Evaluation { name }) => {
+                if let Some(eval) = self.get_evaluation(name) {
+                    if let Some(ex) = eval.examples.get(self.selected_example) {
+                        if is_prompt {
+                            ex.prompt.clone()
+                        } else {
+                            ex.response.clone()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        };
+
+        let line_count = Self::wrapped_line_count(&text, wrap_width);
+        line_count.saturating_sub(visible_height)
+    }
+
     fn handle_key(&mut self, code: KeyCode) {
         // If delete confirmation is shown, handle that first
         if self.show_delete_confirm {
@@ -398,12 +482,6 @@ impl App {
                 self.selected_card = 0;
                 self.scroll_offset = 0;
             }
-            KeyCode::PageUp | KeyCode::Char('k') => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
-            }
-            KeyCode::PageDown | KeyCode::Char('j') => {
-                self.scroll_offset = (self.scroll_offset + 1).min(max_scroll);
-            }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
             }
@@ -471,16 +549,18 @@ impl App {
                     FocusedSection::Response => FocusedSection::Prompt,
                 };
             }
-            // j/k for scrolling the focused section
-            KeyCode::Char('j') => match self.focused_section {
+            // k scrolls down, j scrolls up in the focused section
+            KeyCode::Char('k') => match self.focused_section {
                 FocusedSection::Prompt => {
-                    self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_add(1);
+                    let max = self.focused_max_scroll(true);
+                    self.prompt_scroll_offset = (self.prompt_scroll_offset + 1).min(max);
                 }
                 FocusedSection::Response => {
-                    self.response_scroll_offset = self.response_scroll_offset.saturating_add(1);
+                    let max = self.focused_max_scroll(false);
+                    self.response_scroll_offset = (self.response_scroll_offset + 1).min(max);
                 }
             },
-            KeyCode::Char('k') => match self.focused_section {
+            KeyCode::Char('j') => match self.focused_section {
                 FocusedSection::Prompt => {
                     self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_sub(1);
                 }
@@ -491,10 +571,12 @@ impl App {
             // PageDown/PageUp for faster scrolling
             KeyCode::PageDown => match self.focused_section {
                 FocusedSection::Prompt => {
-                    self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_add(10);
+                    let max = self.focused_max_scroll(true);
+                    self.prompt_scroll_offset = (self.prompt_scroll_offset + 10).min(max);
                 }
                 FocusedSection::Response => {
-                    self.response_scroll_offset = self.response_scroll_offset.saturating_add(10);
+                    let max = self.focused_max_scroll(false);
+                    self.response_scroll_offset = (self.response_scroll_offset + 10).min(max);
                 }
             },
             KeyCode::PageUp => match self.focused_section {
@@ -505,16 +587,23 @@ impl App {
                     self.response_scroll_offset = self.response_scroll_offset.saturating_sub(10);
                 }
             },
-            // Left/Right navigate between response variants
-            KeyCode::Left if response_count > 1 && self.selected_response > 0 => {
-                self.selected_response -= 1;
+            // Left/Right navigate between cards
+            KeyCode::Left if card_count > 1 && self.selected_card > 0 => {
+                self.selected_card -= 1;
+                self.selected_example = 0;
+                self.selected_prompt = 0;
+                self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
             }
             KeyCode::Right
-                if response_count > 1
-                    && self.selected_response < response_count.saturating_sub(1) =>
+                if card_count > 1 && self.selected_card < card_count.saturating_sub(1) =>
             {
-                self.selected_response += 1;
+                self.selected_card += 1;
+                self.selected_example = 0;
+                self.selected_prompt = 0;
+                self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
             }
             // Up/Down navigate within example groups
@@ -549,18 +638,16 @@ impl App {
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
             }
-            // Shift+Tab navigate between example groups (cards)
-            KeyCode::BackTab if card_count > 1 => {
-                // Cycle through cards
-                self.selected_card = if self.selected_card == 0 {
-                    card_count.saturating_sub(1)
-                } else {
-                    self.selected_card - 1
-                };
-                self.selected_example = 0;
-                self.selected_prompt = 0;
-                self.selected_response = 0;
-                self.prompt_scroll_offset = 0;
+            // < and > navigate between response variants
+            KeyCode::Char('<') if response_count > 1 && self.selected_response > 0 => {
+                self.selected_response -= 1;
+                self.response_scroll_offset = 0;
+            }
+            KeyCode::Char('>')
+                if response_count > 1
+                    && self.selected_response < response_count.saturating_sub(1) =>
+            {
+                self.selected_response += 1;
                 self.response_scroll_offset = 0;
             }
             _ => {}
@@ -822,11 +909,8 @@ fn render_list(app: &App, frame: &mut Frame) {
         Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
         Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Tab/→", Style::default().fg(NEON_CYAN)),
-        Span::styled("] expand  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("←", Style::default().fg(NEON_CYAN)),
-        Span::styled("] collapse  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+        Span::styled("] expand/collapse  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_CYAN)),
         Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
@@ -1479,10 +1563,19 @@ fn render_focused(app: &App, frame: &mut Frame) {
                     FocusedSection::Prompt => "prompt",
                     FocusedSection::Response => "response",
                 };
+                let cards = app.cards();
                 let mut footer_spans = vec![
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("q", Style::default().fg(NEON_MAGENTA)),
                     Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}", app.selected_card + 1, cards.len()),
+                        Style::default().fg(NEON_GREEN),
+                    ),
+                    Span::styled("  ", Style::default()),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("j/k", Style::default().fg(NEON_CYAN)),
                     Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
@@ -1517,8 +1610,8 @@ fn render_focused(app: &App, frame: &mut Frame) {
                     footer_spans.extend(vec![
                         Span::styled("  ", Style::default()),
                         Span::styled("[", Style::default().fg(DIM_CYAN)),
-                        Span::styled("←→", Style::default().fg(NEON_CYAN)),
-                        Span::styled("] group ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("<>", Style::default().fg(NEON_CYAN)),
+                        Span::styled("] response ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
                             format!("{}/{}", app.selected_response + 1, response_count),
                             Style::default().fg(NEON_MAGENTA),
@@ -1546,10 +1639,19 @@ fn render_focused(app: &App, frame: &mut Frame) {
                     FocusedSection::Prompt => "prompt",
                     FocusedSection::Response => "response",
                 };
+                let cards = app.cards();
                 let mut footer_spans = vec![
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("q", Style::default().fg(NEON_MAGENTA)),
                     Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}", app.selected_card + 1, cards.len()),
+                        Style::default().fg(NEON_GREEN),
+                    ),
+                    Span::styled("  ", Style::default()),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("j/k", Style::default().fg(NEON_CYAN)),
                     Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
