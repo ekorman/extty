@@ -589,6 +589,87 @@ class TestModalIntegration:
                 extty.finish()
 
 
+class TestLogEvaluation:
+    """Tests for log_evaluation functionality."""
+
+    def test_log_evaluation_creates_json(self, tmp_path: Path) -> None:
+        """Test that log_evaluation creates a JSON file."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="eval-test", system_metrics=False)
+            extty.log_evaluation(
+                "gsm8k",
+                metrics={"reward_mean": 0.85, "reward_std": 0.12, "accuracy": 0.78},
+                examples=[
+                    {"prompt": "What is 2+2?", "response": "4"},
+                    {"prompt": "What is 3*5?", "response": "15"},
+                ],
+                config={"dataset": "gsm8k", "num_samples": 100},
+            )
+            extty.finish()
+
+            eval_path = (
+                tmp_path
+                / "runs"
+                / "test-project"
+                / "eval-test"
+                / "evaluations"
+                / "gsm8k.json"
+            )
+            assert eval_path.exists()
+            content = json.loads(eval_path.read_text())
+            assert content["metrics"]["reward_mean"] == 0.85
+            assert content["metrics"]["accuracy"] == 0.78
+            assert len(content["examples"]) == 2
+            assert content["examples"][0]["prompt"] == "What is 2+2?"
+            assert content["config"]["dataset"] == "gsm8k"
+
+    def test_log_evaluation_metrics_only(self, tmp_path: Path) -> None:
+        """Test log_evaluation with only metrics."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="metrics-only", system_metrics=False)
+            extty.log_evaluation("humaneval", metrics={"pass@1": 0.65, "pass@10": 0.82})
+            extty.finish()
+
+            eval_path = (
+                tmp_path
+                / "runs"
+                / "test-project"
+                / "metrics-only"
+                / "evaluations"
+                / "humaneval.json"
+            )
+            assert eval_path.exists()
+            content = json.loads(eval_path.read_text())
+            assert content["metrics"]["pass@1"] == 0.65
+            assert "examples" not in content
+            assert "config" not in content
+
+    def test_log_evaluation_overwrites(self, tmp_path: Path) -> None:
+        """Test that log_evaluation overwrites previous evaluation with same name."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="overwrite-test", system_metrics=False)
+            extty.log_evaluation("val", metrics={"accuracy": 0.5})
+            extty.log_evaluation("val", metrics={"accuracy": 0.9})
+            extty.finish()
+
+            eval_path = (
+                tmp_path
+                / "runs"
+                / "test-project"
+                / "overwrite-test"
+                / "evaluations"
+                / "val.json"
+            )
+            content = json.loads(eval_path.read_text())
+            assert content["metrics"]["accuracy"] == 0.9
+
+    def test_log_evaluation_without_init_raises(self) -> None:
+        """Test that log_evaluation raises without init."""
+        extty._active_run = None
+        with pytest.raises(RuntimeError, match="No active run"):
+            extty.log_evaluation("test", metrics={"accuracy": 0.5})
+
+
 class TestExperimentDecorator:
     def test_decorator_initializes_and_finishes_run(self, tmp_path: Path) -> None:
         """Test that the decorator properly initializes and finishes a run."""

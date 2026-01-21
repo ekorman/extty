@@ -25,7 +25,7 @@ const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
 mod remote;
-use data::{Example, MetricPoint, Reward, Run, load_runs};
+use data::{Evaluation, Example, MetricPoint, Reward, Run, load_all_evaluations, load_runs};
 use remote::RemoteSync;
 
 enum SyncMessage {
@@ -57,11 +57,12 @@ enum FocusedSection {
     Response,
 }
 
-// A card in the detail grid - either a chart or an example group
+// A card in the detail grid - either a chart, example group, or evaluation
 #[derive(Clone)]
 enum Card {
     Chart { name: String },
     Examples { name: String },
+    Evaluation { name: String },
 }
 
 // Represents an item in the hierarchical list view
@@ -74,6 +75,7 @@ enum ListEntry {
 // All application state lives here
 struct App {
     runs: Vec<Run>,
+    evaluations: Vec<Evaluation>,
     selected_run: usize,
     selected_list_item: usize, // Current position in the flattened list
     expanded_projects: HashSet<String>, // Which projects are expanded
@@ -98,8 +100,10 @@ struct App {
 impl App {
     fn new() -> Self {
         let runs = load_runs();
+        let evaluations = load_all_evaluations();
         App {
             runs,
+            evaluations,
             selected_run: 0,
             selected_list_item: 0,
             expanded_projects: HashSet::new(),
@@ -161,6 +165,7 @@ impl App {
     fn refresh_runs(&mut self) {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
         self.runs = load_runs();
+        self.evaluations = load_all_evaluations();
 
         if let Some(name) = current_name {
             if let Some(idx) = self.runs.iter().position(|r| r.name == name) {
@@ -219,13 +224,38 @@ impl App {
             cards.push(Card::Examples { name: name.clone() });
         }
 
+        // Add evaluations for this run (sorted by name)
+        let run_evaluations: Vec<&Evaluation> = self
+            .evaluations
+            .iter()
+            .filter(|e| e.run_name == run.name)
+            .collect();
+        for eval in run_evaluations {
+            cards.push(Card::Evaluation {
+                name: eval.name.clone(),
+            });
+        }
+
         cards
     }
 
+    fn get_evaluation(&self, name: &str) -> Option<&Evaluation> {
+        let run = self.current_run()?;
+        self.evaluations
+            .iter()
+            .find(|e| e.run_name == run.name && e.name == name)
+    }
+
     fn card_count(&self) -> usize {
-        self.current_run()
-            .map(|r| r.metrics.len() + r.examples.len())
-            .unwrap_or(0)
+        let Some(run) = self.current_run() else {
+            return 0;
+        };
+        let eval_count = self
+            .evaluations
+            .iter()
+            .filter(|e| e.run_name == run.name)
+            .count();
+        run.metrics.len() + run.examples.len() + eval_count
     }
 
     fn handle_key(&mut self, code: KeyCode) {
@@ -424,12 +454,16 @@ impl App {
         let cards = self.cards();
         let current_card = cards.get(self.selected_card);
 
-        // Check if we're viewing an examples group
+        // Check if we're viewing an examples group or evaluation
         let example_count = match current_card {
             Some(Card::Examples { name }) => self
                 .current_run()
                 .and_then(|r| r.examples.get(name))
                 .map(|e| e.len())
+                .unwrap_or(0),
+            Some(Card::Evaluation { name }) => self
+                .get_evaluation(name)
+                .map(|e| e.examples.len())
                 .unwrap_or(0),
             _ => 0,
         };
@@ -1035,6 +1069,11 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                     render_examples_card(frame, card_area, name, examples, is_selected);
                 }
             }
+            Card::Evaluation { name } => {
+                if let Some(eval) = app.get_evaluation(name) {
+                    render_evaluation_card(frame, card_area, eval, is_selected);
+                }
+            }
         }
     }
 }
@@ -1301,6 +1340,76 @@ fn render_examples_card(
     frame.render_widget(paragraph, area);
 }
 
+fn render_evaluation_card(frame: &mut Frame, area: Rect, eval: &Evaluation, selected: bool) {
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    // Build content: metrics as key-value pairs
+    let mut content: Vec<Line> = Vec::new();
+
+    if let Some(metrics) = &eval.metrics {
+        let mut keys: Vec<&String> = metrics.keys().collect();
+        keys.sort();
+        for key in keys.iter().take(area.height.saturating_sub(4) as usize) {
+            if let Some(value) = metrics.get(*key) {
+                let val_str = match value {
+                    serde_json::Value::Number(n) => {
+                        if let Some(f) = n.as_f64() {
+                            format!("{:.4}", f)
+                        } else {
+                            n.to_string()
+                        }
+                    }
+                    _ => value.to_string(),
+                };
+                content.push(Line::from(vec![
+                    Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
+                    Span::styled(val_str, Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+    }
+
+    // Add example count
+    if !eval.examples.is_empty() {
+        content.push(Line::from(""));
+        content.push(Line::from(Span::styled(
+            format!("{} examples", eval.examples.len()),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    if content.is_empty() {
+        content.push(Line::from(Span::styled(
+            "No metrics",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Build title
+    let title_spans = vec![
+        Span::styled("◆ ", Style::default().fg(NEON_YELLOW)),
+        Span::styled(&eval.name, title_style),
+    ];
+    let title = Line::from(title_spans);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let paragraph = Paragraph::new(content)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+
+    frame.render_widget(paragraph, area);
+}
+
 fn compute_average_reward(examples: &[Example]) -> Option<f64> {
     let mut total = 0.0;
     let mut count = 0;
@@ -1453,6 +1562,245 @@ fn render_focused(app: &App, frame: &mut Frame) {
                 frame.render_widget(Paragraph::new(footer), chunks[1]);
             }
         }
+        Card::Evaluation { name } => {
+            if let Some(eval) = app.get_evaluation(name) {
+                render_focused_evaluation(
+                    frame,
+                    chunks[0],
+                    eval,
+                    app.selected_example,
+                    app.focused_section,
+                    app.prompt_scroll_offset,
+                    app.response_scroll_offset,
+                );
+                // Footer for evaluations
+                let example_count = eval.examples.len();
+                let focus_label = match app.focused_section {
+                    FocusedSection::Prompt => "prompt",
+                    FocusedSection::Response => "response",
+                };
+                let mut footer_spans = vec![
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+                    Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("j/k", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
+                ];
+                if example_count > 0 {
+                    footer_spans.extend(vec![
+                        Span::styled("[", Style::default().fg(DIM_CYAN)),
+                        Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+                        Span::styled("] focus:", Style::default().fg(Color::DarkGray)),
+                        Span::styled(focus_label, Style::default().fg(NEON_GREEN)),
+                        Span::styled("  ", Style::default()),
+                        Span::styled("[", Style::default().fg(DIM_CYAN)),
+                        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                        Span::styled("] example ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{}/{}", app.selected_example + 1, example_count),
+                            Style::default().fg(NEON_YELLOW),
+                        ),
+                    ]);
+                }
+                let footer = Line::from(footer_spans);
+                frame.render_widget(Paragraph::new(footer), chunks[1]);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_focused_evaluation(
+    frame: &mut Frame,
+    area: Rect,
+    eval: &Evaluation,
+    selected_example: usize,
+    focused_section: FocusedSection,
+    prompt_scroll_offset: usize,
+    response_scroll_offset: usize,
+) {
+    if eval.examples.is_empty() {
+        // No examples, just show metrics and config
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+
+        // Config panel (top)
+        let config_content: Vec<Line> = if let Some(config) = &eval.config {
+            let mut lines = Vec::new();
+            render_json_value(config, 0, &mut lines);
+            lines
+        } else {
+            vec![Line::from(Span::styled(
+                "No config",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        };
+        let config_block = Block::default()
+            .title(Span::styled(
+                "◆ CONFIG ",
+                Style::default().fg(NEON_CYAN).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DIM_CYAN));
+        frame.render_widget(
+            Paragraph::new(config_content)
+                .block(config_block)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            chunks[0],
+        );
+
+        // Metrics panel (bottom)
+        let metrics_content: Vec<Line> = if let Some(metrics) = &eval.metrics {
+            let mut lines = Vec::new();
+            let mut keys: Vec<&String> = metrics.keys().collect();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = metrics.get(key) {
+                    let val_str = match value {
+                        serde_json::Value::Number(n) => {
+                            if let Some(f) = n.as_f64() {
+                                format!("{:.6}", f)
+                            } else {
+                                n.to_string()
+                            }
+                        }
+                        _ => value.to_string(),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
+                        Span::styled(val_str, Style::default().fg(Color::White)),
+                    ]));
+                }
+            }
+            lines
+        } else {
+            vec![Line::from(Span::styled(
+                "No metrics",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        };
+        let metrics_block = Block::default()
+            .title(Span::styled(
+                "◆ METRICS ",
+                Style::default().fg(NEON_GREEN).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DIM_CYAN));
+        frame.render_widget(
+            Paragraph::new(metrics_content)
+                .block(metrics_block)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            chunks[1],
+        );
+    } else {
+        // Has examples: show metrics/config at top, prompt/response at bottom
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(8),
+                Constraint::Percentage(35),
+                Constraint::Percentage(50),
+            ])
+            .split(area);
+
+        // Metrics summary (top)
+        let metrics_content: Vec<Line> = if let Some(metrics) = &eval.metrics {
+            let mut lines = Vec::new();
+            let mut keys: Vec<&String> = metrics.keys().collect();
+            keys.sort();
+            for key in keys.iter().take(5) {
+                if let Some(value) = metrics.get(*key) {
+                    let val_str = match value {
+                        serde_json::Value::Number(n) => {
+                            if let Some(f) = n.as_f64() {
+                                format!("{:.4}", f)
+                            } else {
+                                n.to_string()
+                            }
+                        }
+                        _ => value.to_string(),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
+                        Span::styled(val_str, Style::default().fg(Color::White)),
+                    ]));
+                }
+            }
+            lines
+        } else {
+            vec![Line::from(Span::styled(
+                "No metrics",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        };
+        let metrics_block = Block::default()
+            .title(Span::styled(
+                format!("◆ {} METRICS ", eval.name),
+                Style::default().fg(NEON_GREEN).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DIM_CYAN));
+        frame.render_widget(
+            Paragraph::new(metrics_content)
+                .block(metrics_block)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            chunks[0],
+        );
+
+        // Get current example
+        let example = eval.examples.get(selected_example);
+        let prompt_text = example.map(|e| e.prompt.as_str()).unwrap_or("");
+        let response_text = example.map(|e| e.response.as_str()).unwrap_or("");
+
+        // Prompt section
+        let prompt_focused = focused_section == FocusedSection::Prompt;
+        let prompt_border_color = if prompt_focused { NEON_CYAN } else { DIM_CYAN };
+        let prompt_block = Block::default()
+            .title(Span::styled(
+                format!("◆ PROMPT {}/{}", selected_example + 1, eval.examples.len()),
+                Style::default().fg(NEON_YELLOW).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(prompt_border_color));
+        frame.render_widget(
+            Paragraph::new(prompt_text)
+                .style(Style::default().fg(Color::White))
+                .block(prompt_block)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((prompt_scroll_offset as u16, 0)),
+            chunks[1],
+        );
+
+        // Response section
+        let response_focused = focused_section == FocusedSection::Response;
+        let response_border_color = if response_focused {
+            NEON_CYAN
+        } else {
+            DIM_CYAN
+        };
+        let response_block = Block::default()
+            .title(Span::styled(
+                "◆ RESPONSE ",
+                Style::default().fg(NEON_GREEN).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(response_border_color));
+        frame.render_widget(
+            Paragraph::new(response_text)
+                .style(Style::default().fg(Color::Gray))
+                .block(response_block)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((response_scroll_offset as u16, 0)),
+            chunks[2],
+        );
     }
 }
 

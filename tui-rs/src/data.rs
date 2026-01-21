@@ -37,6 +37,23 @@ pub struct Example {
     pub rewards: Option<Vec<Vec<Reward>>>,
 }
 
+// An evaluation example (simple prompt/response pair)
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvaluationExample {
+    pub prompt: String,
+    pub response: String,
+}
+
+// An evaluation snapshot
+#[derive(Debug, Clone)]
+pub struct Evaluation {
+    pub name: String,
+    pub run_name: String,
+    pub config: Option<serde_json::Value>,
+    pub metrics: Option<serde_json::Map<String, serde_json::Value>>,
+    pub examples: Vec<EvaluationExample>,
+}
+
 // Run status
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunStatus {
@@ -190,6 +207,103 @@ fn load_run(path: &Path) -> Option<Run> {
         config,
         remote_url,
     })
+}
+
+// Load all evaluations from a run directory
+pub fn load_evaluations_for_run(run_path: &Path) -> Vec<Evaluation> {
+    let evaluations_dir = run_path.join("evaluations");
+    if !evaluations_dir.exists() {
+        return vec![];
+    }
+
+    let run_name = run_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut evaluations = Vec::new();
+    if let Ok(entries) = fs::read_dir(&evaluations_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && let Some(eval) = load_evaluation(&path, &run_name)
+            {
+                evaluations.push(eval);
+            }
+        }
+    }
+    evaluations.sort_by(|a, b| a.name.cmp(&b.name));
+    evaluations
+}
+
+// Load a single evaluation from a JSON file
+fn load_evaluation(path: &Path, run_name: &str) -> Option<Evaluation> {
+    let name = path.file_stem()?.to_string_lossy().to_string();
+    let content = fs::read_to_string(path).ok()?;
+    let data: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let config = data.get("config").cloned();
+    let metrics = data.get("metrics").and_then(|v| v.as_object()).cloned();
+    let examples: Vec<EvaluationExample> = data
+        .get("examples")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    Some(Evaluation {
+        name,
+        run_name: run_name.to_string(),
+        config,
+        metrics,
+        examples,
+    })
+}
+
+// Load all evaluations from both local and remote directories
+pub fn load_all_evaluations() -> Vec<Evaluation> {
+    let mut evaluations = Vec::new();
+
+    // Load from local runs directory
+    evaluations.extend(load_evaluations_from_dir(&runs_dir()));
+
+    // Load from remote runs directory
+    evaluations.extend(load_evaluations_from_dir(&remote_runs_dir()));
+
+    evaluations
+}
+
+// Load all evaluations from all runs in a specific directory
+fn load_evaluations_from_dir(dir: &Path) -> Vec<Evaluation> {
+    if !dir.exists() {
+        return vec![];
+    }
+
+    let mut evaluations = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            if path.join("meta.json").exists() {
+                // Old flat structure: runs/<run_name>/
+                evaluations.extend(load_evaluations_for_run(&path));
+            } else {
+                // New nested structure: runs/<project>/<run_name>/
+                if let Ok(run_entries) = fs::read_dir(&path) {
+                    for run_entry in run_entries.flatten() {
+                        let run_path = run_entry.path();
+                        if run_path.is_dir() {
+                            evaluations.extend(load_evaluations_for_run(&run_path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    evaluations
 }
 
 /// Return type for run metadata

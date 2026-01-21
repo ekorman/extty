@@ -38,6 +38,14 @@ class StorageSink(Protocol):
         gpu_util_pct: float | None = None,
     ) -> None: ...
 
+    def log_evaluation(
+        self,
+        name: str,
+        metrics: dict[str, float] | None = None,
+        examples: list[dict[str, str]] | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> None: ...
+
     def flush(self) -> None: ...
 
     def close(self) -> None: ...
@@ -144,6 +152,38 @@ class Run:
                     self._storage.log_example(name, value.to_dict(), step)
                 else:
                     self._storage.log_metric(name, float(value), step)
+
+    def log_evaluation(
+        self,
+        name: str,
+        *,
+        metrics: dict[str, float] | None = None,
+        examples: list[dict[str, str]] | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Log an evaluation snapshot for the current run.
+
+        Parameters
+        ----------
+        name : str
+            Name of this evaluation (e.g., "gsm8k", "humaneval").
+        metrics : dict[str, float], optional
+            Evaluation metrics (e.g., {"reward_mean": 0.85, "reward_std": 0.12}).
+        examples : list[dict[str, str]], optional
+            Sample outputs: [{"prompt": str, "response": str}, ...].
+        config : dict[str, Any], optional
+            Evaluation configuration (e.g., dataset, temperature).
+
+        Raises
+        ------
+        RuntimeError
+            If the run has already been finished.
+        """
+        with self._lock:
+            if self._finished:
+                raise RuntimeError("Cannot log evaluation to a finished run.")
+            self._storage.log_evaluation(name, metrics, examples, config)
 
     def finish(self) -> None:
         """

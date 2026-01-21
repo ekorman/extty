@@ -192,6 +192,43 @@ class RunStorage:
         with open(filepath, "a") as f:
             f.write(json.dumps(record) + "\n")
 
+    def log_evaluation(
+        self,
+        name: str,
+        metrics: dict[str, float] | None = None,
+        examples: list[dict[str, str]] | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Log an evaluation snapshot.
+
+        Parameters
+        ----------
+        name : str
+            Name of this evaluation (e.g., "gsm8k", "humaneval").
+        metrics : dict[str, float], optional
+            Evaluation metrics.
+        examples : list[dict[str, str]], optional
+            Sample outputs.
+        config : dict[str, Any], optional
+            Evaluation configuration.
+        """
+        evaluations_dir = self.run_dir / "evaluations"
+        evaluations_dir.mkdir(exist_ok=True)
+
+        data: dict[str, Any] = {}
+        if config is not None:
+            data["config"] = config
+        if metrics is not None:
+            data["metrics"] = metrics
+        if examples is not None:
+            data["examples"] = examples
+
+        filepath = evaluations_dir / f"{sanitize_metric_name(name)}.json"
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
+
     def close(self) -> None:
         """Flush remaining data and close any open file handles."""
         self.flush()

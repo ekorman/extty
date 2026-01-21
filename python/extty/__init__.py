@@ -13,6 +13,7 @@ from extty.server import ServerSettings
 __all__ = [
     "init",
     "log",
+    "log_evaluation",
     "finish",
     "Run",
     "push",
@@ -122,6 +123,32 @@ def log(metrics: dict[str, Any], *, step: int) -> None:
     if _active_run is None:
         raise RuntimeError("No active run. Call extty.init() first.")
     _active_run.log(metrics, step=step)
+
+
+def log_evaluation(
+    name: str,
+    *,
+    metrics: dict[str, float] | None = None,
+    examples: list[dict[str, str]] | None = None,
+    config: dict[str, Any] | None = None,
+) -> None:
+    """
+    Log an evaluation snapshot for the current run.
+
+    Parameters
+    ----------
+    name : str
+        Name of this evaluation (e.g., "gsm8k", "humaneval").
+    metrics : dict[str, float], optional
+        Evaluation metrics (e.g., {"reward_mean": 0.85, "reward_std": 0.12}).
+    examples : list[dict[str, str]], optional
+        Sample outputs: [{"prompt": str, "response": str}, ...].
+    config : dict[str, Any], optional
+        Evaluation configuration (e.g., dataset, temperature).
+    """
+    if _active_run is None:
+        raise RuntimeError("No active run. Call extty.init() first.")
+    _active_run.log_evaluation(name, metrics=metrics, examples=examples, config=config)
 
 
 def finish() -> None:
