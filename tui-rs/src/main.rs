@@ -317,7 +317,7 @@ impl App {
             KeyCode::Down if self.selected_list_item < entry_count.saturating_sub(1) => {
                 self.selected_list_item += 1;
             }
-            KeyCode::Tab | KeyCode::Right => {
+            KeyCode::Tab => {
                 // Toggle expansion of current project
                 if let Some(ListEntry::Project { name }) = entries.get(self.selected_list_item) {
                     if self.expanded_projects.contains(name) {
@@ -325,35 +325,6 @@ impl App {
                     } else {
                         self.expanded_projects.insert(name.clone());
                     }
-                }
-            }
-            KeyCode::Left => {
-                // Collapse current project, or if on a run, go to parent project
-                match entries.get(self.selected_list_item) {
-                    Some(ListEntry::Project { name }) => {
-                        self.expanded_projects.remove(name);
-                    }
-                    Some(ListEntry::Run { run_index }) => {
-                        // Find parent project and collapse it, move selection to project
-                        if let Some(run) = self.runs.get(*run_index) {
-                            let project = run
-                                .project
-                                .clone()
-                                .unwrap_or_else(|| "(no project)".to_string());
-                            self.expanded_projects.remove(&project);
-                            // Find the project entry in the list and select it
-                            let new_entries = self.list_entries();
-                            for (i, entry) in new_entries.iter().enumerate() {
-                                if let ListEntry::Project { name } = entry
-                                    && *name == project
-                                {
-                                    self.selected_list_item = i;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    None => {}
                 }
             }
             KeyCode::Enter => {
@@ -397,11 +368,7 @@ impl App {
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.view = View::List,
-            KeyCode::Left if self.selected_card > 0 => self.selected_card -= 1,
-            KeyCode::Right if self.selected_card < card_count.saturating_sub(1) => {
-                self.selected_card += 1
-            }
-            KeyCode::Up if self.selected_card > 0 => {
+            KeyCode::Left if self.selected_card > 0 => {
                 self.selected_card -= 1;
                 // Scroll up if we moved above visible area
                 let new_row = self.selected_card / cols;
@@ -409,7 +376,7 @@ impl App {
                     self.scroll_offset = new_row;
                 }
             }
-            KeyCode::Down if self.selected_card < card_count.saturating_sub(1) => {
+            KeyCode::Right if self.selected_card < card_count.saturating_sub(1) => {
                 self.selected_card += 1;
                 // Scroll down if we moved below visible area
                 let new_row = self.selected_card / cols;
@@ -994,7 +961,7 @@ fn render_detail(app: &App, frame: &mut Frame) {
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
         Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("↑↓←→", Style::default().fg(NEON_CYAN)),
+        Span::styled("←→", Style::default().fg(NEON_CYAN)),
         Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_GREEN)),
