@@ -194,7 +194,19 @@ impl App {
         let card_width = 40u16;
         let card_height = 12u16;
         let grid_height = self.term_height.saturating_sub(5); // header + footer
-        let cols = (self.term_width / card_width).max(1) as usize;
+
+        let config_width = 35u16;
+        let has_config = self
+            .current_run()
+            .map(|r| r.config.is_some())
+            .unwrap_or(false);
+        let effective_width = if self.show_config && has_config {
+            self.term_width.saturating_sub(config_width)
+        } else {
+            self.term_width
+        };
+
+        let cols = (effective_width / card_width).max(1) as usize;
         let visible_rows = (grid_height / card_height).max(1) as usize;
         (visible_rows, cols)
     }
