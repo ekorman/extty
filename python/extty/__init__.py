@@ -1,5 +1,6 @@
 """extty: Terminal-native ML experiment tracker."""
 
+import copy
 import functools
 import warnings
 
@@ -9,6 +10,7 @@ from typing import Any, Callable, ParamSpec, TypeVar
 from extty.example import BatchExample, Example
 from extty.run import Run, ServerConfig
 from extty.server import ServerSettings
+from extty.storage import log_model_evaluation, generate_random_name
 
 __all__ = [
     "init",
@@ -126,29 +128,45 @@ def log(metrics: dict[str, Any], *, step: int) -> None:
 
 
 def log_evaluation(
-    name: str,
+    project: str,
+    model: str,
     *,
+    name: str | None = None,
     metrics: dict[str, float] | None = None,
     examples: list[dict[str, str]] | None = None,
-    config: dict[str, Any] | None = None,
+    model_config: dict[str, Any] | None = None,
+    eval_config: dict[str, Any] | None = None,
 ) -> None:
     """
-    Log an evaluation snapshot for the current run.
+    Log an evaluation for a model.
 
     Parameters
     ----------
+    project : str
+        Name of the project.
+    model : str
+        Name of the model.
     name : str
         Name of this evaluation (e.g., "gsm8k", "humaneval").
     metrics : dict[str, float], optional
-        Evaluation metrics (e.g., {"reward_mean": 0.85, "reward_std": 0.12}).
+        Evaluation metrics (e.g., {"accuracy": 0.85}).
     examples : list[dict[str, str]], optional
         Sample outputs: [{"prompt": str, "response": str}, ...].
-    config : dict[str, Any], optional
-        Evaluation configuration (e.g., dataset, temperature).
+    model_config : dict[str, Any], optional
+        Model configuration (stored on model's meta.json).
+    eval_config : dict[str, Any], optional
+        Evaluation configuration (stored with evaluation).
     """
-    if _active_run is None:
-        raise RuntimeError("No active run. Call extty.init() first.")
-    _active_run.log_evaluation(name, metrics=metrics, examples=examples, config=config)
+    name = name or generate_random_name()
+    log_model_evaluation(
+        project=project,
+        model=model,
+        name=name,
+        metrics=metrics,
+        examples=examples,
+        model_config=model_config,
+        eval_config=eval_config,
+    )
 
 
 def finish() -> None:
@@ -167,6 +185,9 @@ T = TypeVar("T")
 def experiment(
     project: str,
     name: str | None = None,
+    name_kwarg: str | None = None,
+    conf_kwargs: list[str] | None = None,
+    non_conf_kwargs: list[str] | None = None,
     system_metrics: bool = True,
     server: bool = False,
     server_host: str = "0.0.0.0",
@@ -176,6 +197,11 @@ def experiment(
     server_max_example_points: int = 5_000,
     server_max_system_points: int = 2_000,
 ) -> Callable[[Callable[P, T]], Callable[P, T]]:
+    if conf_kwargs is not None and non_conf_kwargs is not None:
+        raise ValueError(
+            "cannot pass values for both `conf_kwargs` and `non_conf_kwargs`"
+        )
+
     def dec(fn: Callable[P, T]) -> Callable[P, T]:
         @functools.wraps(fn)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -184,10 +210,22 @@ def experiment(
                     f"non-keyword args passed to {fn} will not be logged to `extty`."
                 )
             try:
+                kwargs_copy = copy.deepcopy(kwargs)
+                if conf_kwargs is not None:
+                    kwargs_copy = {k: kwargs_copy[k] for k in conf_kwargs}
+                if non_conf_kwargs is not None:
+                    kwargs_copy = {
+                        k: v for k, v in kwargs_copy.items() if k not in non_conf_kwargs
+                    }
+
+                run_name = name
+
+                if run_name is None and name_kwarg is not None:
+                    run_name = kwargs_copy.pop(name_kwarg)
                 init(
                     project=project,
-                    name=name,
-                    config=kwargs,
+                    name=run_name,
+                    config=kwargs_copy,
                     system_metrics=system_metrics,
                     server=server,
                     server_host=server_host,

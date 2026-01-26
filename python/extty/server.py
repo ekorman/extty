@@ -525,15 +525,6 @@ class QueueStorage:
         )
         self._manager.queue.put(SystemLogged(name=self._run_name, point=point))
 
-    def log_evaluation(
-        self,
-        name: str,
-        metrics: dict[str, float] | None = None,
-        examples: list[dict[str, str]] | None = None,
-        config: dict[str, Any] | None = None,
-    ) -> None:
-        pass
-
     def flush(self) -> None:
         return
 

@@ -25,7 +25,10 @@ const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
 mod remote;
-use data::{Evaluation, Example, MetricPoint, Reward, Run, load_all_evaluations, load_runs};
+use data::{
+    Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation, delete_model,
+    load_all_evaluations, load_models, load_runs,
+};
 use remote::RemoteSync;
 
 enum SyncMessage {
@@ -42,11 +45,19 @@ fn run_sync_loop(mut remote_sync: RemoteSync, tx: mpsc::Sender<SyncMessage>) {
     }
 }
 
+// View mode: Runs or Models
+#[derive(Clone, Copy, PartialEq)]
+enum ViewMode {
+    Runs,
+    Models,
+}
+
 // The views in our app
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     List,
-    Detail,
+    RunDetail,
+    ModelDetail,
     Focused,
 }
 
@@ -65,20 +76,31 @@ enum Card {
     Evaluation { name: String },
 }
 
-// Represents an item in the hierarchical list view
+// Represents an item in the hierarchical list view (runs)
 #[derive(Clone, Debug)]
 enum ListEntry {
     Project { name: String },
     Run { run_index: usize },
 }
 
+// Represents an item in the hierarchical list view (models)
+#[derive(Clone, Debug)]
+enum ModelListEntry {
+    Project { name: String },
+    Model { model_index: usize },
+}
+
 // All application state lives here
 struct App {
     runs: Vec<Run>,
-    evaluations: Vec<Evaluation>,
+    models: Vec<Model>,
+    model_evaluations: Vec<Evaluation>,
     selected_run: usize,
-    selected_list_item: usize, // Current position in the flattened list
-    expanded_projects: HashSet<String>, // Which projects are expanded
+    selected_model: usize,
+    selected_list_item: usize, // Current position in the flattened list (runs)
+    selected_model_list_item: usize, // Current position in the flattened list (models)
+    expanded_projects: HashSet<String>, // Which projects are expanded (runs)
+    expanded_model_projects: HashSet<String>, // Which projects are expanded (models)
     selected_card: usize,
     selected_example: usize,  // Index within an example group when focused
     selected_prompt: usize,   // Index within prompts batch for an example
@@ -88,11 +110,13 @@ struct App {
     prompt_scroll_offset: usize,     // Scroll offset for prompt in focused view
     response_scroll_offset: usize,   // Scroll offset for response in focused view
     view: View,
+    view_mode: ViewMode,
     should_quit: bool,
     show_config: bool,
     show_delete_confirm: bool,
     pending_delete_run: Option<usize>, // Index into runs vector of run to delete
-    // Terminal dimensions for layout calculations
+    pending_delete_model: Option<usize>, // Index into models vector of model to delete
+    pending_delete_eval: Option<usize>, // Index into model_evaluations of eval to delete
     term_width: u16,
     term_height: u16,
 }
@@ -100,13 +124,18 @@ struct App {
 impl App {
     fn new() -> Self {
         let runs = load_runs();
-        let evaluations = load_all_evaluations();
+        let models = load_models();
+        let model_evaluations = load_all_evaluations();
         App {
             runs,
-            evaluations,
+            models,
+            model_evaluations,
             selected_run: 0,
+            selected_model: 0,
             selected_list_item: 0,
+            selected_model_list_item: 0,
             expanded_projects: HashSet::new(),
+            expanded_model_projects: HashSet::new(),
             selected_card: 0,
             selected_example: 0,
             selected_prompt: 0,
@@ -116,10 +145,13 @@ impl App {
             prompt_scroll_offset: 0,
             response_scroll_offset: 0,
             view: View::List,
+            view_mode: ViewMode::Runs,
             should_quit: false,
             show_config: false,
             show_delete_confirm: false,
             pending_delete_run: None,
+            pending_delete_model: None,
+            pending_delete_eval: None,
             term_width: 80,
             term_height: 24,
         }
@@ -162,10 +194,36 @@ impl App {
         entries
     }
 
+    // Build the flattened list of entries (projects and models)
+    fn model_list_entries(&self) -> Vec<ModelListEntry> {
+        use std::collections::BTreeMap;
+
+        let mut projects: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+
+        for (i, model) in self.models.iter().enumerate() {
+            projects.entry(model.project.clone()).or_default().push(i);
+        }
+
+        let mut entries = Vec::new();
+
+        for (project_name, model_indices) in projects {
+            entries.push(ModelListEntry::Project {
+                name: project_name.clone(),
+            });
+
+            if self.expanded_model_projects.contains(&project_name) {
+                for model_index in model_indices {
+                    entries.push(ModelListEntry::Model { model_index });
+                }
+            }
+        }
+
+        entries
+    }
+
     fn refresh_runs(&mut self) {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
         self.runs = load_runs();
-        self.evaluations = load_all_evaluations();
 
         if let Some(name) = current_name {
             if let Some(idx) = self.runs.iter().position(|r| r.name == name) {
@@ -175,9 +233,27 @@ impl App {
             }
         }
 
-        // Ensure selected_list_item is valid
         let entries = self.list_entries();
         self.selected_list_item = self.selected_list_item.min(entries.len().saturating_sub(1));
+    }
+
+    fn refresh_models(&mut self) {
+        let current_name = self.models.get(self.selected_model).map(|m| m.name.clone());
+        self.models = load_models();
+        self.model_evaluations = load_all_evaluations();
+
+        if let Some(name) = current_name {
+            if let Some(idx) = self.models.iter().position(|m| m.name == name) {
+                self.selected_model = idx;
+            } else {
+                self.selected_model = self.selected_model.min(self.models.len().saturating_sub(1));
+            }
+        }
+
+        let entries = self.model_list_entries();
+        self.selected_model_list_item = self
+            .selected_model_list_item
+            .min(entries.len().saturating_sub(1));
     }
 
     fn refresh_current_run(&mut self) {
@@ -215,6 +291,10 @@ impl App {
         self.runs.get(self.selected_run)
     }
 
+    fn current_model(&self) -> Option<&Model> {
+        self.models.get(self.selected_model)
+    }
+
     fn cards(&self) -> Vec<Card> {
         let Some(run) = self.current_run() else {
             return vec![];
@@ -222,27 +302,35 @@ impl App {
 
         let mut cards = Vec::new();
 
-        // Add charts (sorted by name)
         let mut metric_names: Vec<&String> = run.metrics.keys().collect();
         metric_names.sort();
         for name in metric_names {
             cards.push(Card::Chart { name: name.clone() });
         }
 
-        // Add example groups (sorted by name)
         let mut example_names: Vec<&String> = run.examples.keys().collect();
         example_names.sort();
         for name in example_names {
             cards.push(Card::Examples { name: name.clone() });
         }
 
-        // Add evaluations for this run (sorted by name)
-        let run_evaluations: Vec<&Evaluation> = self
-            .evaluations
+        cards
+    }
+
+    fn model_cards(&self) -> Vec<Card> {
+        let Some(model) = self.current_model() else {
+            return vec![];
+        };
+
+        let mut cards = Vec::new();
+
+        let model_evaluations: Vec<&Evaluation> = self
+            .model_evaluations
             .iter()
-            .filter(|e| e.run_name == run.name)
+            .filter(|e| e.model_name == model.name && e.project == model.project)
             .collect();
-        for eval in run_evaluations {
+
+        for eval in model_evaluations {
             cards.push(Card::Evaluation {
                 name: eval.name.clone(),
             });
@@ -251,23 +339,28 @@ impl App {
         cards
     }
 
-    fn get_evaluation(&self, name: &str) -> Option<&Evaluation> {
-        let run = self.current_run()?;
-        self.evaluations
+    fn get_model_evaluation(&self, name: &str) -> Option<&Evaluation> {
+        let model = self.current_model()?;
+        self.model_evaluations
             .iter()
-            .find(|e| e.run_name == run.name && e.name == name)
+            .find(|e| e.model_name == model.name && e.project == model.project && e.name == name)
     }
 
     fn card_count(&self) -> usize {
         let Some(run) = self.current_run() else {
             return 0;
         };
-        let eval_count = self
-            .evaluations
+        run.metrics.len() + run.examples.len()
+    }
+
+    fn model_card_count(&self) -> usize {
+        let Some(model) = self.current_model() else {
+            return 0;
+        };
+        self.model_evaluations
             .iter()
-            .filter(|e| e.run_name == run.name)
-            .count();
-        run.metrics.len() + run.examples.len() + eval_count
+            .filter(|e| e.model_name == model.name && e.project == model.project)
+            .count()
     }
 
     // Calculate wrapped line count for text given a width
@@ -291,20 +384,29 @@ impl App {
         count
     }
 
+    fn active_cards(&self) -> Vec<Card> {
+        match self.view {
+            View::RunDetail | View::List => self.cards(),
+            View::ModelDetail => self.model_cards(),
+            View::Focused => match self.view_mode {
+                ViewMode::Runs => self.cards(),
+                ViewMode::Models => self.model_cards(),
+            },
+        }
+    }
+
     // Get max scroll offset for prompt/response in focused view
     fn focused_max_scroll(&self, is_prompt: bool) -> usize {
-        let cards = self.cards();
+        let cards = self.active_cards();
         let current_card = cards.get(self.selected_card);
 
-        // Calculate visible height (40% for prompt, 60% for response, minus borders)
-        let total_height = self.term_height.saturating_sub(6) as usize; // header + footer
+        let total_height = self.term_height.saturating_sub(6) as usize;
         let visible_height = if is_prompt {
-            (total_height * 40 / 100).saturating_sub(2) // 40%, minus borders
+            (total_height * 40 / 100).saturating_sub(2)
         } else {
-            (total_height * 60 / 100).saturating_sub(2) // 60%, minus borders
+            (total_height * 60 / 100).saturating_sub(2)
         };
 
-        // Width for wrapping (minus borders and some padding)
         let wrap_width = self.term_width.saturating_sub(4) as usize;
 
         let text = match current_card {
@@ -333,7 +435,11 @@ impl App {
                 }
             }
             Some(Card::Evaluation { name }) => {
-                if let Some(eval) = self.get_evaluation(name) {
+                let eval = match self.view_mode {
+                    ViewMode::Runs => None,
+                    ViewMode::Models => self.get_model_evaluation(name),
+                };
+                if let Some(eval) = eval {
                     if let Some(ex) = eval.examples.get(self.selected_example) {
                         if is_prompt {
                             ex.prompt.clone()
@@ -355,17 +461,23 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) {
-        // If delete confirmation is shown, handle that first
         if self.show_delete_confirm {
             self.handle_delete_confirm_key(code);
             return;
         }
 
         match self.view {
-            View::List => self.handle_list_key(code),
-            View::Detail => {
+            View::List => match self.view_mode {
+                ViewMode::Runs => self.handle_list_key(code),
+                ViewMode::Models => self.handle_model_list_key(code),
+            },
+            View::RunDetail => {
                 let (visible_rows, cols) = self.grid_layout();
                 self.handle_detail_key(code, visible_rows, cols);
+            }
+            View::ModelDetail => {
+                let (visible_rows, cols) = self.grid_layout();
+                self.handle_model_detail_key(code, visible_rows, cols);
             }
             View::Focused => self.handle_focused_key(code),
         }
@@ -374,28 +486,44 @@ impl App {
     fn handle_delete_confirm_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                // Confirm deletion
                 if let Some(run_idx) = self.pending_delete_run
                     && let Some(run) = self.runs.get(run_idx)
                 {
                     let path = run.path.clone();
-                    if data::delete_run(&path).is_err() {
-                        // Silently ignore deletion errors for now
-                    }
-                    // Refresh the runs list
+                    let _ = data::delete_run(&path);
                     self.refresh_runs();
-                    // Return to List view if we were on Detail
-                    if self.view == View::Detail {
+                    if self.view == View::RunDetail {
                         self.view = View::List;
                     }
                 }
+                if let Some(model_idx) = self.pending_delete_model
+                    && let Some(model) = self.models.get(model_idx)
+                {
+                    let path = model.path.clone();
+                    let _ = delete_model(&path);
+                    self.refresh_models();
+                    if self.view == View::ModelDetail {
+                        self.view = View::List;
+                    }
+                }
+                if let Some(eval_idx) = self.pending_delete_eval
+                    && let Some(eval) = self.model_evaluations.get(eval_idx)
+                {
+                    let path = eval.path.clone();
+                    let _ = delete_evaluation(&path);
+                    self.refresh_models();
+                    self.selected_card = self.selected_card.saturating_sub(1);
+                }
                 self.show_delete_confirm = false;
                 self.pending_delete_run = None;
+                self.pending_delete_model = None;
+                self.pending_delete_eval = None;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                // Cancel deletion
                 self.show_delete_confirm = false;
                 self.pending_delete_run = None;
+                self.pending_delete_model = None;
+                self.pending_delete_eval = None;
             }
             _ => {}
         }
@@ -407,6 +535,11 @@ impl App {
 
         match code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('m') => {
+                self.view_mode = ViewMode::Models;
+                self.selected_card = 0;
+                self.scroll_offset = 0;
+            }
             KeyCode::Up if self.selected_list_item > 0 => {
                 self.selected_list_item -= 1;
             }
@@ -414,7 +547,6 @@ impl App {
                 self.selected_list_item += 1;
             }
             KeyCode::Tab => {
-                // Toggle expansion of current project
                 if let Some(ListEntry::Project { name }) = entries.get(self.selected_list_item) {
                     if self.expanded_projects.contains(name) {
                         self.expanded_projects.remove(name);
@@ -423,29 +555,79 @@ impl App {
                     }
                 }
             }
-            KeyCode::Enter => {
-                match entries.get(self.selected_list_item) {
-                    Some(ListEntry::Project { name }) => {
-                        // Toggle expansion when pressing Enter on a project
-                        if self.expanded_projects.contains(name) {
-                            self.expanded_projects.remove(name);
-                        } else {
-                            self.expanded_projects.insert(name.clone());
-                        }
+            KeyCode::Enter => match entries.get(self.selected_list_item) {
+                Some(ListEntry::Project { name }) => {
+                    if self.expanded_projects.contains(name) {
+                        self.expanded_projects.remove(name);
+                    } else {
+                        self.expanded_projects.insert(name.clone());
                     }
-                    Some(ListEntry::Run { run_index }) => {
-                        // Open the run detail view
-                        self.selected_run = *run_index;
-                        self.selected_card = 0;
-                        self.view = View::Detail;
-                    }
-                    None => {}
                 }
-            }
+                Some(ListEntry::Run { run_index }) => {
+                    self.selected_run = *run_index;
+                    self.selected_card = 0;
+                    self.view = View::RunDetail;
+                }
+                None => {}
+            },
             KeyCode::Char('d') => {
-                // Delete only works on runs, not projects
                 if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
                     self.pending_delete_run = Some(*run_index);
+                    self.show_delete_confirm = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_model_list_key(&mut self, code: KeyCode) {
+        let entries = self.model_list_entries();
+        let entry_count = entries.len();
+
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('m') => {
+                self.view_mode = ViewMode::Runs;
+                self.selected_card = 0;
+                self.scroll_offset = 0;
+            }
+            KeyCode::Up if self.selected_model_list_item > 0 => {
+                self.selected_model_list_item -= 1;
+            }
+            KeyCode::Down if self.selected_model_list_item < entry_count.saturating_sub(1) => {
+                self.selected_model_list_item += 1;
+            }
+            KeyCode::Tab => {
+                if let Some(ModelListEntry::Project { name }) =
+                    entries.get(self.selected_model_list_item)
+                {
+                    if self.expanded_model_projects.contains(name) {
+                        self.expanded_model_projects.remove(name);
+                    } else {
+                        self.expanded_model_projects.insert(name.clone());
+                    }
+                }
+            }
+            KeyCode::Enter => match entries.get(self.selected_model_list_item) {
+                Some(ModelListEntry::Project { name }) => {
+                    if self.expanded_model_projects.contains(name) {
+                        self.expanded_model_projects.remove(name);
+                    } else {
+                        self.expanded_model_projects.insert(name.clone());
+                    }
+                }
+                Some(ModelListEntry::Model { model_index }) => {
+                    self.selected_model = *model_index;
+                    self.selected_card = 0;
+                    self.view = View::ModelDetail;
+                }
+                None => {}
+            },
+            KeyCode::Char('d') => {
+                if let Some(ModelListEntry::Model { model_index }) =
+                    entries.get(self.selected_model_list_item)
+                {
+                    self.pending_delete_model = Some(*model_index);
                     self.show_delete_confirm = true;
                 }
             }
@@ -458,7 +640,6 @@ impl App {
         let total_rows = card_count.div_ceil(cols);
         let max_scroll = total_rows.saturating_sub(visible_rows);
 
-        // Calculate visible row range
         let first_visible_row = self.scroll_offset;
         let last_visible_row = (self.scroll_offset + visible_rows).saturating_sub(1);
 
@@ -466,7 +647,6 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.view = View::List,
             KeyCode::Left if self.selected_card > 0 => {
                 self.selected_card -= 1;
-                // Scroll up if we moved above visible area
                 let new_row = self.selected_card / cols;
                 if new_row < first_visible_row {
                     self.scroll_offset = new_row;
@@ -474,7 +654,6 @@ impl App {
             }
             KeyCode::Right if self.selected_card < card_count.saturating_sub(1) => {
                 self.selected_card += 1;
-                // Scroll down if we moved below visible area
                 let new_row = self.selected_card / cols;
                 if new_row > last_visible_row {
                     self.scroll_offset = (new_row + 1).saturating_sub(visible_rows).min(max_scroll);
@@ -498,7 +677,6 @@ impl App {
                 self.show_config = !self.show_config;
             }
             KeyCode::Char('d') if !self.runs.is_empty() => {
-                // Show delete confirmation
                 self.pending_delete_run = Some(self.selected_run);
                 self.show_delete_confirm = true;
             }
@@ -506,26 +684,86 @@ impl App {
         }
     }
 
+    fn handle_model_detail_key(&mut self, code: KeyCode, visible_rows: usize, cols: usize) {
+        let card_count = self.model_card_count();
+        let total_rows = card_count.div_ceil(cols);
+        let max_scroll = total_rows.saturating_sub(visible_rows);
+
+        let first_visible_row = self.scroll_offset;
+        let last_visible_row = (self.scroll_offset + visible_rows).saturating_sub(1);
+
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => self.view = View::List,
+            KeyCode::Left if self.selected_card > 0 => {
+                self.selected_card -= 1;
+                let new_row = self.selected_card / cols;
+                if new_row < first_visible_row {
+                    self.scroll_offset = new_row;
+                }
+            }
+            KeyCode::Right if self.selected_card < card_count.saturating_sub(1) => {
+                self.selected_card += 1;
+                let new_row = self.selected_card / cols;
+                if new_row > last_visible_row {
+                    self.scroll_offset = (new_row + 1).saturating_sub(visible_rows).min(max_scroll);
+                }
+            }
+            KeyCode::Enter if card_count > 0 => {
+                self.selected_example = 0;
+                self.view = View::Focused;
+            }
+            KeyCode::Char('[') if self.selected_model > 0 => {
+                self.selected_model -= 1;
+                self.selected_card = 0;
+                self.scroll_offset = 0;
+            }
+            KeyCode::Char(']') if self.selected_model < self.models.len().saturating_sub(1) => {
+                self.selected_model += 1;
+                self.selected_card = 0;
+                self.scroll_offset = 0;
+            }
+            KeyCode::Char('c') => {
+                self.show_config = !self.show_config;
+            }
+            KeyCode::Char('d') if card_count > 0 => {
+                let cards = self.model_cards();
+                if let Some(Card::Evaluation { name }) = cards.get(self.selected_card)
+                    && let Some(model) = self.current_model()
+                    && let Some(eval_idx) = self.model_evaluations.iter().position(|e| {
+                        e.name == *name && e.model_name == model.name && e.project == model.project
+                    })
+                {
+                    self.pending_delete_eval = Some(eval_idx);
+                    self.show_delete_confirm = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_focused_key(&mut self, code: KeyCode) {
-        let card_count = self.card_count();
-        let cards = self.cards();
+        let (card_count, cards) = match self.view_mode {
+            ViewMode::Runs => (self.card_count(), self.cards()),
+            ViewMode::Models => (self.model_card_count(), self.model_cards()),
+        };
         let current_card = cards.get(self.selected_card);
 
-        // Check if we're viewing an examples group or evaluation
         let example_count = match current_card {
             Some(Card::Examples { name }) => self
                 .current_run()
                 .and_then(|r| r.examples.get(name))
                 .map(|e| e.len())
                 .unwrap_or(0),
-            Some(Card::Evaluation { name }) => self
-                .get_evaluation(name)
-                .map(|e| e.examples.len())
-                .unwrap_or(0),
+            Some(Card::Evaluation { name }) => match self.view_mode {
+                ViewMode::Runs => 0,
+                ViewMode::Models => self
+                    .get_model_evaluation(name)
+                    .map(|e| e.examples.len())
+                    .unwrap_or(0),
+            },
             _ => 0,
         };
 
-        // Get current prompt count for the selected example
         let prompt_count = match current_card {
             Some(Card::Examples { name }) => self
                 .current_run()
@@ -536,7 +774,6 @@ impl App {
             _ => 0,
         };
 
-        // Get current response count for the selected example and prompt
         let response_count = match current_card {
             Some(Card::Examples { name }) => self
                 .current_run()
@@ -550,7 +787,10 @@ impl App {
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                self.view = View::Detail;
+                self.view = match self.view_mode {
+                    ViewMode::Runs => View::RunDetail,
+                    ViewMode::Models => View::ModelDetail,
+                };
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
             }
@@ -662,6 +902,10 @@ impl App {
                 self.selected_response += 1;
                 self.response_scroll_offset = 0;
             }
+            // c toggles model config panel (Models view only)
+            KeyCode::Char('c') if self.view_mode == ViewMode::Models => {
+                self.show_config = !self.show_config;
+            }
             _ => {}
         }
     }
@@ -705,16 +949,21 @@ fn main() -> Result<()> {
         if let Some(rx) = &sync_rx
             && let Ok(SyncMessage::SyncCompleted) = rx.try_recv()
         {
-            if matches!(app.view, View::Detail | View::Focused) {
+            if matches!(
+                app.view,
+                View::RunDetail | View::ModelDetail | View::Focused
+            ) {
                 app.refresh_current_run();
             } else {
                 app.refresh_runs();
+                app.refresh_models();
             }
         }
 
-        // Periodic refresh of run list for local runs (less frequent)
+        // Periodic refresh of run and model lists (less frequent)
         if last_list_refresh.elapsed() >= list_refresh_interval {
             app.refresh_runs();
+            app.refresh_models();
             last_list_refresh = Instant::now();
         }
 
@@ -778,22 +1027,24 @@ fn remote_runs_dir() -> PathBuf {
 
 fn render(app: &App, frame: &mut Frame) {
     match app.view {
-        View::List => render_list(app, frame),
-        View::Detail => render_detail(app, frame),
+        View::List => match app.view_mode {
+            ViewMode::Runs => render_runs_list(app, frame),
+            ViewMode::Models => render_models_list(app, frame),
+        },
+        View::RunDetail => render_run_detail(app, frame),
+        View::ModelDetail => render_model_detail(app, frame),
         View::Focused => render_focused(app, frame),
     }
 
-    // Render delete confirmation dialog on top if showing
     if app.show_delete_confirm {
         render_delete_confirm(app, frame);
     }
 }
 
-fn render_list(app: &App, frame: &mut Frame) {
+fn render_runs_list(app: &App, frame: &mut Frame) {
     let area = frame.area();
     let entries = app.list_entries();
 
-    // Create list items from hierarchical entries
     let items: Vec<ListItem> = entries
         .iter()
         .enumerate()
@@ -899,13 +1150,18 @@ fn render_list(app: &App, frame: &mut Frame) {
     let mut state = ListState::default();
     state.select(Some(app.selected_list_item));
 
+    let title = Line::from(vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("[Runs]", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Models", Style::default().fg(Color::DarkGray)),
+        Span::styled(" ", Style::default()),
+    ]);
+
     let list = List::new(items)
         .block(
             Block::default()
-                .title(Span::styled(
-                    " ◆ TRAINING RUNS ",
-                    Style::default().fg(NEON_CYAN).bold(),
-                ))
+                .title(title)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(DIM_CYAN)),
@@ -915,14 +1171,16 @@ fn render_list(app: &App, frame: &mut Frame) {
 
     frame.render_stateful_widget(list, area, &mut state);
 
-    // Help text at bottom with styling
     let help = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("m", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] models  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
         Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Tab", Style::default().fg(NEON_CYAN)),
-        Span::styled("] expand/collapse  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("] expand  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_CYAN)),
         Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
@@ -937,7 +1195,130 @@ fn render_list(app: &App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(help), help_area);
 }
 
-fn render_detail(app: &App, frame: &mut Frame) {
+fn render_models_list(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+    let entries = app.model_list_entries();
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let is_selected = i == app.selected_model_list_item;
+
+            match entry {
+                ModelListEntry::Project { name } => {
+                    let is_expanded = app.expanded_model_projects.contains(name);
+                    let icon = if is_expanded { "▼ " } else { "▶ " };
+
+                    let model_count = app.models.iter().filter(|m| &m.project == name).count();
+
+                    let name_style = if is_selected {
+                        Style::default().fg(NEON_MAGENTA).bold()
+                    } else {
+                        Style::default().fg(NEON_CYAN).bold()
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        Span::styled(icon, Style::default().fg(NEON_MAGENTA)),
+                        Span::styled(name.clone(), name_style),
+                        Span::styled(
+                            format!("  ({} models)", model_count),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                }
+                ModelListEntry::Model { model_index } => {
+                    let model = &app.models[*model_index];
+
+                    let eval_count = app
+                        .model_evaluations
+                        .iter()
+                        .filter(|e| e.model_name == model.name && e.project == model.project)
+                        .count();
+
+                    let name_style = if is_selected {
+                        Style::default().fg(NEON_CYAN).bold()
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+
+                    let created_str = model
+                        .created_at
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "—".to_string());
+
+                    let updated_str = model
+                        .updated_at
+                        .map(|t| t.format("%H:%M").to_string())
+                        .unwrap_or_else(|| "—".to_string());
+
+                    ListItem::new(Line::from(vec![
+                        Span::styled("  └─ ", Style::default().fg(DIM_CYAN)),
+                        Span::styled("◆ ", Style::default().fg(NEON_YELLOW)),
+                        Span::styled(model.name.clone(), name_style),
+                        Span::styled(
+                            format!("  ({} evals)", eval_count),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled("  ", Style::default()),
+                        Span::styled(created_str, Style::default().fg(Color::DarkGray)),
+                        Span::styled(" → ", Style::default().fg(DIM_CYAN)),
+                        Span::styled(updated_str, Style::default().fg(Color::DarkGray)),
+                    ]))
+                }
+            }
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.selected_model_list_item));
+
+    let title = Line::from(vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("Runs", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("[Models]", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(" ", Style::default()),
+    ]);
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIM_CYAN)),
+        )
+        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, area, &mut state);
+
+    let help = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("m", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] runs  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+        Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+        Span::styled("] expand  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Enter", Style::default().fg(NEON_CYAN)),
+        Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("d", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+    ]);
+    let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
+    frame.render_widget(Paragraph::new(help), help_area);
+}
+
+fn render_run_detail(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
     let Some(run) = app.current_run() else {
@@ -945,13 +1326,12 @@ fn render_detail(app: &App, frame: &mut Frame) {
         return;
     };
 
-    // Layout: header, main content, footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(10),   // main content
-            Constraint::Length(1), // footer
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -1082,6 +1462,158 @@ fn render_detail(app: &App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
+fn render_model_detail(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+
+    let Some(model) = app.current_model() else {
+        frame.render_widget(Paragraph::new("No model selected"), area);
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let config_width = 35u16;
+    let (grid_area, config_area) = if app.show_config && model.config.is_some() {
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(config_width)])
+            .split(chunks[1]);
+        (h_chunks[0], Some(h_chunks[1]))
+    } else {
+        (chunks[1], None)
+    };
+
+    let card_width = 40u16;
+    let card_height = 12u16;
+    let cols = (grid_area.width / card_width).max(1) as usize;
+    let cards = app.model_cards();
+    let total_cards = cards.len();
+    let total_rows = total_cards.div_ceil(cols);
+    let visible_rows = (grid_area.height / card_height) as usize;
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let scroll = app.scroll_offset.min(max_scroll);
+
+    let scroll_indicator = if total_rows > visible_rows {
+        let has_above = scroll > 0;
+        let has_below = scroll < max_scroll;
+        match (has_above, has_below) {
+            (true, true) => " [↑↓ more]".to_string(),
+            (true, false) => " [↑ more above]".to_string(),
+            (false, true) => " [↓ more below]".to_string(),
+            (false, false) => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    let header_spans = vec![
+        Span::styled("◆ ", Style::default().fg(NEON_YELLOW)),
+        Span::styled(
+            format!("{}/{}", model.project, model.name),
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+        Span::styled("  │  ", Style::default().fg(DIM_CYAN)),
+        Span::styled(format!("{}", total_cards), Style::default().fg(NEON_GREEN)),
+        Span::styled(" evaluations", Style::default().fg(Color::DarkGray)),
+        Span::styled(&scroll_indicator, Style::default().fg(NEON_MAGENTA)),
+    ];
+    let header_text = Line::from(header_spans);
+    let header = Paragraph::new(header_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DIM_CYAN)),
+    );
+    frame.render_widget(header, chunks[0]);
+
+    render_model_cards_grid(app, frame, grid_area, &cards);
+
+    if let Some(config_area) = config_area
+        && let Some(config) = &model.config
+    {
+        render_config_panel(frame, config_area, config);
+    }
+
+    let config_hint = if app.show_config { "hide" } else { "config" };
+    let footer = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("←→", Style::default().fg(NEON_CYAN)),
+        Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+        Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("d", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("c", Style::default().fg(NEON_CYAN)),
+        Span::styled(
+            format!("] {}  ", config_hint),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("[]", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] model ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}/{}", app.selected_model + 1, app.models.len()),
+            Style::default().fg(NEON_YELLOW),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
+fn render_model_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
+    if cards.is_empty() {
+        frame.render_widget(Paragraph::new("No evaluations"), area);
+        return;
+    }
+
+    let card_width = 40u16;
+    let card_height = 12u16;
+    let cols = (area.width / card_width).max(1) as usize;
+
+    let total_rows = cards.len().div_ceil(cols);
+    let visible_rows = (area.height / card_height) as usize;
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let scroll = app.scroll_offset.min(max_scroll);
+
+    for (i, card) in cards.iter().enumerate() {
+        let col = i % cols;
+        let row = i / cols;
+
+        if row < scroll {
+            continue;
+        }
+
+        let visible_row = row - scroll;
+        let x = area.x + (col as u16) * card_width;
+        let y = area.y + (visible_row as u16) * card_height;
+
+        if y + card_height > area.bottom() {
+            continue;
+        }
+
+        let card_area = Rect::new(x, y, card_width.min(area.right() - x), card_height);
+        let is_selected = i == app.selected_card;
+
+        if let Card::Evaluation { name } = card
+            && let Some(eval) = app.get_model_evaluation(name)
+        {
+            render_evaluation_card(frame, card_area, eval, is_selected);
+        }
+    }
+}
+
 fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
     let Some(run) = app.current_run() else { return };
 
@@ -1132,11 +1664,7 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                     render_examples_card(frame, card_area, name, examples, is_selected);
                 }
             }
-            Card::Evaluation { name } => {
-                if let Some(eval) = app.get_evaluation(name) {
-                    render_evaluation_card(frame, card_area, eval, is_selected);
-                }
-            }
+            Card::Evaluation { .. } => {}
         }
     }
 }
@@ -1453,11 +1981,17 @@ fn render_evaluation_card(frame: &mut Frame, area: Rect, eval: &Evaluation, sele
         )));
     }
 
-    // Build title
-    let title_spans = vec![
+    // Build title with logged_at time
+    let mut title_spans = vec![
         Span::styled("◆ ", Style::default().fg(NEON_YELLOW)),
         Span::styled(&eval.name, title_style),
     ];
+    if let Some(logged_at) = eval.logged_at {
+        title_spans.push(Span::styled(
+            format!("  {}", logged_at.format("%m-%d %H:%M")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     let title = Line::from(title_spans);
 
     let block = Block::default()
@@ -1506,6 +2040,13 @@ fn reward_color(reward: f64) -> Color {
 fn render_focused(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
+    match app.view_mode {
+        ViewMode::Runs => render_focused_run(app, frame, area),
+        ViewMode::Models => render_focused_model(app, frame, area),
+    }
+}
+
+fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
     let Some(run) = app.current_run() else {
         frame.render_widget(Paragraph::new("No run selected"), area);
         return;
@@ -1517,7 +2058,6 @@ fn render_focused(app: &App, frame: &mut Frame) {
         return;
     };
 
-    // Layout: content and footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(1)])
@@ -1528,7 +2068,6 @@ fn render_focused(app: &App, frame: &mut Frame) {
             if let Some(points) = run.metrics.get(name) {
                 render_chart(frame, chunks[0], name, points, true);
             }
-            // Footer for charts
             let footer = Line::from(vec![
                 Span::styled("[", Style::default().fg(DIM_CYAN)),
                 Span::styled("q", Style::default().fg(NEON_MAGENTA)),
@@ -1560,7 +2099,6 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         app.response_scroll_offset,
                     );
                 }
-                // Get prompt and response counts for footer
                 let prompt_count = examples
                     .get(app.selected_example)
                     .map(|e| e.prompts.len())
@@ -1570,12 +2108,10 @@ fn render_focused(app: &App, frame: &mut Frame) {
                     .and_then(|e| e.responses.get(app.selected_prompt))
                     .map(|r| r.len())
                     .unwrap_or(0);
-                // Footer for examples
                 let focus_label = match app.focused_section {
                     FocusedSection::Prompt => "prompt",
                     FocusedSection::Response => "response",
                 };
-                let cards = app.cards();
                 let mut footer_spans = vec![
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("q", Style::default().fg(NEON_MAGENTA)),
@@ -1604,7 +2140,6 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         Style::default().fg(NEON_YELLOW),
                     ),
                 ];
-                // Add prompt navigation if multiple prompts in batch
                 if prompt_count > 1 {
                     footer_spans.extend(vec![
                         Span::styled("  ", Style::default()),
@@ -1617,7 +2152,6 @@ fn render_focused(app: &App, frame: &mut Frame) {
                         ),
                     ]);
                 }
-                // Add response variant navigation if multiple responses
                 if response_count > 1 {
                     footer_spans.extend(vec![
                         Span::styled("  ", Style::default()),
@@ -1634,60 +2168,99 @@ fn render_focused(app: &App, frame: &mut Frame) {
                 frame.render_widget(Paragraph::new(footer), chunks[1]);
             }
         }
-        Card::Evaluation { name } => {
-            if let Some(eval) = app.get_evaluation(name) {
-                render_focused_evaluation(
-                    frame,
-                    chunks[0],
-                    eval,
-                    app.selected_example,
-                    app.focused_section,
-                    app.prompt_scroll_offset,
-                    app.response_scroll_offset,
-                );
-                // Footer for evaluations
-                let example_count = eval.examples.len();
-                let focus_label = match app.focused_section {
-                    FocusedSection::Prompt => "prompt",
-                    FocusedSection::Response => "response",
-                };
-                let cards = app.cards();
-                let mut footer_spans = vec![
-                    Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-                    Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("←→", Style::default().fg(NEON_CYAN)),
-                    Span::styled("] card ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{}/{}", app.selected_card + 1, cards.len()),
-                        Style::default().fg(NEON_GREEN),
-                    ),
-                    Span::styled("  ", Style::default()),
-                    Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("j/k", Style::default().fg(NEON_CYAN)),
-                    Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
-                ];
-                if example_count > 0 {
-                    footer_spans.extend(vec![
-                        Span::styled("[", Style::default().fg(DIM_CYAN)),
-                        Span::styled("Tab", Style::default().fg(NEON_CYAN)),
-                        Span::styled("] focus:", Style::default().fg(Color::DarkGray)),
-                        Span::styled(focus_label, Style::default().fg(NEON_GREEN)),
-                        Span::styled("  ", Style::default()),
-                        Span::styled("[", Style::default().fg(DIM_CYAN)),
-                        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-                        Span::styled("] example ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            format!("{}/{}", app.selected_example + 1, example_count),
-                            Style::default().fg(NEON_YELLOW),
-                        ),
-                    ]);
-                }
-                let footer = Line::from(footer_spans);
-                frame.render_widget(Paragraph::new(footer), chunks[1]);
-            }
+        Card::Evaluation { .. } => {}
+    }
+}
+
+fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
+    let cards = app.model_cards();
+    let Some(card) = cards.get(app.selected_card) else {
+        frame.render_widget(Paragraph::new("No card selected"), area);
+        return;
+    };
+
+    let model = app.current_model();
+    let model_config = model.and_then(|m| m.config.clone());
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Breadcrumbs: project / model
+    if let Some(m) = model {
+        let breadcrumb = Line::from(vec![
+            Span::styled(&m.project, Style::default().fg(Color::DarkGray)),
+            Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&m.name, Style::default().fg(NEON_CYAN).bold()),
+        ]);
+        frame.render_widget(Paragraph::new(breadcrumb), chunks[0]);
+    }
+
+    if let Card::Evaluation { name } = card
+        && let Some(eval) = app.get_model_evaluation(name)
+    {
+        render_focused_evaluation(
+            frame,
+            chunks[1],
+            eval,
+            app.selected_example,
+            app.focused_section,
+            app.prompt_scroll_offset,
+            app.response_scroll_offset,
+            app.show_config,
+            model_config.as_ref(),
+        );
+        let example_count = eval.examples.len();
+        let focus_label = match app.focused_section {
+            FocusedSection::Prompt => "prompt",
+            FocusedSection::Response => "response",
+        };
+        let config_hint = if app.show_config { "hide" } else { "config" };
+        let mut footer_spans = vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("←→", Style::default().fg(NEON_CYAN)),
+            Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}/{}", app.selected_card + 1, cards.len()),
+                Style::default().fg(NEON_GREEN),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("c", Style::default().fg(NEON_CYAN)),
+            Span::styled(
+                format!("] {}  ", config_hint),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("j/k", Style::default().fg(NEON_CYAN)),
+            Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
+        ];
+        if example_count > 0 {
+            footer_spans.extend(vec![
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+                Span::styled("] focus:", Style::default().fg(Color::DarkGray)),
+                Span::styled(focus_label, Style::default().fg(NEON_GREEN)),
+                Span::styled("  ", Style::default()),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                Span::styled("] example ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}/{}", app.selected_example + 1, example_count),
+                    Style::default().fg(NEON_YELLOW),
+                ),
+            ]);
         }
+        let footer = Line::from(footer_spans);
+        frame.render_widget(Paragraph::new(footer), chunks[2]);
     }
 }
 
@@ -1700,15 +2273,54 @@ fn render_focused_evaluation(
     focused_section: FocusedSection,
     prompt_scroll_offset: usize,
     response_scroll_offset: usize,
+    show_model_config: bool,
+    model_config: Option<&serde_json::Value>,
 ) {
+    let (main_area, config_area) = if show_model_config && model_config.is_some() {
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(area);
+        (h_chunks[0], Some(h_chunks[1]))
+    } else {
+        (area, None)
+    };
+
+    if let Some(config_area) = config_area {
+        let config_content: Vec<Line> = if let Some(config) = model_config {
+            let mut lines = Vec::new();
+            render_json_value(config, 0, &mut lines);
+            lines
+        } else {
+            vec![Line::from(Span::styled(
+                "No config",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        };
+        let config_block = Block::default()
+            .title(Span::styled(
+                "◆ MODEL CONFIG ",
+                Style::default().fg(NEON_YELLOW).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DIM_CYAN));
+        frame.render_widget(
+            Paragraph::new(config_content)
+                .block(config_block)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            config_area,
+        );
+    }
+
     if eval.examples.is_empty() {
-        // No examples, just show metrics and config
+        // No examples, just show metrics and eval config
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
+            .split(main_area);
 
-        // Config panel (top)
+        // Eval config panel (top)
         let config_content: Vec<Line> = if let Some(config) = &eval.config {
             let mut lines = Vec::new();
             render_json_value(config, 0, &mut lines);
@@ -1721,7 +2333,7 @@ fn render_focused_evaluation(
         };
         let config_block = Block::default()
             .title(Span::styled(
-                "◆ CONFIG ",
+                "◆ EVAL CONFIG ",
                 Style::default().fg(NEON_CYAN).bold(),
             ))
             .borders(Borders::ALL)
@@ -1787,7 +2399,7 @@ fn render_focused_evaluation(
                 Constraint::Percentage(35),
                 Constraint::Percentage(50),
             ])
-            .split(area);
+            .split(main_area);
 
         // Metrics summary (top)
         let metrics_content: Vec<Line> = if let Some(metrics) = &eval.metrics {
@@ -2051,14 +2663,31 @@ fn render_focused_example(
 fn render_delete_confirm(app: &App, frame: &mut Frame) {
     use ratatui::widgets::Clear;
 
-    // Get the run name to display
-    let run_name = app
-        .pending_delete_run
-        .and_then(|idx| app.runs.get(idx))
-        .map(|r| r.name.as_str())
-        .unwrap_or("unknown");
+    let (item_type, item_name) = if let Some(idx) = app.pending_delete_run {
+        let name = app
+            .runs
+            .get(idx)
+            .map(|r| r.name.as_str())
+            .unwrap_or("unknown");
+        ("run", name)
+    } else if let Some(idx) = app.pending_delete_model {
+        let name = app
+            .models
+            .get(idx)
+            .map(|m| m.name.as_str())
+            .unwrap_or("unknown");
+        ("model", name)
+    } else if let Some(idx) = app.pending_delete_eval {
+        let name = app
+            .model_evaluations
+            .get(idx)
+            .map(|e| e.name.as_str())
+            .unwrap_or("unknown");
+        ("evaluation", name)
+    } else {
+        ("item", "unknown")
+    };
 
-    // Create centered popup
     let area = frame.area();
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = 7u16;
@@ -2066,15 +2695,16 @@ fn render_delete_confirm(app: &App, frame: &mut Frame) {
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
-    // Clear the area behind the popup
     frame.render_widget(Clear, popup_area);
 
-    // Create the popup content
     let text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("Delete run ", Style::default().fg(Color::White)),
-            Span::styled(run_name, Style::default().fg(NEON_CYAN).bold()),
+            Span::styled(
+                format!("Delete {} ", item_type),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(item_name, Style::default().fg(NEON_CYAN).bold()),
             Span::styled("? (y/n)", Style::default().fg(Color::White)),
         ]),
         Line::from(""),

@@ -44,14 +44,28 @@ pub struct EvaluationExample {
     pub response: String,
 }
 
-// An evaluation snapshot
+// An evaluation snapshot (now associated with models instead of runs)
 #[derive(Debug, Clone)]
 pub struct Evaluation {
     pub name: String,
-    pub run_name: String,
+    pub model_name: String,
+    pub project: String,
+    pub path: PathBuf,
     pub config: Option<serde_json::Value>,
     pub metrics: Option<serde_json::Map<String, serde_json::Value>>,
     pub examples: Vec<EvaluationExample>,
+    pub logged_at: Option<DateTime<Local>>,
+}
+
+// A model with its evaluations
+#[derive(Debug, Clone)]
+pub struct Model {
+    pub name: String,
+    pub project: String,
+    pub path: PathBuf,
+    pub config: Option<serde_json::Value>,
+    pub created_at: Option<DateTime<Local>>,
+    pub updated_at: Option<DateTime<Local>>,
 }
 
 // Run status
@@ -110,6 +124,14 @@ fn runs_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".ex")
         .join("runs")
+}
+
+// Get the directory where models are stored
+fn models_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ex")
+        .join("models")
 }
 
 // Get the directory where remote runs are cached
@@ -187,6 +209,16 @@ pub fn delete_run(path: &Path) -> Result<(), std::io::Error> {
     fs::remove_dir_all(path)
 }
 
+// Delete an evaluation by removing its JSON file
+pub fn delete_evaluation(path: &Path) -> Result<(), std::io::Error> {
+    fs::remove_file(path)
+}
+
+// Delete a model by removing its directory
+pub fn delete_model(path: &Path) -> Result<(), std::io::Error> {
+    fs::remove_dir_all(path)
+}
+
 // Load a single run from a directory
 fn load_run(path: &Path) -> Option<Run> {
     let name = path.file_name()?.to_string_lossy().to_string();
@@ -209,24 +241,97 @@ fn load_run(path: &Path) -> Option<Run> {
     })
 }
 
-// Load all evaluations from a run directory
-pub fn load_evaluations_for_run(run_path: &Path) -> Vec<Evaluation> {
-    let evaluations_dir = run_path.join("evaluations");
+// Load all models from the models directory
+pub fn load_models() -> Vec<Model> {
+    let mut models = Vec::new();
+    let dir = models_dir();
+
+    if !dir.exists() {
+        return models;
+    }
+
+    if let Ok(project_entries) = fs::read_dir(&dir) {
+        for project_entry in project_entries.flatten() {
+            let project_path = project_entry.path();
+            if !project_path.is_dir() {
+                continue;
+            }
+
+            let project_name = project_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if let Ok(model_entries) = fs::read_dir(&project_path) {
+                for model_entry in model_entries.flatten() {
+                    let model_path = model_entry.path();
+                    if model_path.is_dir()
+                        && let Some(model) = load_model(&model_path, &project_name)
+                    {
+                        models.push(model);
+                    }
+                }
+            }
+        }
+    }
+
+    models.sort_by(|a, b| a.project.cmp(&b.project).then_with(|| b.name.cmp(&a.name)));
+    models
+}
+
+// Load a single model from a directory
+fn load_model(path: &Path, project: &str) -> Option<Model> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    let meta_path = path.join("meta.json");
+
+    let (config, created_at, updated_at) = if meta_path.exists() {
+        let content = fs::read_to_string(&meta_path).ok()?;
+        let data: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+        let config = data.get("model_config").cloned();
+        let created_at = data
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Local));
+        let updated_at = data
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Local));
+
+        (config, created_at, updated_at)
+    } else {
+        (None, None, None)
+    };
+
+    Some(Model {
+        name,
+        project: project.to_string(),
+        path: path.to_path_buf(),
+        config,
+        created_at,
+        updated_at,
+    })
+}
+
+// Load all evaluations from a model directory
+pub fn load_evaluations_for_model(
+    model_path: &Path,
+    model_name: &str,
+    project: &str,
+) -> Vec<Evaluation> {
+    let evaluations_dir = model_path.join("evaluations");
     if !evaluations_dir.exists() {
         return vec![];
     }
-
-    let run_name = run_path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
 
     let mut evaluations = Vec::new();
     if let Ok(entries) = fs::read_dir(&evaluations_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false)
-                && let Some(eval) = load_evaluation(&path, &run_name)
+                && let Some(eval) = load_evaluation(&path, model_name, project)
             {
                 evaluations.push(eval);
             }
@@ -237,7 +342,7 @@ pub fn load_evaluations_for_run(run_path: &Path) -> Vec<Evaluation> {
 }
 
 // Load a single evaluation from a JSON file
-fn load_evaluation(path: &Path, run_name: &str) -> Option<Evaluation> {
+fn load_evaluation(path: &Path, model_name: &str, project: &str) -> Option<Evaluation> {
     let name = path.file_stem()?.to_string_lossy().to_string();
     let content = fs::read_to_string(path).ok()?;
     let data: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -248,55 +353,58 @@ fn load_evaluation(path: &Path, run_name: &str) -> Option<Evaluation> {
         .get("examples")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    let logged_at = data
+        .get("logged_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Local));
 
     Some(Evaluation {
         name,
-        run_name: run_name.to_string(),
+        model_name: model_name.to_string(),
+        project: project.to_string(),
+        path: path.to_path_buf(),
         config,
         metrics,
         examples,
+        logged_at,
     })
 }
 
-// Load all evaluations from both local and remote directories
+// Load all evaluations from all models
 pub fn load_all_evaluations() -> Vec<Evaluation> {
     let mut evaluations = Vec::new();
 
-    // Load from local runs directory
-    evaluations.extend(load_evaluations_from_dir(&runs_dir()));
-
-    // Load from remote runs directory
-    evaluations.extend(load_evaluations_from_dir(&remote_runs_dir()));
-
-    evaluations
-}
-
-// Load all evaluations from all runs in a specific directory
-fn load_evaluations_from_dir(dir: &Path) -> Vec<Evaluation> {
+    let dir = models_dir();
     if !dir.exists() {
-        return vec![];
+        return evaluations;
     }
 
-    let mut evaluations = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
+    if let Ok(project_entries) = fs::read_dir(&dir) {
+        for project_entry in project_entries.flatten() {
+            let project_path = project_entry.path();
+            if !project_path.is_dir() {
                 continue;
             }
 
-            if path.join("meta.json").exists() {
-                // Old flat structure: runs/<run_name>/
-                evaluations.extend(load_evaluations_for_run(&path));
-            } else {
-                // New nested structure: runs/<project>/<run_name>/
-                if let Ok(run_entries) = fs::read_dir(&path) {
-                    for run_entry in run_entries.flatten() {
-                        let run_path = run_entry.path();
-                        if run_path.is_dir() {
-                            evaluations.extend(load_evaluations_for_run(&run_path));
-                        }
+            let project_name = project_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if let Ok(model_entries) = fs::read_dir(&project_path) {
+                for model_entry in model_entries.flatten() {
+                    let model_path = model_entry.path();
+                    if model_path.is_dir() {
+                        let model_name = model_path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        evaluations.extend(load_evaluations_for_model(
+                            &model_path,
+                            &model_name,
+                            &project_name,
+                        ));
                     }
                 }
             }

@@ -13,8 +13,13 @@ from typing import Any
 
 
 def get_runs_dir() -> Path:
-    """Get the default runs directory (~/.extty/runs/)."""
+    """Get the default runs directory (~/.ex/runs/)."""
     return Path.home() / ".ex" / "runs"
+
+
+def get_models_dir() -> Path:
+    """Get the default models directory (~/.ex/models/)."""
+    return Path.home() / ".ex" / "models"
 
 
 def sanitize_metric_name(name: str) -> str:
@@ -29,11 +34,112 @@ def sanitize_metric_name(name: str) -> str:
     return "/".join(sanitized_parts)
 
 
-def generate_run_name() -> str:
+def generate_random_name() -> str:
     """Generate a unique run name with timestamp and random suffix."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     suffix = os.urandom(2).hex()
     return f"{timestamp}_{suffix}"
+
+
+@dataclass
+class ModelMeta:
+    """Metadata for a model."""
+
+    project: str
+    model_name: str
+    model_config: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project": self.project,
+            "model_name": self.model_name,
+            "model_config": self.model_config,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ModelMeta":
+        return cls(
+            project=data["project"],
+            model_name=data["model_name"],
+            model_config=data.get("model_config", {}),
+            created_at=data["created_at"],
+            updated_at=data["updated_at"],
+        )
+
+
+def log_model_evaluation(
+    project: str,
+    model: str,
+    name: str,
+    *,
+    metrics: dict[str, float] | None = None,
+    examples: list[dict[str, str]] | None = None,
+    model_config: dict[str, Any] | None = None,
+    eval_config: dict[str, Any] | None = None,
+) -> None:
+    """
+    Log an evaluation for a model.
+
+    Parameters
+    ----------
+    project : str
+        Name of the project.
+    model : str
+        Name of the model.
+    name : str
+        Name of this evaluation (e.g., "gsm8k", "humaneval").
+    metrics : dict[str, float], optional
+        Evaluation metrics.
+    examples : list[dict[str, str]], optional
+        Sample outputs.
+    model_config : dict[str, Any], optional
+        Model configuration (stored on model's meta.json).
+    eval_config : dict[str, Any], optional
+        Evaluation configuration (stored with evaluation).
+    """
+    now = datetime.now().isoformat()
+
+    model_dir = get_models_dir() / project / model
+    model_dir.mkdir(parents=True, exist_ok=True)
+    evaluations_dir = model_dir / "evaluations"
+    evaluations_dir.mkdir(exist_ok=True)
+
+    meta_path = model_dir / "meta.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            existing_meta = ModelMeta.from_dict(json.load(f))
+        if model_config is not None:
+            existing_meta.model_config = model_config
+        existing_meta.updated_at = now
+        meta = existing_meta
+    else:
+        meta = ModelMeta(
+            project=project,
+            model_name=model,
+            model_config=model_config or {},
+            created_at=now,
+            updated_at=now,
+        )
+
+    with open(meta_path, "w") as f:
+        json.dump(meta.to_dict(), f, indent=2)
+
+    eval_data: dict[str, Any] = {"logged_at": now}
+    if eval_config is not None:
+        eval_data["config"] = eval_config
+    if metrics is not None:
+        eval_data["metrics"] = metrics
+    if examples is not None:
+        eval_data["examples"] = examples
+
+    eval_path = evaluations_dir / f"{sanitize_metric_name(name)}.json"
+    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(eval_path, "w") as f:
+        json.dump(eval_data, f, indent=2)
 
 
 @dataclass
@@ -191,43 +297,6 @@ class RunStorage:
         }
         with open(filepath, "a") as f:
             f.write(json.dumps(record) + "\n")
-
-    def log_evaluation(
-        self,
-        name: str,
-        metrics: dict[str, float] | None = None,
-        examples: list[dict[str, str]] | None = None,
-        config: dict[str, Any] | None = None,
-    ) -> None:
-        """
-        Log an evaluation snapshot.
-
-        Parameters
-        ----------
-        name : str
-            Name of this evaluation (e.g., "gsm8k", "humaneval").
-        metrics : dict[str, float], optional
-            Evaluation metrics.
-        examples : list[dict[str, str]], optional
-            Sample outputs.
-        config : dict[str, Any], optional
-            Evaluation configuration.
-        """
-        evaluations_dir = self.run_dir / "evaluations"
-        evaluations_dir.mkdir(exist_ok=True)
-
-        data: dict[str, Any] = {}
-        if config is not None:
-            data["config"] = config
-        if metrics is not None:
-            data["metrics"] = metrics
-        if examples is not None:
-            data["examples"] = examples
-
-        filepath = evaluations_dir / f"{sanitize_metric_name(name)}.json"
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w") as f:
-            json.dump(data, f, indent=2)
 
     def close(self) -> None:
         """Flush remaining data and close any open file handles."""
