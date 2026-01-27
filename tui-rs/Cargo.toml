@@ -17,6 +17,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
+toml = "0.8"
 
 [package.metadata.release]
 # Skip crates.io publish (set to true when ready to publish)
