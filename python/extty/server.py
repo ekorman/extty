@@ -421,7 +421,7 @@ def _run_server(
 
         with modal.forward(port) as tunnel:
             print(
-                f"Serving extty through modal tunnel: {tunnel.host}:{tunnel.port} with token {token}"
+                f"Serving extty through modal tunnel. Connect with `extty --remote https://{tunnel.host}:{tunnel.port} --token {token}`"
             )
             server.serve_forever()
     else:
