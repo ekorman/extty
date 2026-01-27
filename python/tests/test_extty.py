@@ -16,7 +16,7 @@ import extty
 from extty.storage import (
     MetaData,
     RunStorage,
-    generate_run_name,
+    generate_random_name,
     sanitize_metric_name,
 )
 
@@ -54,7 +54,7 @@ class TestSanitizeMetricName:
 
 class TestGenerateRunName:
     def test_format(self) -> None:
-        name = generate_run_name()
+        name = generate_random_name()
         parts = name.split("_")
         assert len(parts) == 3
         assert len(parts[-1]) == 4
@@ -589,6 +589,74 @@ class TestModalIntegration:
                 extty.finish()
 
 
+class TestLogEvaluation:
+    """Tests for log_evaluation functionality."""
+
+    eval_config = {"dataset": "gsm8k", "num_samples": 100}
+    model_config = {"n_layers": 2}
+
+    def test_log_evaluation_creates_json(self, tmp_path: Path) -> None:
+        """Test that log_evaluation creates a JSON file."""
+        with mock.patch(
+            "extty.storage.get_models_dir", return_value=tmp_path / "models"
+        ):
+            extty.log_evaluation(
+                "test-project",
+                "test-model",
+                name="gsm8k",
+                metrics={"reward_mean": 0.85, "reward_std": 0.12, "accuracy": 0.78},
+                examples=[
+                    extty.Example(prompt="What is 2+2?", responses=["4"]),
+                    extty.Example(prompt="What is 3*5?", responses=["15"]),
+                ],
+                eval_config=self.eval_config,
+                model_config=self.model_config,
+            )
+
+            eval_path = (
+                tmp_path
+                / "models"
+                / "test-project"
+                / "test-model"
+                / "evaluations"
+                / "gsm8k.json"
+            )
+            assert eval_path.exists()
+            content = json.loads(eval_path.read_text())
+            assert content["metrics"]["reward_mean"] == 0.85
+            assert content["metrics"]["accuracy"] == 0.78
+            assert len(content["examples"]) == 2
+            assert content["examples"][0]["prompt"] == ["What is 2+2?"]
+            assert content["examples"][0]["response"] == [["4"]]
+            assert content["config"]["dataset"] == "gsm8k"
+
+    def test_log_evaluation_metrics_only(self, tmp_path: Path) -> None:
+        """Test log_evaluation with only metrics."""
+        with mock.patch(
+            "extty.storage.get_models_dir", return_value=tmp_path / "models"
+        ):
+            extty.log_evaluation(
+                "test-project",
+                "model_name",
+                name="humaneval",
+                metrics={"pass@1": 0.65, "pass@10": 0.82},
+            )
+
+            eval_path = (
+                tmp_path
+                / "models"
+                / "test-project"
+                / "model_name"
+                / "evaluations"
+                / "humaneval.json"
+            )
+            assert eval_path.exists()
+            content = json.loads(eval_path.read_text())
+            assert content["metrics"]["pass@1"] == 0.65
+            assert "examples" not in content
+            assert "config" not in content
+
+
 class TestExperimentDecorator:
     def test_decorator_initializes_and_finishes_run(self, tmp_path: Path) -> None:
         """Test that the decorator properly initializes and finishes a run."""
@@ -675,3 +743,132 @@ class TestExperimentDecorator:
             result = my_experiment()
 
             assert result == {"accuracy": 0.95, "loss": 0.05}
+
+    def test_decorator_name_kwarg(self, tmp_path: Path) -> None:
+        """Test that name_kwarg uses a kwarg value as the run name."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment(
+                "test-project", name_kwarg="run_name", system_metrics=False
+            )
+            def my_experiment(run_name: str, lr: float = 0.01) -> None:
+                pass
+
+            my_experiment(run_name="custom-run-name", lr=0.001)
+
+            meta_path = (
+                tmp_path / "runs" / "test-project" / "custom-run-name" / "meta.json"
+            )
+            assert meta_path.exists()
+            meta = json.loads(meta_path.read_text())
+            assert meta["run_name"] == "custom-run-name"
+            assert "run_name" not in meta["config"]
+            assert meta["config"]["lr"] == 0.001
+
+    def test_decorator_conf_kwargs(self, tmp_path: Path) -> None:
+        """Test that conf_kwargs only logs specified kwargs to config."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment(
+                "test-project",
+                name="conf-kwargs-test",
+                conf_kwargs=["lr", "batch_size"],
+                system_metrics=False,
+            )
+            def my_experiment(
+                lr: float, batch_size: int, data_path: str, verbose: bool = False
+            ) -> None:
+                pass
+
+            my_experiment(lr=0.001, batch_size=64, data_path="/data", verbose=True)
+
+            meta_path = (
+                tmp_path / "runs" / "test-project" / "conf-kwargs-test" / "meta.json"
+            )
+            meta = json.loads(meta_path.read_text())
+            assert meta["config"] == {"lr": 0.001, "batch_size": 64}
+            assert "data_path" not in meta["config"]
+            assert "verbose" not in meta["config"]
+
+    def test_decorator_non_conf_kwargs(self, tmp_path: Path) -> None:
+        """Test that non_conf_kwargs excludes specified kwargs from config."""
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment(
+                "test-project",
+                name="non-conf-kwargs-test",
+                non_conf_kwargs=["data_path", "verbose"],
+                system_metrics=False,
+            )
+            def my_experiment(
+                lr: float, batch_size: int, data_path: str, verbose: bool = False
+            ) -> None:
+                pass
+
+            my_experiment(lr=0.001, batch_size=64, data_path="/data", verbose=True)
+
+            meta_path = (
+                tmp_path
+                / "runs"
+                / "test-project"
+                / "non-conf-kwargs-test"
+                / "meta.json"
+            )
+            meta = json.loads(meta_path.read_text())
+            assert meta["config"] == {"lr": 0.001, "batch_size": 64}
+            assert "data_path" not in meta["config"]
+            assert "verbose" not in meta["config"]
+
+    def test_decorator_conf_and_non_conf_kwargs_raises(self) -> None:
+        """Test that passing both conf_kwargs and non_conf_kwargs raises ValueError."""
+        with pytest.raises(
+            ValueError,
+            match="cannot pass values for both.*conf_kwargs.*non_conf_kwargs",
+        ):
+
+            @extty.experiment(
+                "test-project",
+                conf_kwargs=["lr"],
+                non_conf_kwargs=["verbose"],
+                system_metrics=False,
+            )
+            def my_experiment(lr: float, verbose: bool) -> None:
+                pass
+
+
+class TestEvaluationDecorator:
+    """Tests for the evaluation decorator."""
+
+    def test_decorator_logs_started_and_finished_at(self, tmp_path: Path) -> None:
+        """Test that the evaluation decorator logs started_at and finished_at."""
+        with mock.patch(
+            "extty.storage.get_models_dir", return_value=tmp_path / "models"
+        ):
+
+            @extty.evaluation(
+                "test-project",
+                name="timing-test",
+                model="test-model",
+                model_config_kwargs=[],
+                eval_config_kwargs=[],
+            )
+            def my_evaluation() -> tuple[dict[str, float], list[extty.Example]]:
+                return {"accuracy": 0.95}, []
+
+            my_evaluation()
+
+            eval_path = (
+                tmp_path
+                / "models"
+                / "test-project"
+                / "test-model"
+                / "evaluations"
+                / "timing-test.json"
+            )
+            assert eval_path.exists()
+            content = json.loads(eval_path.read_text())
+            assert "started_at" in content
+            assert "finished_at" in content
+            assert "logged_at" in content
+            assert content["started_at"] <= content["finished_at"]
+            assert content["finished_at"] <= content["logged_at"]

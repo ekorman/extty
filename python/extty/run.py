@@ -11,7 +11,7 @@ from typing import Any, Protocol, runtime_checkable
 from extty.storage import (
     MetaData,
     RunStorage,
-    generate_run_name,
+    generate_random_name,
     get_runs_dir,
 )
 from extty.system_monitor import SystemMonitor
@@ -65,7 +65,7 @@ class Run:
         server: ServerConfig | None = None,
     ) -> None:
         self.project = project
-        self.name = name or generate_run_name()
+        self.name = name or generate_random_name()
         self.config = config or {}
         self._system_metrics_enabled = system_metrics
 
