@@ -1167,11 +1167,11 @@ impl App {
             }
             KeyCode::Char('s') => {
                 let instances = self.filtered_infra_instances();
-                if let Some(instance) = instances.get(self.selected_infra_instance) {
-                    if instance.ip.is_some() {
-                        let instance_clone = (*instance).clone();
-                        let _ = self.launch_ssh(&instance_clone);
-                    }
+                if let Some(instance) = instances.get(self.selected_infra_instance)
+                    && instance.ip.is_some()
+                {
+                    let instance_clone = (*instance).clone();
+                    let _ = self.launch_ssh(&instance_clone);
                 }
             }
             KeyCode::Char('R') => {
