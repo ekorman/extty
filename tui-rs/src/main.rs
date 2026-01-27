@@ -32,6 +32,7 @@ use data::{
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, Provider, get_provider, load_config,
+    save_config,
 };
 use remote::RemoteSync;
 
@@ -66,6 +67,8 @@ enum View {
     Focused,
     InfraList,
     InfraTypes,
+    InfraConfig,
+    InfraLaunch,
 }
 
 // Which section is focused in the focused example view
@@ -137,6 +140,15 @@ struct App {
     infra_error: Option<String>,
     show_terminate_confirm: bool,
     pending_terminate_instance: Option<usize>,
+    // Infra config editing
+    config_provider_index: usize,
+    config_api_key_input: String,
+    config_editing_key: bool,
+    // Infra launch
+    launch_selected_region: usize,
+    launch_name_input: String,
+    launch_editing_name: bool,
+    launch_confirming: bool,
 }
 
 impl App {
@@ -183,6 +195,13 @@ impl App {
             infra_error: None,
             show_terminate_confirm: false,
             pending_terminate_instance: None,
+            config_provider_index: 0,
+            config_api_key_input: String::new(),
+            config_editing_key: false,
+            launch_selected_region: 0,
+            launch_name_input: String::new(),
+            launch_editing_name: false,
+            launch_confirming: false,
         }
     }
 
@@ -553,7 +572,7 @@ impl App {
                 ViewMode::Models => self.model_cards(),
                 ViewMode::Infra => vec![],
             },
-            View::InfraList | View::InfraTypes => vec![],
+            View::InfraList | View::InfraTypes | View::InfraConfig | View::InfraLaunch => vec![],
         }
     }
 
@@ -656,6 +675,8 @@ impl App {
             View::Focused => self.handle_focused_key(code),
             View::InfraList => self.handle_infra_list_key(code),
             View::InfraTypes => self.handle_infra_types_key(code),
+            View::InfraConfig => self.handle_infra_config_key(code),
+            View::InfraLaunch => self.handle_infra_launch_key(code),
         }
     }
 
@@ -1177,6 +1198,12 @@ impl App {
             KeyCode::Char('R') => {
                 self.refresh_infra();
             }
+            KeyCode::Char('c') => {
+                self.view = View::InfraConfig;
+                self.config_provider_index = 0;
+                self.config_editing_key = false;
+                self.config_api_key_input.clear();
+            }
             _ => {}
         }
     }
@@ -1207,7 +1234,198 @@ impl App {
                     self.refresh_infra_types();
                 }
             }
+            KeyCode::Enter | KeyCode::Char('l') if type_count > 0 => {
+                self.view = View::InfraLaunch;
+                self.launch_selected_region = 0;
+                self.launch_name_input.clear();
+                self.launch_editing_name = false;
+                self.launch_confirming = false;
+            }
             _ => {}
+        }
+    }
+
+    fn handle_infra_config_key(&mut self, code: KeyCode) {
+        let providers = Provider::all();
+
+        if self.config_editing_key {
+            match code {
+                KeyCode::Esc => {
+                    self.config_editing_key = false;
+                    self.config_api_key_input.clear();
+                }
+                KeyCode::Enter => {
+                    let provider = providers[self.config_provider_index];
+                    let api_key = if self.config_api_key_input.is_empty() {
+                        None
+                    } else {
+                        Some(self.config_api_key_input.clone())
+                    };
+
+                    match provider {
+                        Provider::Lambda => self.infra_config.lambda_config.api_key = api_key,
+                        Provider::Vast => self.infra_config.vast.api_key = api_key,
+                        Provider::Prime => self.infra_config.prime.api_key = api_key,
+                    }
+
+                    let _ = save_config(&self.infra_config);
+                    self.config_editing_key = false;
+                    self.config_api_key_input.clear();
+                }
+                KeyCode::Backspace => {
+                    self.config_api_key_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.config_api_key_input.push(c);
+                }
+                _ => {}
+            }
+        } else {
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.view = View::InfraList;
+                }
+                KeyCode::Up if self.config_provider_index > 0 => {
+                    self.config_provider_index -= 1;
+                }
+                KeyCode::Down if self.config_provider_index < providers.len().saturating_sub(1) => {
+                    self.config_provider_index += 1;
+                }
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    self.config_editing_key = true;
+                    let provider = providers[self.config_provider_index];
+                    let current_key = match provider {
+                        Provider::Lambda => &self.infra_config.lambda_config.api_key,
+                        Provider::Vast => &self.infra_config.vast.api_key,
+                        Provider::Prime => &self.infra_config.prime.api_key,
+                    };
+                    self.config_api_key_input = current_key.clone().unwrap_or_default();
+                }
+                KeyCode::Char('d') => {
+                    let provider = providers[self.config_provider_index];
+                    match provider {
+                        Provider::Lambda => self.infra_config.lambda_config.api_key = None,
+                        Provider::Vast => self.infra_config.vast.api_key = None,
+                        Provider::Prime => self.infra_config.prime.api_key = None,
+                    }
+                    let _ = save_config(&self.infra_config);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_infra_launch_key(&mut self, code: KeyCode) {
+        let selected_type = self.infra_types.get(self.selected_infra_type);
+        let regions: Vec<&str> = selected_type
+            .map(|t| t.regions.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+
+        if self.launch_confirming {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.do_launch_instance();
+                    self.launch_confirming = false;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.launch_confirming = false;
+                }
+                _ => {}
+            }
+        } else if self.launch_editing_name {
+            match code {
+                KeyCode::Esc => {
+                    self.launch_editing_name = false;
+                }
+                KeyCode::Enter => {
+                    self.launch_editing_name = false;
+                }
+                KeyCode::Backspace => {
+                    self.launch_name_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.launch_name_input.push(c);
+                }
+                _ => {}
+            }
+        } else {
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.view = View::InfraTypes;
+                }
+                KeyCode::Up if self.launch_selected_region > 0 => {
+                    self.launch_selected_region -= 1;
+                }
+                KeyCode::Down
+                    if !regions.is_empty()
+                        && self.launch_selected_region < regions.len().saturating_sub(1) =>
+                {
+                    self.launch_selected_region += 1;
+                }
+                KeyCode::Char('n') => {
+                    self.launch_editing_name = true;
+                }
+                KeyCode::Enter | KeyCode::Char('l') => {
+                    self.launch_confirming = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn do_launch_instance(&mut self) {
+        let provider = self
+            .selected_infra_provider
+            .unwrap_or(self.infra_config.default_provider);
+        let config = self.infra_config.get_provider_config(provider);
+
+        let Some(api_key) = &config.api_key else {
+            self.infra_error = Some(format!("No API key for {}", provider.display_name()));
+            self.view = View::InfraList;
+            return;
+        };
+
+        let Some(instance_type) = self.infra_types.get(self.selected_infra_type) else {
+            self.infra_error = Some("No instance type selected".to_string());
+            self.view = View::InfraList;
+            return;
+        };
+
+        let region = if instance_type.regions.is_empty() {
+            config.default_region.clone()
+        } else {
+            instance_type.regions.get(self.launch_selected_region).cloned()
+        };
+
+        let name = if self.launch_name_input.is_empty() {
+            None
+        } else {
+            Some(self.launch_name_input.clone())
+        };
+
+        let ssh_key_names = config.ssh_key_name.as_ref().map(|k| vec![k.clone()]);
+
+        let opts = infra::models::LaunchOptions {
+            instance_type: instance_type.name.clone(),
+            region,
+            ssh_key_names,
+            name,
+        };
+
+        let client = get_provider(provider, api_key);
+        match client.launch(&opts) {
+            Ok(ids) => {
+                self.infra_error = None;
+                self.view = View::InfraList;
+                self.refresh_infra();
+                if !ids.is_empty() {
+                    self.infra_error = Some(format!("Launched: {}", ids.join(", ")));
+                }
+            }
+            Err(e) => {
+                self.infra_error = Some(format!("Launch failed: {}", e));
+                self.view = View::InfraList;
+            }
         }
     }
 }
@@ -1338,6 +1556,8 @@ fn render(app: &App, frame: &mut Frame) {
         View::Focused => render_focused(app, frame),
         View::InfraList => render_infra_list(app, frame),
         View::InfraTypes => render_infra_types(app, frame),
+        View::InfraConfig => render_infra_config(app, frame),
+        View::InfraLaunch => render_infra_launch(app, frame),
     }
 
     if app.show_delete_confirm {
@@ -3413,6 +3633,10 @@ fn render_infra_list(app: &App, frame: &mut Frame) {
         None => "[All]".to_string(),
     };
 
+    let lambda_configured = app.infra_config.lambda_config.api_key.is_some();
+    let vast_configured = app.infra_config.vast.api_key.is_some();
+    let prime_configured = app.infra_config.prime.api_key.is_some();
+
     let title = Line::from(vec![
         Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
         Span::styled("Runs", Style::default().fg(Color::DarkGray)),
@@ -3425,6 +3649,19 @@ fn render_infra_list(app: &App, frame: &mut Frame) {
         Span::styled(
             format!("  ({} instances)", instances.len()),
             Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            "λ",
+            Style::default().fg(if lambda_configured { NEON_GREEN } else { Color::DarkGray }),
+        ),
+        Span::styled(
+            "V",
+            Style::default().fg(if vast_configured { NEON_GREEN } else { Color::DarkGray }),
+        ),
+        Span::styled(
+            "P",
+            Style::default().fg(if prime_configured { NEON_GREEN } else { Color::DarkGray }),
         ),
     ]);
 
@@ -3474,6 +3711,9 @@ fn render_infra_list(app: &App, frame: &mut Frame) {
         Span::styled("Tab", Style::default().fg(NEON_CYAN)),
         Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("c", Style::default().fg(NEON_CYAN)),
+        Span::styled("] config  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("t", Style::default().fg(NEON_CYAN)),
         Span::styled("] types  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
@@ -3481,7 +3721,7 @@ fn render_infra_list(app: &App, frame: &mut Frame) {
         Span::styled("] ssh  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("x", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("] terminate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("] term  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("R", Style::default().fg(NEON_CYAN)),
         Span::styled("] refresh  ", Style::default().fg(Color::DarkGray)),
@@ -3614,11 +3854,263 @@ fn render_infra_types(app: &App, frame: &mut Frame) {
         Span::styled("Tab", Style::default().fg(NEON_CYAN)),
         Span::styled("] switch provider  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("l", Style::default().fg(NEON_GREEN)),
+        Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
         Span::styled("/", Style::default().fg(Color::DarkGray)),
         Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
         Span::styled("] back", Style::default().fg(Color::DarkGray)),
     ]);
+    let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
+    frame.render_widget(Paragraph::new(help), help_area);
+}
+
+fn render_infra_config(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+    let providers = Provider::all();
+
+    let items: Vec<ListItem> = providers
+        .iter()
+        .enumerate()
+        .map(|(i, provider)| {
+            let is_selected = i == app.config_provider_index;
+            let config = app.infra_config.get_provider_config(*provider);
+            let has_key = config.api_key.is_some();
+
+            let (status_icon, status_color) = if has_key {
+                ("✓", NEON_GREEN)
+            } else {
+                ("✗", Color::DarkGray)
+            };
+
+            let name_style = if is_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let key_display = if has_key {
+                let key = config.api_key.as_ref().unwrap();
+                if key.len() > 8 {
+                    format!("{}...{}", &key[..4], &key[key.len() - 4..])
+                } else {
+                    "****".to_string()
+                }
+            } else {
+                "not configured".to_string()
+            };
+
+            let mut spans = vec![
+                Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
+                Span::styled(format!("{:<12}", provider.display_name()), name_style),
+                Span::styled("  API Key: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    key_display,
+                    Style::default().fg(if has_key { NEON_YELLOW } else { Color::DarkGray }),
+                ),
+            ];
+
+            if is_selected && app.config_editing_key {
+                spans.push(Span::styled("  → ", Style::default().fg(NEON_MAGENTA)));
+                spans.push(Span::styled(
+                    &app.config_api_key_input,
+                    Style::default().fg(Color::White),
+                ));
+                spans.push(Span::styled("█", Style::default().fg(NEON_CYAN)));
+            }
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.config_provider_index));
+
+    let title = Line::from(vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("Provider Configuration", Style::default().fg(NEON_CYAN).bold()),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN));
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, area, &mut state);
+
+    let help = if app.config_editing_key {
+        Line::from(vec![
+            Span::styled("Type API key, then ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+            Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("e", Style::default().fg(NEON_GREEN)),
+            Span::styled("] edit key  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("d", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] delete key  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] back", Style::default().fg(Color::DarkGray)),
+        ])
+    };
+
+    let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
+    frame.render_widget(Paragraph::new(help), help_area);
+}
+
+fn render_infra_launch(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+
+    let selected_type = app.infra_types.get(app.selected_infra_type);
+    let provider = app
+        .selected_infra_provider
+        .unwrap_or(app.infra_config.default_provider);
+
+    let type_name = selected_type
+        .map(|t| t.name.as_str())
+        .unwrap_or("unknown");
+    let type_price = selected_type
+        .map(|t| t.price_display())
+        .unwrap_or_else(|| "?".to_string());
+    let regions: Vec<&str> = selected_type
+        .map(|t| t.regions.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Provider: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(provider.display_name(), Style::default().fg(NEON_CYAN)),
+        ]),
+        Line::from(vec![
+            Span::styled("Type: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(type_name, Style::default().fg(NEON_YELLOW)),
+            Span::styled("  ", Style::default()),
+            Span::styled(&type_price, Style::default().fg(NEON_GREEN)),
+        ]),
+        Line::from(""),
+    ];
+
+    if !regions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Select Region:",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for (i, region) in regions.iter().enumerate() {
+            let is_selected = i == app.launch_selected_region;
+            let prefix = if is_selected { "▶ " } else { "  " };
+            let style = if is_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(Span::styled(format!("{}{}", prefix, region), style)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
+        if app.launch_name_input.is_empty() {
+            Span::styled("(optional)", Style::default().fg(Color::DarkGray))
+        } else {
+            Span::styled(&app.launch_name_input, Style::default().fg(Color::White))
+        },
+        if app.launch_editing_name {
+            Span::styled("█", Style::default().fg(NEON_CYAN))
+        } else {
+            Span::raw("")
+        },
+    ]));
+
+    if app.launch_confirming {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Launch instance? ", Style::default().fg(NEON_YELLOW)),
+            Span::styled("[y/n]", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    let title = Line::from(vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("Launch Instance", Style::default().fg(NEON_CYAN).bold()),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+
+    let help = if app.launch_confirming {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("y", Style::default().fg(NEON_GREEN)),
+            Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("n", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    } else if app.launch_editing_name {
+        Line::from(vec![
+            Span::styled("Type name, then ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] done  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+            Span::styled("] region  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("n", Style::default().fg(NEON_CYAN)),
+            Span::styled("] set name  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("l", Style::default().fg(NEON_GREEN)),
+            Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] back", Style::default().fg(Color::DarkGray)),
+        ])
+    };
+
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
 }
