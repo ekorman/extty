@@ -15,7 +15,7 @@ runner = CliRunner()
 @pytest.fixture
 def temp_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Set up temporary config and state directories."""
-    config_dir = tmp_path / ".ex" / "infra"
+    config_dir = tmp_path / ".extty" / "infra"
     config_file = config_dir / "config.toml"
     state_file = config_dir / "instances.json"
 

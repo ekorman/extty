@@ -8,7 +8,7 @@ use super::models::InfraConfig;
 fn config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ex")
+        .join(".extty")
         .join("infra")
         .join("config.toml")
 }

@@ -1322,7 +1322,7 @@ fn parse_options() -> Result<Options> {
 fn remote_runs_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ex")
+        .join(".extty")
         .join("remote_runs")
 }
 

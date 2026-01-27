@@ -15,7 +15,7 @@ from extty_infra.models import InfraConfig
 @pytest.fixture
 def temp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Set up a temporary config directory."""
-    config_dir = tmp_path / ".ex" / "infra"
+    config_dir = tmp_path / ".extty" / "infra"
     config_file = config_dir / "config.toml"
 
     import extty_infra.config as config_module

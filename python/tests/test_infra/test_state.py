@@ -17,7 +17,7 @@ from extty_infra.models import InstanceState, InstanceStateFile
 @pytest.fixture
 def temp_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Set up a temporary state directory."""
-    state_dir = tmp_path / ".ex" / "infra"
+    state_dir = tmp_path / ".extty" / "infra"
     state_file = state_dir / "instances.json"
 
     import extty_infra.state as state_module

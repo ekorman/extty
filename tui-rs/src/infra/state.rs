@@ -10,7 +10,7 @@ use super::models::{InstanceStatus, Provider};
 fn state_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ex")
+        .join(".extty")
         .join("infra")
         .join("instances.json")
 }
