@@ -77,9 +77,11 @@ def log_model_evaluation(
     name: str,
     *,
     metrics: dict[str, float] | None = None,
-    examples: list[dict[str, str]] | None = None,
+    examples: list[dict[str, Any]] | None = None,
     model_config: dict[str, Any] | None = None,
     eval_config: dict[str, Any] | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
 ) -> None:
     """
     Log an evaluation for a model.
@@ -100,6 +102,10 @@ def log_model_evaluation(
         Model configuration (stored on model's meta.json).
     eval_config : dict[str, Any], optional
         Evaluation configuration (stored with evaluation).
+    started_at : str, optional
+        ISO timestamp when the evaluation started.
+    finished_at : str, optional
+        ISO timestamp when the evaluation finished.
     """
     now = datetime.now().isoformat()
 
@@ -129,6 +135,10 @@ def log_model_evaluation(
         json.dump(meta.to_dict(), f, indent=2)
 
     eval_data: dict[str, Any] = {"logged_at": now}
+    if started_at is not None:
+        eval_data["started_at"] = started_at
+    if finished_at is not None:
+        eval_data["finished_at"] = finished_at
     if eval_config is not None:
         eval_data["config"] = eval_config
     if metrics is not None:

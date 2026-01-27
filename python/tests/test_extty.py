@@ -606,8 +606,8 @@ class TestLogEvaluation:
                 name="gsm8k",
                 metrics={"reward_mean": 0.85, "reward_std": 0.12, "accuracy": 0.78},
                 examples=[
-                    {"prompt": "What is 2+2?", "response": "4"},
-                    {"prompt": "What is 3*5?", "response": "15"},
+                    extty.Example(prompt="What is 2+2?", responses=["4"]),
+                    extty.Example(prompt="What is 3*5?", responses=["15"]),
                 ],
                 eval_config=self.eval_config,
                 model_config=self.model_config,
@@ -626,7 +626,8 @@ class TestLogEvaluation:
             assert content["metrics"]["reward_mean"] == 0.85
             assert content["metrics"]["accuracy"] == 0.78
             assert len(content["examples"]) == 2
-            assert content["examples"][0]["prompt"] == "What is 2+2?"
+            assert content["examples"][0]["prompt"] == ["What is 2+2?"]
+            assert content["examples"][0]["response"] == [["4"]]
             assert content["config"]["dataset"] == "gsm8k"
 
     def test_log_evaluation_metrics_only(self, tmp_path: Path) -> None:
@@ -833,3 +834,41 @@ class TestExperimentDecorator:
             )
             def my_experiment(lr: float, verbose: bool) -> None:
                 pass
+
+
+class TestEvaluationDecorator:
+    """Tests for the evaluation decorator."""
+
+    def test_decorator_logs_started_and_finished_at(self, tmp_path: Path) -> None:
+        """Test that the evaluation decorator logs started_at and finished_at."""
+        with mock.patch(
+            "extty.storage.get_models_dir", return_value=tmp_path / "models"
+        ):
+
+            @extty.evaluation(
+                "test-project",
+                name="timing-test",
+                model="test-model",
+                model_config_kwargs=[],
+                eval_config_kwargs=[],
+            )
+            def my_evaluation() -> tuple[dict[str, float], list[extty.Example]]:
+                return {"accuracy": 0.95}, []
+
+            my_evaluation()
+
+            eval_path = (
+                tmp_path
+                / "models"
+                / "test-project"
+                / "test-model"
+                / "evaluations"
+                / "timing-test.json"
+            )
+            assert eval_path.exists()
+            content = json.loads(eval_path.read_text())
+            assert "started_at" in content
+            assert "finished_at" in content
+            assert "logged_at" in content
+            assert content["started_at"] <= content["finished_at"]
+            assert content["finished_at"] <= content["logged_at"]

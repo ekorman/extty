@@ -37,11 +37,12 @@ pub struct Example {
     pub rewards: Option<Vec<Vec<Reward>>>,
 }
 
-// An evaluation example (simple prompt/response pair)
-#[derive(Debug, Clone, Deserialize)]
+// An evaluation example (supports batched prompts and grouped responses like training examples)
+#[derive(Debug, Clone)]
 pub struct EvaluationExample {
-    pub prompt: String,
-    pub response: String,
+    pub prompts: Vec<String>,
+    pub responses: Vec<Vec<String>>,
+    pub rewards: Option<Vec<Vec<Reward>>>,
 }
 
 // An evaluation snapshot (now associated with models instead of runs)
@@ -55,6 +56,8 @@ pub struct Evaluation {
     pub metrics: Option<serde_json::Map<String, serde_json::Value>>,
     pub examples: Vec<EvaluationExample>,
     pub logged_at: Option<DateTime<Local>>,
+    pub started_at: Option<DateTime<Local>>,
+    pub finished_at: Option<DateTime<Local>>,
 }
 
 // A model with its evaluations
@@ -64,7 +67,9 @@ pub struct Model {
     pub project: String,
     pub path: PathBuf,
     pub config: Option<serde_json::Value>,
+    #[allow(dead_code)]
     pub created_at: Option<DateTime<Local>>,
+    #[allow(dead_code)]
     pub updated_at: Option<DateTime<Local>>,
 }
 
@@ -351,13 +356,32 @@ fn load_evaluation(path: &Path, model_name: &str, project: &str) -> Option<Evalu
     let metrics = data.get("metrics").and_then(|v| v.as_object()).cloned();
     let examples: Vec<EvaluationExample> = data
         .get("examples")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|ex| {
+                    let ex_data: ExampleData = serde_json::from_value(ex.clone()).ok()?;
+                    Some(EvaluationExample {
+                        prompts: ex_data.prompt,
+                        responses: ex_data.response,
+                        rewards: ex_data.reward,
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let logged_at = data
         .get("logged_at")
         .and_then(|v| v.as_str())
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Local));
+        .and_then(parse_datetime);
+    let started_at = data
+        .get("started_at")
+        .and_then(|v| v.as_str())
+        .and_then(parse_datetime);
+    let finished_at = data
+        .get("finished_at")
+        .and_then(|v| v.as_str())
+        .and_then(parse_datetime);
 
     Some(Evaluation {
         name,
@@ -368,7 +392,26 @@ fn load_evaluation(path: &Path, model_name: &str, project: &str) -> Option<Evalu
         metrics,
         examples,
         logged_at,
+        started_at,
+        finished_at,
     })
+}
+
+/// Parse a datetime string in either RFC3339 or ISO format
+fn parse_datetime(s: &str) -> Option<DateTime<Local>> {
+    // Try RFC3339 first (with timezone)
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Local));
+    }
+    // Try ISO format without timezone (assume local)
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return dt.and_local_timezone(Local).single();
+    }
+    // Try without fractional seconds
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return dt.and_local_timezone(Local).single();
+    }
+    None
 }
 
 // Load all evaluations from all models

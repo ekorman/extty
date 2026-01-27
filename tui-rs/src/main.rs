@@ -442,9 +442,16 @@ impl App {
                 if let Some(eval) = eval {
                     if let Some(ex) = eval.examples.get(self.selected_example) {
                         if is_prompt {
-                            ex.prompt.clone()
+                            ex.prompts
+                                .get(self.selected_prompt)
+                                .cloned()
+                                .unwrap_or_default()
                         } else {
-                            ex.response.clone()
+                            ex.responses
+                                .get(self.selected_prompt)
+                                .and_then(|r| r.get(self.selected_response))
+                                .cloned()
+                                .unwrap_or_default()
                         }
                     } else {
                         String::new()
@@ -771,6 +778,11 @@ impl App {
                 .and_then(|e| e.get(self.selected_example))
                 .map(|ex| ex.prompts.len())
                 .unwrap_or(0),
+            Some(Card::Evaluation { name }) => self
+                .get_model_evaluation(name)
+                .and_then(|e| e.examples.get(self.selected_example))
+                .map(|ex| ex.prompts.len())
+                .unwrap_or(0),
             _ => 0,
         };
 
@@ -779,6 +791,12 @@ impl App {
                 .current_run()
                 .and_then(|r| r.examples.get(name))
                 .and_then(|e| e.get(self.selected_example))
+                .and_then(|ex| ex.responses.get(self.selected_prompt))
+                .map(|r| r.len())
+                .unwrap_or(0),
+            Some(Card::Evaluation { name }) => self
+                .get_model_evaluation(name)
+                .and_then(|e| e.examples.get(self.selected_example))
                 .and_then(|ex| ex.responses.get(self.selected_prompt))
                 .map(|r| r.len())
                 .unwrap_or(0),
@@ -1230,11 +1248,18 @@ fn render_models_list(app: &App, frame: &mut Frame) {
                 ModelListEntry::Model { model_index } => {
                     let model = &app.models[*model_index];
 
-                    let eval_count = app
+                    let model_evals: Vec<_> = app
                         .model_evaluations
                         .iter()
                         .filter(|e| e.model_name == model.name && e.project == model.project)
-                        .count();
+                        .collect();
+                    let eval_count = model_evals.len();
+
+                    // Find the latest evaluation timestamp (prefer started_at, fall back to logged_at)
+                    let latest_eval_time = model_evals
+                        .iter()
+                        .filter_map(|e| e.started_at.or(e.logged_at))
+                        .max();
 
                     let name_style = if is_selected {
                         Style::default().fg(NEON_CYAN).bold()
@@ -1242,17 +1267,7 @@ fn render_models_list(app: &App, frame: &mut Frame) {
                         Style::default().fg(Color::Gray)
                     };
 
-                    let created_str = model
-                        .created_at
-                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_else(|| "—".to_string());
-
-                    let updated_str = model
-                        .updated_at
-                        .map(|t| t.format("%H:%M").to_string())
-                        .unwrap_or_else(|| "—".to_string());
-
-                    ListItem::new(Line::from(vec![
+                    let mut spans = vec![
                         Span::styled("  └─ ", Style::default().fg(DIM_CYAN)),
                         Span::styled("◆ ", Style::default().fg(NEON_YELLOW)),
                         Span::styled(model.name.clone(), name_style),
@@ -1260,11 +1275,17 @@ fn render_models_list(app: &App, frame: &mut Frame) {
                             format!("  ({} evals)", eval_count),
                             Style::default().fg(Color::DarkGray),
                         ),
-                        Span::styled("  ", Style::default()),
-                        Span::styled(created_str, Style::default().fg(Color::DarkGray)),
-                        Span::styled(" → ", Style::default().fg(DIM_CYAN)),
-                        Span::styled(updated_str, Style::default().fg(Color::DarkGray)),
-                    ]))
+                    ];
+
+                    if let Some(latest) = latest_eval_time {
+                        spans.push(Span::styled("  ", Style::default()));
+                        spans.push(Span::styled(
+                            latest.format("%m-%d %H:%M").to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+
+                    ListItem::new(Line::from(spans))
                 }
             }
         })
@@ -1981,15 +2002,40 @@ fn render_evaluation_card(frame: &mut Frame, area: Rect, eval: &Evaluation, sele
         )));
     }
 
-    // Build title with logged_at time
+    // Build title with time info
     let mut title_spans = vec![
         Span::styled("◆ ", Style::default().fg(NEON_YELLOW)),
         Span::styled(&eval.name, title_style),
     ];
-    if let Some(logged_at) = eval.logged_at {
+    // Show started_at time if available, otherwise logged_at
+    if let Some(started_at) = eval.started_at {
+        title_spans.push(Span::styled(
+            format!("  {}", started_at.format("%m-%d %H:%M")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else if let Some(logged_at) = eval.logged_at {
         title_spans.push(Span::styled(
             format!("  {}", logged_at.format("%m-%d %H:%M")),
             Style::default().fg(Color::DarkGray),
+        ));
+    }
+    // Show duration if we have both start and end times
+    if let (Some(started), Some(finished)) = (eval.started_at, eval.finished_at) {
+        let duration = finished.signed_duration_since(started);
+        let duration_str = if duration.num_seconds() < 60 {
+            format!("{}s", duration.num_seconds())
+        } else if duration.num_minutes() < 60 {
+            format!(
+                "{}m{}s",
+                duration.num_minutes(),
+                duration.num_seconds() % 60
+            )
+        } else {
+            format!("{}h{}m", duration.num_hours(), duration.num_minutes() % 60)
+        };
+        title_spans.push(Span::styled(
+            format!("  ({})", duration_str),
+            Style::default().fg(NEON_GREEN),
         ));
     }
     let title = Line::from(title_spans);
@@ -2191,13 +2237,20 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
         ])
         .split(area);
 
-    // Breadcrumbs: project / model
+    // Breadcrumbs: project / model / evaluation (if viewing evaluation)
     if let Some(m) = model {
-        let breadcrumb = Line::from(vec![
+        let mut breadcrumb_spans = vec![
             Span::styled(&m.project, Style::default().fg(Color::DarkGray)),
             Span::styled(" / ", Style::default().fg(Color::DarkGray)),
             Span::styled(&m.name, Style::default().fg(NEON_CYAN).bold()),
-        ]);
+        ];
+        if let Card::Evaluation { name } = card {
+            breadcrumb_spans.extend(vec![
+                Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+                Span::styled(name, Style::default().fg(NEON_YELLOW).bold()),
+            ]);
+        }
+        let breadcrumb = Line::from(breadcrumb_spans);
         frame.render_widget(Paragraph::new(breadcrumb), chunks[0]);
     }
 
@@ -2209,6 +2262,8 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
             chunks[1],
             eval,
             app.selected_example,
+            app.selected_prompt,
+            app.selected_response,
             app.focused_section,
             app.prompt_scroll_offset,
             app.response_scroll_offset,
@@ -2216,6 +2271,12 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
             model_config.as_ref(),
         );
         let example_count = eval.examples.len();
+        let current_example = eval.examples.get(app.selected_example);
+        let prompt_count = current_example.map(|e| e.prompts.len()).unwrap_or(0);
+        let response_count = current_example
+            .and_then(|e| e.responses.get(app.selected_prompt))
+            .map(|r| r.len())
+            .unwrap_or(0);
         let focus_label = match app.focused_section {
             FocusedSection::Prompt => "prompt",
             FocusedSection::Response => "response",
@@ -2258,6 +2319,30 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
                     Style::default().fg(NEON_YELLOW),
                 ),
             ]);
+            if prompt_count > 1 {
+                footer_spans.extend(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("[]", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] prompt ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}", app.selected_prompt + 1, prompt_count),
+                        Style::default().fg(NEON_MAGENTA),
+                    ),
+                ]);
+            }
+            if response_count > 1 {
+                footer_spans.extend(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("<>", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] response ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}", app.selected_response + 1, response_count),
+                        Style::default().fg(NEON_MAGENTA),
+                    ),
+                ]);
+            }
         }
         let footer = Line::from(footer_spans);
         frame.render_widget(Paragraph::new(footer), chunks[2]);
@@ -2270,6 +2355,8 @@ fn render_focused_evaluation(
     area: Rect,
     eval: &Evaluation,
     selected_example: usize,
+    selected_prompt: usize,
+    selected_response: usize,
     focused_section: FocusedSection,
     prompt_scroll_offset: usize,
     response_scroll_offset: usize,
@@ -2320,17 +2407,56 @@ fn render_focused_evaluation(
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(main_area);
 
-        // Eval config panel (top)
-        let config_content: Vec<Line> = if let Some(config) = &eval.config {
-            let mut lines = Vec::new();
-            render_json_value(config, 0, &mut lines);
-            lines
-        } else {
-            vec![Line::from(Span::styled(
+        // Eval config panel (top) - includes timing info
+        let mut config_content: Vec<Line> = Vec::new();
+
+        // Add timing info
+        if let Some(started) = eval.started_at {
+            config_content.push(Line::from(vec![
+                Span::styled("started: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    started.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        if let Some(finished) = eval.finished_at {
+            config_content.push(Line::from(vec![
+                Span::styled("finished: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    finished.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        if let (Some(started), Some(finished)) = (eval.started_at, eval.finished_at) {
+            let duration = finished.signed_duration_since(started);
+            let duration_str = format!(
+                "{}.{:03}s",
+                duration.num_seconds(),
+                duration.num_milliseconds() % 1000
+            );
+            config_content.push(Line::from(vec![
+                Span::styled("duration: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(duration_str, Style::default().fg(NEON_GREEN)),
+            ]));
+        }
+
+        // Add separator if we have timing info and config
+        if !config_content.is_empty() && eval.config.is_some() {
+            config_content.push(Line::from(""));
+        }
+
+        // Add config
+        if let Some(config) = &eval.config {
+            render_json_value(config, 0, &mut config_content);
+        } else if config_content.is_empty() {
+            config_content.push(Line::from(Span::styled(
                 "No config",
                 Style::default().fg(Color::DarkGray),
-            ))]
-        };
+            )));
+        }
+
         let config_block = Block::default()
             .title(Span::styled(
                 "◆ EVAL CONFIG ",
@@ -2391,27 +2517,94 @@ fn render_focused_evaluation(
             chunks[1],
         );
     } else {
-        // Has examples: show metrics/config at top, prompt/response at bottom
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(8),
-                Constraint::Percentage(35),
-                Constraint::Percentage(50),
-            ])
+        // Has examples: left side (config + metrics), right side (examples)
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(main_area);
 
-        // Metrics summary (top)
+        // Left side: eval config (top) and metrics (bottom)
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(h_chunks[0]);
+
+        // Eval config panel (top left) - includes timing info
+        let mut config_content: Vec<Line> = Vec::new();
+
+        // Add timing info
+        if let Some(started) = eval.started_at {
+            config_content.push(Line::from(vec![
+                Span::styled("started: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    started.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        if let Some(finished) = eval.finished_at {
+            config_content.push(Line::from(vec![
+                Span::styled("finished: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    finished.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        if let (Some(started), Some(finished)) = (eval.started_at, eval.finished_at) {
+            let duration = finished.signed_duration_since(started);
+            let duration_str = format!(
+                "{}.{:03}s",
+                duration.num_seconds(),
+                duration.num_milliseconds() % 1000
+            );
+            config_content.push(Line::from(vec![
+                Span::styled("duration: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(duration_str, Style::default().fg(NEON_GREEN)),
+            ]));
+        }
+
+        // Add separator if we have timing info and config
+        if !config_content.is_empty() && eval.config.is_some() {
+            config_content.push(Line::from(""));
+        }
+
+        // Add config
+        if let Some(config) = &eval.config {
+            render_json_value(config, 0, &mut config_content);
+        } else if config_content.is_empty() {
+            config_content.push(Line::from(Span::styled(
+                "No config",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        let config_block = Block::default()
+            .title(Span::styled(
+                "◆ EVAL CONFIG ",
+                Style::default().fg(NEON_CYAN).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DIM_CYAN));
+        frame.render_widget(
+            Paragraph::new(config_content)
+                .block(config_block)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            left_chunks[0],
+        );
+
+        // Metrics panel (bottom left)
         let metrics_content: Vec<Line> = if let Some(metrics) = &eval.metrics {
             let mut lines = Vec::new();
             let mut keys: Vec<&String> = metrics.keys().collect();
             keys.sort();
-            for key in keys.iter().take(5) {
-                if let Some(value) = metrics.get(*key) {
+            for key in keys {
+                if let Some(value) = metrics.get(key) {
                     let val_str = match value {
                         serde_json::Value::Number(n) => {
                             if let Some(f) = n.as_f64() {
-                                format!("{:.4}", f)
+                                format!("{:.6}", f)
                             } else {
                                 n.to_string()
                             }
@@ -2433,7 +2626,7 @@ fn render_focused_evaluation(
         };
         let metrics_block = Block::default()
             .title(Span::styled(
-                format!("◆ {} METRICS ", eval.name),
+                "◆ METRICS ",
                 Style::default().fg(NEON_GREEN).bold(),
             ))
             .borders(Borders::ALL)
@@ -2443,57 +2636,167 @@ fn render_focused_evaluation(
             Paragraph::new(metrics_content)
                 .block(metrics_block)
                 .wrap(ratatui::widgets::Wrap { trim: false }),
-            chunks[0],
+            left_chunks[1],
         );
 
-        // Get current example
-        let example = eval.examples.get(selected_example);
-        let prompt_text = example.map(|e| e.prompt.as_str()).unwrap_or("");
-        let response_text = example.map(|e| e.response.as_str()).unwrap_or("");
-
-        // Prompt section
-        let prompt_focused = focused_section == FocusedSection::Prompt;
-        let prompt_border_color = if prompt_focused { NEON_CYAN } else { DIM_CYAN };
-        let prompt_block = Block::default()
+        // Right side: Examples card containing prompt and response
+        let examples_block = Block::default()
             .title(Span::styled(
-                format!("◆ PROMPT {}/{}", selected_example + 1, eval.examples.len()),
+                format!(
+                    "◆ EXAMPLES #{}/{} ",
+                    selected_example + 1,
+                    eval.examples.len()
+                ),
                 Style::default().fg(NEON_YELLOW).bold(),
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(prompt_border_color));
-        frame.render_widget(
-            Paragraph::new(prompt_text)
-                .style(Style::default().fg(Color::White))
-                .block(prompt_block)
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .scroll((prompt_scroll_offset as u16, 0)),
-            chunks[1],
-        );
+            .border_style(Style::default().fg(DIM_CYAN));
+        let examples_inner = examples_block.inner(h_chunks[1]);
+        frame.render_widget(examples_block, h_chunks[1]);
 
-        // Response section
-        let response_focused = focused_section == FocusedSection::Response;
-        let response_border_color = if response_focused {
-            NEON_CYAN
-        } else {
-            DIM_CYAN
-        };
-        let response_block = Block::default()
-            .title(Span::styled(
-                "◆ RESPONSE ",
+        // Split examples inner area into prompt and response
+        let example_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(examples_inner);
+
+        // Get current example
+        if let Some(example) = eval.examples.get(selected_example) {
+            // Get the prompt text
+            let prompt_text = example
+                .prompts
+                .get(selected_prompt)
+                .cloned()
+                .unwrap_or_default();
+
+            // Prompt title - show batch position if multiple prompts
+            let prompt_focused = focused_section == FocusedSection::Prompt;
+            let prompt_border_color = if prompt_focused { NEON_CYAN } else { DIM_CYAN };
+            let mut prompt_title_spans = vec![Span::styled(
+                "PROMPT ",
+                Style::default().fg(NEON_YELLOW).bold(),
+            )];
+            if example.prompts.len() > 1 {
+                prompt_title_spans.extend(vec![
+                    Span::styled(
+                        format!("{}/{}", selected_prompt + 1, example.prompts.len()),
+                        Style::default().fg(NEON_YELLOW),
+                    ),
+                    Span::styled(" ", Style::default()),
+                ]);
+            }
+            let prompt_title = Line::from(prompt_title_spans);
+
+            let prompt_block = Block::default()
+                .title(prompt_title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(prompt_border_color));
+            frame.render_widget(
+                Paragraph::new(prompt_text)
+                    .style(Style::default().fg(Color::White))
+                    .block(prompt_block)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((prompt_scroll_offset as u16, 0)),
+                example_chunks[0],
+            );
+
+            // Get responses for the selected prompt
+            let responses_for_prompt = example
+                .responses
+                .get(selected_prompt)
+                .cloned()
+                .unwrap_or_default();
+
+            // Get the reward for the selected response variant (if it exists)
+            let current_reward = example
+                .rewards
+                .as_ref()
+                .and_then(|rewards| rewards.get(selected_prompt))
+                .and_then(|prompt_rewards| prompt_rewards.get(selected_response));
+
+            // Response title with variant indicator if multiple responses
+            let response_focused = focused_section == FocusedSection::Response;
+            let response_border_color = if response_focused {
+                NEON_CYAN
+            } else {
+                DIM_CYAN
+            };
+
+            let mut response_title_spans = vec![Span::styled(
+                "RESPONSE ",
                 Style::default().fg(NEON_GREEN).bold(),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(response_border_color));
-        frame.render_widget(
-            Paragraph::new(response_text)
-                .style(Style::default().fg(Color::Gray))
-                .block(response_block)
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .scroll((response_scroll_offset as u16, 0)),
-            chunks[2],
-        );
+            )];
+
+            if responses_for_prompt.len() > 1 {
+                response_title_spans.extend(vec![
+                    Span::styled("│ ", Style::default().fg(DIM_CYAN)),
+                    Span::styled("group ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}", selected_response + 1, responses_for_prompt.len()),
+                        Style::default().fg(NEON_MAGENTA),
+                    ),
+                ]);
+            }
+
+            if let Some(reward) = current_reward {
+                response_title_spans.push(Span::styled(" │ ", Style::default().fg(DIM_CYAN)));
+                match reward {
+                    Reward::Scalar(v) => {
+                        let color = reward_color(*v);
+                        response_title_spans.push(Span::styled(
+                            "reward: ",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                        response_title_spans.push(Span::styled(
+                            format!("{:.2}", v),
+                            Style::default().fg(color),
+                        ));
+                    }
+                    Reward::Components(map) => {
+                        let mut parts: Vec<(&String, &f64)> = map.iter().collect();
+                        parts.sort_by_key(|(k, _)| *k);
+                        for (i, (key, value)) in parts.iter().enumerate() {
+                            let color = reward_color(**value);
+                            if i > 0 {
+                                response_title_spans.push(Span::styled("  ", Style::default()));
+                            }
+                            response_title_spans.push(Span::styled(
+                                format!("{}: ", key),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                            response_title_spans.push(Span::styled(
+                                format!("{:.1}", value),
+                                Style::default().fg(color),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let response_title = Line::from(response_title_spans);
+
+            // Get the selected response text
+            let response_text = responses_for_prompt
+                .get(selected_response)
+                .cloned()
+                .unwrap_or_default();
+
+            let response_block = Block::default()
+                .title(response_title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(response_border_color));
+            frame.render_widget(
+                Paragraph::new(response_text)
+                    .style(Style::default().fg(Color::Gray))
+                    .block(response_block)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((response_scroll_offset as u16, 0)),
+                example_chunks[1],
+            );
+        }
     }
 }
 
