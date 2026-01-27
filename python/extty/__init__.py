@@ -251,7 +251,7 @@ def experiment(
     conf_kwargs: list[str] | None = None,
     non_conf_kwargs: list[str] | None = None,
     system_metrics: bool = True,
-    server: bool = False,
+    server: bool | Callable[..., bool] = False,
     server_host: str = "0.0.0.0",
     server_port: int = 0,
     server_token: str | None = None,
@@ -284,12 +284,17 @@ def experiment(
 
                 if run_name is None and name_kwarg is not None:
                     run_name = kwargs_copy.pop(name_kwarg)
+
+                if callable(server):
+                    run_server = server()
+                else:
+                    run_server = server
                 init(
                     project=project,
                     name=run_name,
                     config=kwargs_copy,
                     system_metrics=system_metrics,
-                    server=server,
+                    server=run_server,
                     server_host=server_host,
                     server_port=server_port,
                     server_token=server_token,
