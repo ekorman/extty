@@ -304,7 +304,9 @@ def experiment(
                 )
                 return fn(*args, **kwargs)
             finally:
-                finish()
+                global _active_run
+                if _active_run is not None:
+                    finish()
 
         return wrapper
 
