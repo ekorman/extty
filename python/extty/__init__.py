@@ -241,7 +241,6 @@ def evaluation(
         return wrapper
 
     return dec
-    # metrics, examples = pass
 
 
 def experiment(
