@@ -26,6 +26,7 @@ const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 mod data;
 mod infra;
 mod remote;
+mod s3;
 use data::{
     Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation, delete_model,
     load_all_evaluations, load_models, load_runs,
@@ -66,9 +67,14 @@ enum View {
     ModelDetail,
     Focused,
     InfraList,
-    InfraTypes,
     InfraConfig,
-    InfraLaunch,
+}
+
+// Which panel has focus in the Infra dashboard
+#[derive(Clone, Copy, PartialEq)]
+enum InfraPanel {
+    Instances,
+    Types,
 }
 
 // Which section is focused in the focused example view
@@ -140,15 +146,16 @@ struct App {
     infra_error: Option<String>,
     show_terminate_confirm: bool,
     pending_terminate_instance: Option<usize>,
+    infra_active_panel: InfraPanel,
     // Infra config editing
     config_provider_index: usize,
     config_api_key_input: String,
     config_editing_key: bool,
-    // Infra launch
+    // Infra launch (inline in types panel)
     launch_selected_region: usize,
     launch_name_input: String,
-    launch_editing_name: bool,
     launch_confirming: bool,
+    launch_selecting_region: bool,
 }
 
 impl App {
@@ -195,13 +202,14 @@ impl App {
             infra_error: None,
             show_terminate_confirm: false,
             pending_terminate_instance: None,
+            infra_active_panel: InfraPanel::Instances,
             config_provider_index: 0,
             config_api_key_input: String::new(),
             config_editing_key: false,
             launch_selected_region: 0,
             launch_name_input: String::new(),
-            launch_editing_name: false,
             launch_confirming: false,
+            launch_selecting_region: false,
         }
     }
 
@@ -572,7 +580,7 @@ impl App {
                 ViewMode::Models => self.model_cards(),
                 ViewMode::Infra => vec![],
             },
-            View::InfraList | View::InfraTypes | View::InfraConfig | View::InfraLaunch => vec![],
+            View::InfraList | View::InfraConfig => vec![],
         }
     }
 
@@ -674,9 +682,7 @@ impl App {
             }
             View::Focused => self.handle_focused_key(code),
             View::InfraList => self.handle_infra_list_key(code),
-            View::InfraTypes => self.handle_infra_types_key(code),
             View::InfraConfig => self.handle_infra_config_key(code),
-            View::InfraLaunch => self.handle_infra_launch_key(code),
         }
     }
 
@@ -741,6 +747,7 @@ impl App {
                 self.view_mode = ViewMode::Infra;
                 self.view = View::InfraList;
                 self.refresh_infra();
+                self.refresh_infra_types();
             }
             KeyCode::Up if self.selected_list_item > 0 => {
                 self.selected_list_item -= 1;
@@ -797,6 +804,7 @@ impl App {
                 self.view_mode = ViewMode::Infra;
                 self.view = View::InfraList;
                 self.refresh_infra();
+                self.refresh_infra_types();
             }
             KeyCode::Up if self.selected_model_list_item > 0 => {
                 self.selected_model_list_item -= 1;
@@ -1148,8 +1156,18 @@ impl App {
     }
 
     fn handle_infra_list_key(&mut self, code: KeyCode) {
+        if self.launch_confirming {
+            self.handle_infra_launch_confirm_key(code);
+            return;
+        }
+        if self.launch_selecting_region {
+            self.handle_infra_region_select_key(code);
+            return;
+        }
+
         let instances = self.filtered_infra_instances();
         let instance_count = instances.len();
+        let type_count = self.infra_types.len();
 
         match code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -1161,42 +1179,95 @@ impl App {
                 self.view_mode = ViewMode::Models;
                 self.view = View::List;
             }
-            KeyCode::Up if self.selected_infra_instance > 0 => {
-                self.selected_infra_instance -= 1;
-            }
-            KeyCode::Down if self.selected_infra_instance < instance_count.saturating_sub(1) => {
-                self.selected_infra_instance += 1;
-            }
-            KeyCode::Tab => {
-                self.selected_infra_provider = match self.selected_infra_provider {
-                    None => Some(Provider::Lambda),
-                    Some(Provider::Lambda) => Some(Provider::Vast),
-                    Some(Provider::Vast) => Some(Provider::Prime),
-                    Some(Provider::Prime) => None,
+            KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                self.infra_active_panel = match self.infra_active_panel {
+                    InfraPanel::Instances => InfraPanel::Types,
+                    InfraPanel::Types => InfraPanel::Instances,
                 };
-                self.selected_infra_instance = 0;
             }
-            KeyCode::Char('t') => {
-                self.view = View::InfraTypes;
+            KeyCode::Up => match self.infra_active_panel {
+                InfraPanel::Instances if self.selected_infra_instance > 0 => {
+                    self.selected_infra_instance -= 1;
+                }
+                InfraPanel::Types if self.selected_infra_type > 0 => {
+                    self.selected_infra_type -= 1;
+                }
+                _ => {}
+            },
+            KeyCode::Down => match self.infra_active_panel {
+                InfraPanel::Instances
+                    if self.selected_infra_instance < instance_count.saturating_sub(1) =>
+                {
+                    self.selected_infra_instance += 1;
+                }
+                InfraPanel::Types if self.selected_infra_type < type_count.saturating_sub(1) => {
+                    self.selected_infra_type += 1;
+                }
+                _ => {}
+            },
+            KeyCode::Char('1') => {
+                self.selected_infra_provider = Some(Provider::Lambda);
+                self.selected_infra_instance = 0;
+                self.selected_infra_type = 0;
+                self.refresh_infra();
                 self.refresh_infra_types();
             }
-            KeyCode::Char('x') => {
+            KeyCode::Char('2') => {
+                self.selected_infra_provider = Some(Provider::Vast);
+                self.selected_infra_instance = 0;
+                self.selected_infra_type = 0;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Char('3') => {
+                self.selected_infra_provider = Some(Provider::Prime);
+                self.selected_infra_instance = 0;
+                self.selected_infra_type = 0;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Char('0') => {
+                self.selected_infra_provider = None;
+                self.selected_infra_instance = 0;
+                self.selected_infra_type = 0;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Enter => match self.infra_active_panel {
+                InfraPanel::Instances => {
+                    let instances = self.filtered_infra_instances();
+                    if let Some(instance) = instances.get(self.selected_infra_instance)
+                        && instance.ip.is_some()
+                    {
+                        let instance_clone = (*instance).clone();
+                        let _ = self.launch_ssh(&instance_clone);
+                    }
+                }
+                InfraPanel::Types if type_count > 0 => {
+                    if let Some(instance_type) = self.infra_types.get(self.selected_infra_type) {
+                        if instance_type.regions.is_empty() {
+                            self.infra_error = Some("No availability for this type".to_string());
+                        } else if instance_type.regions.len() == 1 {
+                            self.launch_selected_region = 0;
+                            self.launch_name_input.clear();
+                            self.launch_confirming = true;
+                        } else {
+                            self.launch_selected_region = 0;
+                            self.launch_selecting_region = true;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Char('x') if self.infra_active_panel == InfraPanel::Instances => {
                 if instance_count > 0 && self.selected_infra_instance < instance_count {
                     self.pending_terminate_instance = Some(self.selected_infra_instance);
                     self.show_terminate_confirm = true;
                 }
             }
-            KeyCode::Char('s') => {
-                let instances = self.filtered_infra_instances();
-                if let Some(instance) = instances.get(self.selected_infra_instance) {
-                    if instance.ip.is_some() {
-                        let instance_clone = (*instance).clone();
-                        let _ = self.launch_ssh(&instance_clone);
-                    }
-                }
-            }
             KeyCode::Char('R') => {
                 self.refresh_infra();
+                self.refresh_infra_types();
             }
             KeyCode::Char('c') => {
                 self.view = View::InfraConfig;
@@ -1208,38 +1279,39 @@ impl App {
         }
     }
 
-    fn handle_infra_types_key(&mut self, code: KeyCode) {
-        let type_count = self.infra_types.len();
+    fn handle_infra_launch_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.do_launch_instance();
+                self.launch_confirming = false;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.launch_confirming = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_infra_region_select_key(&mut self, code: KeyCode) {
+        let regions_count = self
+            .infra_types
+            .get(self.selected_infra_type)
+            .map(|t| t.regions.len())
+            .unwrap_or(0);
 
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.view = View::InfraList;
+            KeyCode::Esc => {
+                self.launch_selecting_region = false;
             }
-            KeyCode::Up if self.selected_infra_type > 0 => {
-                self.selected_infra_type -= 1;
+            KeyCode::Up if self.launch_selected_region > 0 => {
+                self.launch_selected_region -= 1;
             }
-            KeyCode::Down if self.selected_infra_type < type_count.saturating_sub(1) => {
-                self.selected_infra_type += 1;
+            KeyCode::Down if self.launch_selected_region < regions_count.saturating_sub(1) => {
+                self.launch_selected_region += 1;
             }
-            KeyCode::Tab => {
-                let old_provider = self.selected_infra_provider;
-                self.selected_infra_provider = match self.selected_infra_provider {
-                    None => Some(self.infra_config.default_provider),
-                    Some(Provider::Lambda) => Some(Provider::Vast),
-                    Some(Provider::Vast) => Some(Provider::Prime),
-                    Some(Provider::Prime) => Some(Provider::Lambda),
-                };
-                if self.selected_infra_provider != old_provider {
-                    self.selected_infra_type = 0;
-                    self.refresh_infra_types();
-                }
-            }
-            KeyCode::Enter | KeyCode::Char('l') if type_count > 0 => {
-                self.view = View::InfraLaunch;
-                self.launch_selected_region = 0;
-                self.launch_name_input.clear();
-                self.launch_editing_name = false;
-                self.launch_confirming = false;
+            KeyCode::Enter => {
+                self.launch_selecting_region = false;
+                self.launch_confirming = true;
             }
             _ => {}
         }
@@ -1314,65 +1386,6 @@ impl App {
             }
         }
     }
-
-    fn handle_infra_launch_key(&mut self, code: KeyCode) {
-        let selected_type = self.infra_types.get(self.selected_infra_type);
-        let regions: Vec<&str> = selected_type
-            .map(|t| t.regions.iter().map(|s| s.as_str()).collect())
-            .unwrap_or_default();
-
-        if self.launch_confirming {
-            match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.do_launch_instance();
-                    self.launch_confirming = false;
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.launch_confirming = false;
-                }
-                _ => {}
-            }
-        } else if self.launch_editing_name {
-            match code {
-                KeyCode::Esc => {
-                    self.launch_editing_name = false;
-                }
-                KeyCode::Enter => {
-                    self.launch_editing_name = false;
-                }
-                KeyCode::Backspace => {
-                    self.launch_name_input.pop();
-                }
-                KeyCode::Char(c) => {
-                    self.launch_name_input.push(c);
-                }
-                _ => {}
-            }
-        } else {
-            match code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    self.view = View::InfraTypes;
-                }
-                KeyCode::Up if self.launch_selected_region > 0 => {
-                    self.launch_selected_region -= 1;
-                }
-                KeyCode::Down
-                    if !regions.is_empty()
-                        && self.launch_selected_region < regions.len().saturating_sub(1) =>
-                {
-                    self.launch_selected_region += 1;
-                }
-                KeyCode::Char('n') => {
-                    self.launch_editing_name = true;
-                }
-                KeyCode::Enter | KeyCode::Char('l') => {
-                    self.launch_confirming = true;
-                }
-                _ => {}
-            }
-        }
-    }
-
     fn do_launch_instance(&mut self) {
         let provider = self
             .selected_infra_provider
@@ -1381,20 +1394,21 @@ impl App {
 
         let Some(api_key) = &config.api_key else {
             self.infra_error = Some(format!("No API key for {}", provider.display_name()));
-            self.view = View::InfraList;
             return;
         };
 
         let Some(instance_type) = self.infra_types.get(self.selected_infra_type) else {
             self.infra_error = Some("No instance type selected".to_string());
-            self.view = View::InfraList;
             return;
         };
 
         let region = if instance_type.regions.is_empty() {
             config.default_region.clone()
         } else {
-            instance_type.regions.get(self.launch_selected_region).cloned()
+            instance_type
+                .regions
+                .get(self.launch_selected_region)
+                .cloned()
         };
 
         let name = if self.launch_name_input.is_empty() {
@@ -1416,23 +1430,31 @@ impl App {
         match client.launch(&opts) {
             Ok(ids) => {
                 self.infra_error = None;
-                self.view = View::InfraList;
                 self.refresh_infra();
+                self.infra_active_panel = InfraPanel::Instances;
                 if !ids.is_empty() {
                     self.infra_error = Some(format!("Launched: {}", ids.join(", ")));
                 }
             }
             Err(e) => {
                 self.infra_error = Some(format!("Launch failed: {}", e));
-                self.view = View::InfraList;
             }
         }
     }
 }
 
 fn main() -> Result<()> {
-    let options = parse_options()?;
+    let command = parse_command()?;
 
+    match command {
+        Command::Tui(options) => run_tui(options),
+        Command::Pull(options) => run_s3_command("pull", options),
+        Command::Push(options) => run_s3_command("push", options),
+        Command::Sync(options) => run_s3_command("sync", options),
+    }
+}
+
+fn run_tui(options: TuiOptions) -> Result<()> {
     let sync_rx: Option<Receiver<SyncMessage>> = if let Some(remote_url) = options.remote_url {
         let runs_dir = remote_runs_dir();
         let token = options
@@ -1506,35 +1528,290 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-struct Options {
+fn run_s3_command(cmd: &str, options: SyncOptions) -> Result<()> {
+    let config = s3::load_config()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "S3 not configured. Create ~/.extty/s3/config.toml with:\n\n\
+             bucket = \"your-bucket\"\n\
+             prefix = \"extty\"\n\
+             region = \"us-west-2\"\n"
+        )
+    })?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let client = s3::S3Client::new(config).await?;
+        let runs_dir = runs_dir();
+
+        let (project_filter, run_filter) = parse_target(&options.target);
+
+        match cmd {
+            "pull" => {
+                let runs = client.list_runs(project_filter.as_deref()).await?;
+                let runs_to_sync: Vec<_> = runs
+                    .into_iter()
+                    .filter(|r| run_filter.as_ref().is_none_or(|rf| r.name == *rf))
+                    .collect();
+
+                if runs_to_sync.is_empty() {
+                    println!("No runs found to pull.");
+                    return Ok(());
+                }
+
+                for run in runs_to_sync {
+                    client
+                        .download_run(
+                            &run.project,
+                            &run.name,
+                            &runs_dir,
+                            options.force,
+                            options.dry_run,
+                        )
+                        .await?;
+                    if !options.dry_run {
+                        println!("Pulled: {}/{}", run.project, run.name);
+                    }
+                }
+            }
+            "push" => {
+                let local_runs = list_local_runs(&runs_dir, project_filter.as_deref())?;
+                let runs_to_sync: Vec<_> = local_runs
+                    .into_iter()
+                    .filter(|(_, name)| run_filter.as_ref().is_none_or(|rf| name == rf))
+                    .collect();
+
+                if runs_to_sync.is_empty() {
+                    println!("No runs found to push.");
+                    return Ok(());
+                }
+
+                for (project, name) in runs_to_sync {
+                    client
+                        .upload_run(&project, &name, &runs_dir, options.force, options.dry_run)
+                        .await?;
+                    if !options.dry_run {
+                        println!("Pushed: {}/{}", project, name);
+                    }
+                }
+            }
+            "sync" => {
+                let remote_runs = client.list_runs(project_filter.as_deref()).await?;
+                let local_runs = list_local_runs(&runs_dir, project_filter.as_deref())?;
+
+                let mut all_runs: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                for r in &remote_runs {
+                    all_runs.insert((r.project.clone(), r.name.clone()));
+                }
+                for (p, n) in &local_runs {
+                    all_runs.insert((p.clone(), n.clone()));
+                }
+
+                let runs_to_sync: Vec<_> = all_runs
+                    .into_iter()
+                    .filter(|(_, name)| run_filter.as_ref().is_none_or(|rf| name == rf))
+                    .collect();
+
+                if runs_to_sync.is_empty() {
+                    println!("No runs found to sync.");
+                    return Ok(());
+                }
+
+                for (project, name) in runs_to_sync {
+                    client
+                        .sync_run(&project, &name, &runs_dir, options.dry_run)
+                        .await?;
+                    if !options.dry_run {
+                        println!("Synced: {}/{}", project, name);
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(())
+    })
+}
+
+fn parse_target(target: &Option<String>) -> (Option<String>, Option<String>) {
+    match target {
+        None => (None, None),
+        Some(t) => {
+            if t.ends_with('/') {
+                (Some(t.trim_end_matches('/').to_string()), None)
+            } else if t.contains('/') {
+                let parts: Vec<&str> = t.splitn(2, '/').collect();
+                (Some(parts[0].to_string()), Some(parts[1].to_string()))
+            } else {
+                (Some(t.clone()), None)
+            }
+        }
+    }
+}
+
+fn runs_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".extty")
+        .join("runs")
+}
+
+fn list_local_runs(
+    runs_dir: &PathBuf,
+    project_filter: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let mut runs = Vec::new();
+
+    if !runs_dir.exists() {
+        return Ok(runs);
+    }
+
+    for proj_entry in std::fs::read_dir(runs_dir)? {
+        let proj_entry = proj_entry?;
+        let proj_path = proj_entry.path();
+        if !proj_path.is_dir() {
+            continue;
+        }
+
+        let proj_name = proj_entry.file_name().to_string_lossy().to_string();
+        if let Some(filter) = project_filter
+            && proj_name != filter
+        {
+            continue;
+        }
+
+        for run_entry in std::fs::read_dir(&proj_path)? {
+            let run_entry = run_entry?;
+            let run_path = run_entry.path();
+            if run_path.is_dir() && run_path.join("meta.json").exists() {
+                runs.push((
+                    proj_name.clone(),
+                    run_entry.file_name().to_string_lossy().to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(runs)
+}
+
+enum Command {
+    Tui(TuiOptions),
+    Pull(SyncOptions),
+    Push(SyncOptions),
+    Sync(SyncOptions),
+}
+
+struct TuiOptions {
     remote_url: Option<String>,
     token: Option<String>,
 }
 
-fn parse_options() -> Result<Options> {
+struct SyncOptions {
+    target: Option<String>,
+    force: bool,
+    dry_run: bool,
+}
+
+fn parse_command() -> Result<Command> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.is_empty() {
+        return Ok(Command::Tui(TuiOptions {
+            remote_url: None,
+            token: None,
+        }));
+    }
+
+    match args[0].as_str() {
+        "pull" | "push" | "sync" => {
+            let cmd = args.remove(0);
+            let opts = parse_sync_options(&mut args)?;
+            match cmd.as_str() {
+                "pull" => Ok(Command::Pull(opts)),
+                "push" => Ok(Command::Push(opts)),
+                "sync" => Ok(Command::Sync(opts)),
+                _ => unreachable!(),
+            }
+        }
+        "--remote" | "--token" => {
+            let opts = parse_tui_options(&mut args)?;
+            Ok(Command::Tui(opts))
+        }
+        other if other.starts_with('-') => Err(anyhow::anyhow!("Unknown option: {}", other)),
+        _ => Err(anyhow::anyhow!(
+            "Unknown command: {}. Valid commands: pull, push, sync",
+            args[0]
+        )),
+    }
+}
+
+fn parse_tui_options(args: &mut Vec<String>) -> Result<TuiOptions> {
     let mut remote_url = None;
     let mut token = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
+
+    while !args.is_empty() {
+        match args[0].as_str() {
             "--remote" => {
+                args.remove(0);
                 remote_url = Some(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--remote requires a URL"))?,
+                    args.first()
+                        .ok_or_else(|| anyhow::anyhow!("--remote requires a URL"))?
+                        .clone(),
                 );
+                args.remove(0);
             }
             "--token" => {
+                args.remove(0);
                 token = Some(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--token requires a value"))?,
+                    args.first()
+                        .ok_or_else(|| anyhow::anyhow!("--token requires a value"))?
+                        .clone(),
                 );
+                args.remove(0);
             }
             other => {
                 return Err(anyhow::anyhow!("Unknown option: {}", other));
             }
         }
     }
-    Ok(Options { remote_url, token })
+
+    Ok(TuiOptions { remote_url, token })
+}
+
+fn parse_sync_options(args: &mut Vec<String>) -> Result<SyncOptions> {
+    let mut target = None;
+    let mut force = false;
+    let mut dry_run = false;
+
+    while !args.is_empty() {
+        match args[0].as_str() {
+            "-f" | "--force" => {
+                force = true;
+                args.remove(0);
+            }
+            "-n" | "--dry-run" => {
+                dry_run = true;
+                args.remove(0);
+            }
+            s if s.starts_with('-') => {
+                return Err(anyhow::anyhow!("Unknown option: {}", s));
+            }
+            _ => {
+                if target.is_none() {
+                    target = Some(args.remove(0));
+                } else {
+                    return Err(anyhow::anyhow!("Unexpected argument: {}", args[0]));
+                }
+            }
+        }
+    }
+
+    Ok(SyncOptions {
+        target,
+        force,
+        dry_run,
+    })
 }
 
 fn remote_runs_dir() -> PathBuf {
@@ -1549,15 +1826,13 @@ fn render(app: &App, frame: &mut Frame) {
         View::List => match app.view_mode {
             ViewMode::Runs => render_runs_list(app, frame),
             ViewMode::Models => render_models_list(app, frame),
-            ViewMode::Infra => render_infra_list(app, frame),
+            ViewMode::Infra => render_infra_dashboard(app, frame),
         },
         View::RunDetail => render_run_detail(app, frame),
         View::ModelDetail => render_model_detail(app, frame),
         View::Focused => render_focused(app, frame),
-        View::InfraList => render_infra_list(app, frame),
-        View::InfraTypes => render_infra_types(app, frame),
+        View::InfraList => render_infra_dashboard(app, frame),
         View::InfraConfig => render_infra_config(app, frame),
-        View::InfraLaunch => render_infra_launch(app, frame),
     }
 
     if app.show_delete_confirm {
@@ -3566,15 +3841,208 @@ fn render_delete_confirm(app: &App, frame: &mut Frame) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_infra_list(app: &App, frame: &mut Frame) {
+fn render_infra_dashboard(app: &App, frame: &mut Frame) {
     let area = frame.area();
+
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(10),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_infra_provider_tabs(app, frame, v_chunks[0]);
+
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(v_chunks[1]);
+
+    render_infra_instances_panel(app, frame, h_chunks[0]);
+    render_infra_types_panel(app, frame, h_chunks[1]);
+    render_infra_help_bar(app, frame, v_chunks[2]);
+
+    if app.launch_selecting_region {
+        render_infra_region_popup(app, frame);
+    }
+    if app.launch_confirming {
+        render_infra_launch_confirm(app, frame);
+    }
+}
+
+fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
+    let lambda_configured = app.infra_config.lambda_config.api_key.is_some();
+    let vast_configured = app.infra_config.vast.api_key.is_some();
+    let prime_configured = app.infra_config.prime.api_key.is_some();
+
+    let lambda_selected = app.selected_infra_provider == Some(Provider::Lambda);
+    let vast_selected = app.selected_infra_provider == Some(Provider::Vast);
+    let prime_selected = app.selected_infra_provider == Some(Provider::Prime);
+    let all_selected = app.selected_infra_provider.is_none();
+
+    let spans = vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("Runs", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Models", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("[Infra]", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled("   Provider: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            if all_selected { "[All]" } else { "All" },
+            if all_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            if lambda_selected {
+                "[λ Lambda"
+            } else {
+                "λ Lambda"
+            },
+            if lambda_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if lambda_configured {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(
+            if lambda_configured { " ✓" } else { " ✗" },
+            Style::default().fg(if lambda_configured {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            if lambda_selected { "]" } else { "" },
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            if vast_selected { "[V Vast" } else { "V Vast" },
+            if vast_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if vast_configured {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(
+            if vast_configured { " ✓" } else { " ✗" },
+            Style::default().fg(if vast_configured {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            if vast_selected { "]" } else { "" },
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            if prime_selected {
+                "[P Prime"
+            } else {
+                "P Prime"
+            },
+            if prime_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if prime_configured {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(
+            if prime_configured { " ✓" } else { " ✗" },
+            Style::default().fg(if prime_configured {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            if prime_selected { "]" } else { "" },
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+        Span::styled("          ", Style::default()),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("c", Style::default().fg(NEON_CYAN)),
+        Span::styled("] config", Style::default().fg(Color::DarkGray)),
+    ];
+
+    let line = Line::from(spans);
+    let para = Paragraph::new(line);
+    frame.render_widget(para, area);
+}
+
+fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
     let instances = app.filtered_infra_instances();
+    let is_focused = app.infra_active_panel == InfraPanel::Instances;
+
+    let title = Line::from(vec![Span::styled(
+        format!(" ◆ Active Instances ({}) ", instances.len()),
+        Style::default()
+            .fg(if is_focused { NEON_CYAN } else { Color::Gray })
+            .bold(),
+    )]);
+
+    let border_color = if is_focused { NEON_CYAN } else { DIM_CYAN };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    if app.infra_loading {
+        let loading = Paragraph::new(Span::styled("Loading...", Style::default().fg(NEON_YELLOW)))
+            .block(block);
+        frame.render_widget(loading, area);
+        return;
+    }
+
+    if instances.is_empty() {
+        let empty_text = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No active instances",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press → or Tab to browse",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "available instance types",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "and launch a new instance.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        let empty = Paragraph::new(empty_text).block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
 
     let items: Vec<ListItem> = instances
         .iter()
         .enumerate()
         .map(|(i, instance)| {
-            let is_selected = i == app.selected_infra_instance;
+            let is_selected = is_focused && i == app.selected_infra_instance;
 
             let (status_icon, status_color) = match instance.status {
                 InstanceStatus::Running => ("●", NEON_GREEN),
@@ -3593,197 +4061,156 @@ fn render_infra_list(app: &App, frame: &mut Frame) {
                 Style::default().fg(Color::Gray)
             };
 
+            let provider_char = match instance.provider {
+                Provider::Lambda => "λ",
+                Provider::Vast => "V",
+                Provider::Prime => "P",
+            };
+
             let ip_display = instance.ip.as_deref().unwrap_or("pending...");
 
-            let mut spans = vec![
+            let line1 = Line::from(vec![
                 Span::styled(
                     format!("{} ", status_icon),
                     Style::default().fg(status_color),
                 ),
                 Span::styled(instance.display_name().to_string(), name_style),
                 Span::styled("  ", Style::default()),
-                Span::styled(
-                    format!("[{}]", instance.provider.display_name()),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(provider_char, Style::default().fg(Color::DarkGray)),
                 Span::styled("  ", Style::default()),
                 Span::styled(&instance.instance_type, Style::default().fg(NEON_YELLOW)),
+            ]);
+
+            let line2 = Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    instance.status.as_str().to_string(),
+                    Style::default().fg(status_color),
+                ),
                 Span::styled("  ", Style::default()),
                 Span::styled(&instance.region, Style::default().fg(Color::DarkGray)),
                 Span::styled("  ", Style::default()),
                 Span::styled(ip_display, Style::default().fg(NEON_CYAN)),
-            ];
+            ]);
 
-            if instance.status.is_active() {
-                spans.push(Span::styled(
-                    format!("  {}", instance.status.as_str()),
-                    Style::default().fg(status_color),
-                ));
-            }
-
-            ListItem::new(Line::from(spans))
+            ListItem::new(vec![line1, line2])
         })
         .collect();
 
     let mut state = ListState::default();
-    state.select(Some(app.selected_infra_instance));
+    if is_focused {
+        state.select(Some(app.selected_infra_instance));
+    }
 
-    let provider_filter = match app.selected_infra_provider {
-        Some(p) => format!("[{}]", p.display_name()),
-        None => "[All]".to_string(),
-    };
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, area, &mut state);
+}
 
-    let lambda_configured = app.infra_config.lambda_config.api_key.is_some();
-    let vast_configured = app.infra_config.vast.api_key.is_some();
-    let prime_configured = app.infra_config.prime.api_key.is_some();
+fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
+    let is_focused = app.infra_active_panel == InfraPanel::Types;
 
-    let title = Line::from(vec![
-        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("Runs", Style::default().fg(Color::DarkGray)),
-        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
-        Span::styled("Models", Style::default().fg(Color::DarkGray)),
-        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
-        Span::styled("[Infra]", Style::default().fg(NEON_CYAN).bold()),
-        Span::styled("  ", Style::default()),
-        Span::styled(&provider_filter, Style::default().fg(NEON_YELLOW)),
-        Span::styled(
-            format!("  ({} instances)", instances.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            "λ",
-            Style::default().fg(if lambda_configured { NEON_GREEN } else { Color::DarkGray }),
-        ),
-        Span::styled(
-            "V",
-            Style::default().fg(if vast_configured { NEON_GREEN } else { Color::DarkGray }),
-        ),
-        Span::styled(
-            "P",
-            Style::default().fg(if prime_configured { NEON_GREEN } else { Color::DarkGray }),
-        ),
-    ]);
+    let title = Line::from(vec![Span::styled(
+        format!(" ◆ Instance Types ({}) ", app.infra_types.len()),
+        Style::default()
+            .fg(if is_focused { NEON_CYAN } else { Color::Gray })
+            .bold(),
+    )]);
+
+    let border_color = if is_focused { NEON_CYAN } else { DIM_CYAN };
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(DIM_CYAN));
+        .border_style(Style::default().fg(border_color));
 
     if app.infra_loading {
         let loading = Paragraph::new(Span::styled("Loading...", Style::default().fg(NEON_YELLOW)))
             .block(block);
         frame.render_widget(loading, area);
-    } else if let Some(error) = &app.infra_error {
-        let err_text = vec![
-            Line::from(Span::styled("Error:", Style::default().fg(NEON_MAGENTA))),
-            Line::from(Span::styled(
-                error.clone(),
-                Style::default().fg(Color::White),
-            )),
-        ];
-        let err_para = Paragraph::new(err_text).block(block);
-        frame.render_widget(err_para, area);
-    } else if items.is_empty() {
-        let empty = Paragraph::new(Span::styled(
-            "No instances found. Press [R] to refresh.",
-            Style::default().fg(Color::DarkGray),
-        ))
-        .block(block);
-        frame.render_widget(empty, area);
-    } else {
-        let list = List::new(items)
-            .block(block)
-            .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
-            .highlight_symbol("▶ ");
-        frame.render_stateful_widget(list, area, &mut state);
+        return;
     }
 
-    let help = Line::from(vec![
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("r", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] runs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("m", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] models  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Tab", Style::default().fg(NEON_CYAN)),
-        Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("c", Style::default().fg(NEON_CYAN)),
-        Span::styled("] config  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("t", Style::default().fg(NEON_CYAN)),
-        Span::styled("] types  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("s", Style::default().fg(NEON_GREEN)),
-        Span::styled("] ssh  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("x", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("] term  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("R", Style::default().fg(NEON_CYAN)),
-        Span::styled("] refresh  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("] quit", Style::default().fg(Color::DarkGray)),
-    ]);
-    let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
-    frame.render_widget(Paragraph::new(help), help_area);
-}
-
-fn render_infra_types(app: &App, frame: &mut Frame) {
-    let area = frame.area();
+    if app.infra_types.is_empty() {
+        let provider = app
+            .selected_infra_provider
+            .unwrap_or(app.infra_config.default_provider);
+        let config = app.infra_config.get_provider_config(provider);
+        let msg = if config.api_key.is_none() {
+            format!(
+                "No API key for {}. Press [c] to configure.",
+                provider.display_name()
+            )
+        } else {
+            "No instance types available".to_string()
+        };
+        let empty =
+            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))).block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
 
     let items: Vec<ListItem> = app
         .infra_types
         .iter()
         .enumerate()
         .map(|(i, it)| {
-            let is_selected = i == app.selected_infra_type;
+            let is_selected = is_focused && i == app.selected_infra_type;
+            let has_availability = !it.regions.is_empty();
 
             let name_style = if is_selected {
                 Style::default().fg(NEON_CYAN).bold()
+            } else if has_availability {
+                Style::default().fg(NEON_GREEN)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(Color::DarkGray)
             };
 
-            let gpu_info = if let Some(gpu_name) = &it.gpu_name {
+            let gpu_info = if let Some(gpu_desc) = &it.gpu_description {
+                gpu_desc.clone()
+            } else if let Some(gpu_name) = &it.gpu_name {
                 format!("{}x {}", it.gpu_count, gpu_name)
             } else {
                 format!("{}x GPU", it.gpu_count)
             };
 
-            let regions_display = if it.regions.is_empty() {
-                "no availability".to_string()
-            } else if it.regions.len() > 3 {
-                format!("{} regions", it.regions.len())
+            let region_info = if it.regions.is_empty() {
+                "-".to_string()
+            } else if it.regions.len() == 1 {
+                it.regions[0].clone()
             } else {
-                it.regions.join(", ")
+                format!("{} regions", it.regions.len())
             };
 
             let spans = vec![
-                Span::styled(format!("{:<20}", it.name), name_style),
+                Span::styled(format!("{:<22}", it.name), name_style),
                 Span::styled(
-                    format!("{:<15}", gpu_info),
-                    Style::default().fg(NEON_YELLOW),
+                    format!("{:<30}", gpu_info),
+                    if has_availability {
+                        Style::default().fg(NEON_YELLOW)
+                    } else {
+                        Style::default().fg(Color::Rgb(80, 80, 40))
+                    },
                 ),
                 Span::styled(
-                    format!("{:>3} vCPU  ", it.vcpus),
-                    Style::default().fg(Color::DarkGray),
+                    format!("{:<12}", it.price_display()),
+                    if has_availability {
+                        Style::default().fg(NEON_GREEN)
+                    } else {
+                        Style::default().fg(Color::Rgb(40, 80, 40))
+                    },
                 ),
                 Span::styled(
-                    format!("{:>4}GB RAM  ", it.memory_gib),
-                    Style::default().fg(Color::DarkGray),
+                    region_info,
+                    if has_availability {
+                        Style::default().fg(Color::Gray)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
                 ),
-                Span::styled(
-                    format!("{:>6}GB disk  ", it.storage_gib),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(it.price_display(), Style::default().fg(NEON_GREEN)),
-                Span::styled("  ", Style::default()),
-                Span::styled(regions_display, Style::default().fg(Color::DarkGray)),
             ];
 
             ListItem::new(Line::from(spans))
@@ -3791,81 +4218,188 @@ fn render_infra_types(app: &App, frame: &mut Frame) {
         .collect();
 
     let mut state = ListState::default();
-    state.select(Some(app.selected_infra_type));
-
-    let provider = app
-        .selected_infra_provider
-        .unwrap_or(app.infra_config.default_provider);
-
-    let title = Line::from(vec![
-        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("Instance Types", Style::default().fg(NEON_CYAN).bold()),
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            format!("[{}]", provider.display_name()),
-            Style::default().fg(NEON_YELLOW),
-        ),
-        Span::styled(
-            format!("  ({} types)", app.infra_types.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(DIM_CYAN));
-
-    if app.infra_loading {
-        let loading = Paragraph::new(Span::styled("Loading...", Style::default().fg(NEON_YELLOW)))
-            .block(block);
-        frame.render_widget(loading, area);
-    } else if let Some(error) = &app.infra_error {
-        let err_text = vec![
-            Line::from(Span::styled("Error:", Style::default().fg(NEON_MAGENTA))),
-            Line::from(Span::styled(
-                error.clone(),
-                Style::default().fg(Color::White),
-            )),
-        ];
-        let err_para = Paragraph::new(err_text).block(block);
-        frame.render_widget(err_para, area);
-    } else if items.is_empty() {
-        let empty = Paragraph::new(Span::styled(
-            "No instance types available",
-            Style::default().fg(Color::DarkGray),
-        ))
-        .block(block);
-        frame.render_widget(empty, area);
-    } else {
-        let list = List::new(items)
-            .block(block)
-            .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
-            .highlight_symbol("▶ ");
-        frame.render_stateful_widget(list, area, &mut state);
+    if is_focused {
+        state.select(Some(app.selected_infra_type));
     }
 
-    let help = Line::from(vec![
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-        Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Tab", Style::default().fg(NEON_CYAN)),
-        Span::styled("] switch provider  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Enter", Style::default().fg(NEON_GREEN)),
-        Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled("l", Style::default().fg(NEON_GREEN)),
-        Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("/", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("] back", Style::default().fg(Color::DarkGray)),
-    ]);
-    let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
-    frame.render_widget(Paragraph::new(help), help_area);
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
+    let help = if app.launch_selecting_region || app.launch_confirming {
+        Line::from(vec![])
+    } else {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+            Span::styled("] switch panel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+            Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if app.infra_active_panel == InfraPanel::Instances {
+                    "ssh"
+                } else {
+                    "launch"
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("x", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] terminate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("1-3", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("R", Style::default().fg(NEON_CYAN)),
+            Span::styled("] refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+        ])
+    };
+
+    if let Some(error) = &app.infra_error {
+        let error_line = Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(error, Style::default().fg(NEON_YELLOW)),
+        ]);
+        frame.render_widget(Paragraph::new(error_line), area);
+    } else {
+        frame.render_widget(Paragraph::new(help), area);
+    }
+}
+
+fn render_infra_region_popup(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let selected_type = app.infra_types.get(app.selected_infra_type);
+    let regions: Vec<&str> = selected_type
+        .map(|t| t.regions.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+
+    let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
+
+    let area = frame.area();
+    let popup_width = 40u16.min(area.width.saturating_sub(4));
+    let popup_height = (regions.len() as u16 + 5).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("Type: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(type_name, Style::default().fg(NEON_YELLOW)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Select Region:",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    for (i, region) in regions.iter().enumerate() {
+        let is_selected = i == app.launch_selected_region;
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let style = if is_selected {
+            Style::default().fg(NEON_CYAN).bold()
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{}{}", prefix, region),
+            style,
+        )));
+    }
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Select Region ",
+            Style::default().fg(NEON_CYAN).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(NEON_CYAN))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_infra_launch_confirm(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let selected_type = app.infra_types.get(app.selected_infra_type);
+    let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
+    let type_price = selected_type
+        .map(|t| t.price_display())
+        .unwrap_or_else(|| "?".to_string());
+    let region = selected_type
+        .and_then(|t| t.regions.get(app.launch_selected_region))
+        .map(|s| s.as_str())
+        .unwrap_or("default");
+
+    let area = frame.area();
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_height = 8u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Launch ", Style::default().fg(Color::White)),
+            Span::styled(type_name, Style::default().fg(NEON_YELLOW).bold()),
+            Span::styled(" in ", Style::default().fg(Color::White)),
+            Span::styled(region, Style::default().fg(NEON_CYAN)),
+            Span::styled("?", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("Price: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&type_price, Style::default().fg(NEON_GREEN)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("y", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Yes  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("n", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Launch Instance ",
+            Style::default().fg(NEON_GREEN).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(NEON_GREEN))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center);
+
+    frame.render_widget(paragraph, popup_area);
 }
 
 fn render_infra_config(app: &App, frame: &mut Frame) {
@@ -3904,12 +4438,19 @@ fn render_infra_config(app: &App, frame: &mut Frame) {
             };
 
             let mut spans = vec![
-                Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
+                Span::styled(
+                    format!("{} ", status_icon),
+                    Style::default().fg(status_color),
+                ),
                 Span::styled(format!("{:<12}", provider.display_name()), name_style),
                 Span::styled("  API Key: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     key_display,
-                    Style::default().fg(if has_key { NEON_YELLOW } else { Color::DarkGray }),
+                    Style::default().fg(if has_key {
+                        NEON_YELLOW
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
             ];
 
@@ -3931,7 +4472,10 @@ fn render_infra_config(app: &App, frame: &mut Frame) {
 
     let title = Line::from(vec![
         Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("Provider Configuration", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(
+            "Provider Configuration",
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
     ]);
 
     let block = Block::default()
@@ -3970,139 +4514,6 @@ fn render_infra_config(app: &App, frame: &mut Frame) {
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("d", Style::default().fg(NEON_YELLOW)),
             Span::styled("] delete key  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("/", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] back", Style::default().fg(Color::DarkGray)),
-        ])
-    };
-
-    let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
-    frame.render_widget(Paragraph::new(help), help_area);
-}
-
-fn render_infra_launch(app: &App, frame: &mut Frame) {
-    let area = frame.area();
-
-    let selected_type = app.infra_types.get(app.selected_infra_type);
-    let provider = app
-        .selected_infra_provider
-        .unwrap_or(app.infra_config.default_provider);
-
-    let type_name = selected_type
-        .map(|t| t.name.as_str())
-        .unwrap_or("unknown");
-    let type_price = selected_type
-        .map(|t| t.price_display())
-        .unwrap_or_else(|| "?".to_string());
-    let regions: Vec<&str> = selected_type
-        .map(|t| t.regions.iter().map(|s| s.as_str()).collect())
-        .unwrap_or_default();
-
-    let mut lines: Vec<Line> = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Provider: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(provider.display_name(), Style::default().fg(NEON_CYAN)),
-        ]),
-        Line::from(vec![
-            Span::styled("Type: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(type_name, Style::default().fg(NEON_YELLOW)),
-            Span::styled("  ", Style::default()),
-            Span::styled(&type_price, Style::default().fg(NEON_GREEN)),
-        ]),
-        Line::from(""),
-    ];
-
-    if !regions.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Select Region:",
-            Style::default().fg(Color::DarkGray),
-        )));
-        for (i, region) in regions.iter().enumerate() {
-            let is_selected = i == app.launch_selected_region;
-            let prefix = if is_selected { "▶ " } else { "  " };
-            let style = if is_selected {
-                Style::default().fg(NEON_CYAN).bold()
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            lines.push(Line::from(Span::styled(format!("{}{}", prefix, region), style)));
-        }
-        lines.push(Line::from(""));
-    }
-
-    lines.push(Line::from(vec![
-        Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
-        if app.launch_name_input.is_empty() {
-            Span::styled("(optional)", Style::default().fg(Color::DarkGray))
-        } else {
-            Span::styled(&app.launch_name_input, Style::default().fg(Color::White))
-        },
-        if app.launch_editing_name {
-            Span::styled("█", Style::default().fg(NEON_CYAN))
-        } else {
-            Span::raw("")
-        },
-    ]));
-
-    if app.launch_confirming {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Launch instance? ", Style::default().fg(NEON_YELLOW)),
-            Span::styled("[y/n]", Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    let title = Line::from(vec![
-        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("Launch Instance", Style::default().fg(NEON_CYAN).bold()),
-    ]);
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(DIM_CYAN));
-
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, area);
-
-    let help = if app.launch_confirming {
-        Line::from(vec![
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("y", Style::default().fg(NEON_GREEN)),
-            Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("n", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("/", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] cancel", Style::default().fg(Color::DarkGray)),
-        ])
-    } else if app.launch_editing_name {
-        Line::from(vec![
-            Span::styled("Type name, then ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
-            Span::styled("] done  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] cancel", Style::default().fg(Color::DarkGray)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-            Span::styled("] region  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("n", Style::default().fg(NEON_CYAN)),
-            Span::styled("] set name  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
-            Span::styled("/", Style::default().fg(Color::DarkGray)),
-            Span::styled("l", Style::default().fg(NEON_GREEN)),
-            Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("q", Style::default().fg(NEON_MAGENTA)),
             Span::styled("/", Style::default().fg(Color::DarkGray)),

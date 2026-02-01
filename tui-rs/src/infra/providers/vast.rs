@@ -162,10 +162,6 @@ struct CreateResponse {
 }
 
 impl CloudProvider for VastProvider {
-    fn name(&self) -> Provider {
-        Provider::Vast
-    }
-
     fn ssh_user(&self) -> &str {
         "root"
     }
@@ -199,39 +195,6 @@ impl CloudProvider for VastProvider {
                 }
             })
             .collect())
-    }
-
-    fn get_instance(&self, id: &str) -> Result<Instance> {
-        let response: InstancesResponse = self.get(&format!("/instances/?id={}", id))?;
-
-        let instance = response
-            .instances
-            .into_iter()
-            .find(|i| i.id.to_string() == id)
-            .ok_or_else(|| anyhow!("Instance {} not found", id))?;
-
-        let raw_status = instance
-            .actual_status
-            .or(instance.status_msg)
-            .unwrap_or_else(|| "unknown".to_string());
-        let ip = instance.ssh_host.map(|host| {
-            let port = instance.ssh_port.unwrap_or(22);
-            format!("{}:{}", host, port)
-        });
-
-        Ok(Instance {
-            id: instance.id.to_string(),
-            name: instance.label,
-            ip,
-            status: normalize_status(&raw_status),
-            instance_type: instance.gpu_name.unwrap_or_else(|| "unknown".to_string()),
-            region: instance
-                .geolocation
-                .unwrap_or_else(|| "unknown".to_string()),
-            provider: Provider::Vast,
-            ssh_user: "root".to_string(),
-            raw_status,
-        })
     }
 
     fn list_instance_types(&self) -> Result<Vec<InstanceType>> {
@@ -268,6 +231,7 @@ impl CloudProvider for VastProvider {
                 description: Some(format!("{}x {}", num_gpus, gpu_name)),
                 gpu_count: num_gpus,
                 gpu_name: Some(gpu_name),
+                gpu_description: None,
                 vcpus: offer.cpu_cores_effective.unwrap_or(0.0) as u32,
                 memory_gib: (offer.cpu_ram.unwrap_or(0.0) / 1024.0) as u32,
                 storage_gib: offer.disk_space.unwrap_or(0.0) as u32,

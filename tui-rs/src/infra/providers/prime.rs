@@ -149,23 +149,12 @@ struct PrimeGpu {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum SinglePodResponse {
-    Direct(PrimePod),
-    Wrapped { pod: PrimePod },
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum CreatePodResponse {
     WithId { id: serde_json::Value },
     WithPod { pod: PrimePod },
 }
 
 impl CloudProvider for PrimeProvider {
-    fn name(&self) -> Provider {
-        Provider::Prime
-    }
-
     fn ssh_user(&self) -> &str {
         "ubuntu"
     }
@@ -200,31 +189,6 @@ impl CloudProvider for PrimeProvider {
             .collect())
     }
 
-    fn get_instance(&self, id: &str) -> Result<Instance> {
-        let response: SinglePodResponse = self.get(&format!("/pods/{}", id))?;
-
-        let pod = match response {
-            SinglePodResponse::Direct(p) => p,
-            SinglePodResponse::Wrapped { pod } => pod,
-        };
-
-        let pod_id = pod.id_string();
-        let raw_status = pod.status.unwrap_or_else(|| "unknown".to_string());
-        let ip = pod.ip_address.or(pod.ssh_host);
-
-        Ok(Instance {
-            id: pod_id,
-            name: pod.name,
-            ip,
-            status: normalize_status(&raw_status),
-            instance_type: pod.gpu_type.unwrap_or_else(|| "unknown".to_string()),
-            region: pod.region.unwrap_or_else(|| "unknown".to_string()),
-            provider: Provider::Prime,
-            ssh_user: "ubuntu".to_string(),
-            raw_status,
-        })
-    }
-
     fn list_instance_types(&self) -> Result<Vec<InstanceType>> {
         let response: GpusResponse = self.get("/availability/gpus")?;
 
@@ -244,6 +208,7 @@ impl CloudProvider for PrimeProvider {
                     description: g.description,
                     gpu_count,
                     gpu_name: Some(gpu_type),
+                    gpu_description: None,
                     vcpus: g.vcpus.unwrap_or(0),
                     memory_gib: g.memory_gib.unwrap_or(0),
                     storage_gib: g.storage_gib.unwrap_or(0),

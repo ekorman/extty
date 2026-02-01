@@ -11,10 +11,9 @@ pub use vast::VastProvider;
 use super::models::{Instance, InstanceType, LaunchOptions, Provider};
 
 pub trait CloudProvider: Send {
-    fn name(&self) -> Provider;
+    #[allow(dead_code)]
     fn ssh_user(&self) -> &str;
     fn list_instances(&self) -> Result<Vec<Instance>>;
-    fn get_instance(&self, id: &str) -> Result<Instance>;
     fn list_instance_types(&self) -> Result<Vec<InstanceType>>;
     fn launch(&self, opts: &LaunchOptions) -> Result<Vec<String>>;
     fn terminate(&self, ids: &[String]) -> Result<()>;

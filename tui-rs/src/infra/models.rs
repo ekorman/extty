@@ -10,14 +10,6 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Provider::Lambda => "lambda",
-            Provider::Vast => "vast",
-            Provider::Prime => "prime",
-        }
-    }
-
     pub fn display_name(&self) -> &'static str {
         match self {
             Provider::Lambda => "Lambda",
@@ -82,6 +74,7 @@ impl Instance {
         self.name.as_deref().unwrap_or(&self.id)
     }
 
+    #[allow(dead_code)]
     pub fn ssh_command(&self) -> Option<String> {
         self.ip.as_ref().map(|ip| {
             if ip.contains(':') {
@@ -100,6 +93,7 @@ pub struct InstanceType {
     pub description: Option<String>,
     pub gpu_count: u32,
     pub gpu_name: Option<String>,
+    pub gpu_description: Option<String>,
     pub vcpus: u32,
     pub memory_gib: u32,
     pub storage_gib: u32,

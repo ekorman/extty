@@ -18,6 +18,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 toml = "0.8"
+aws-config = "1.5"
+aws-sdk-s3 = "1.65"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [package.metadata.release]
 # Skip crates.io publish (set to true when ready to publish)

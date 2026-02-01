@@ -101,12 +101,11 @@ struct LambdaInstance {
 struct LambdaInstanceType {
     name: String,
     description: Option<String>,
+    gpu_description: Option<String>,
     #[serde(default)]
     specs: LambdaSpecs,
     #[serde(default)]
     price_cents_per_hour: u32,
-    #[serde(default)]
-    regions_with_capacity_available: Vec<LambdaRegion>,
 }
 
 #[derive(Deserialize, Default)]
@@ -134,6 +133,8 @@ struct InstanceTypesResponse {
 #[derive(Deserialize)]
 struct InstanceTypeWrapper {
     instance_type: LambdaInstanceType,
+    #[serde(default)]
+    regions_with_capacity_available: Vec<LambdaRegion>,
 }
 
 #[derive(Deserialize)]
@@ -146,16 +147,7 @@ struct LaunchData {
     instance_ids: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct SingleInstanceResponse {
-    data: LambdaInstance,
-}
-
 impl CloudProvider for LambdaProvider {
-    fn name(&self) -> Provider {
-        Provider::Lambda
-    }
-
     fn ssh_user(&self) -> &str {
         "ubuntu"
     }
@@ -180,23 +172,6 @@ impl CloudProvider for LambdaProvider {
             .collect())
     }
 
-    fn get_instance(&self, id: &str) -> Result<Instance> {
-        let response: SingleInstanceResponse = self.get(&format!("/instances/{}", id))?;
-        let i = response.data;
-
-        Ok(Instance {
-            id: i.id,
-            name: i.name,
-            ip: i.ip,
-            status: normalize_status(&i.status),
-            instance_type: i.instance_type.name,
-            region: i.region.name,
-            provider: Provider::Lambda,
-            ssh_user: "ubuntu".to_string(),
-            raw_status: i.status,
-        })
-    }
-
     fn list_instance_types(&self) -> Result<Vec<InstanceType>> {
         let response: InstanceTypesResponse = self.get("/instance-types")?;
 
@@ -210,11 +185,12 @@ impl CloudProvider for LambdaProvider {
                     description: it.description,
                     gpu_count: it.specs.gpus,
                     gpu_name: None,
+                    gpu_description: it.gpu_description,
                     vcpus: it.specs.vcpus,
                     memory_gib: it.specs.memory_gib,
                     storage_gib: it.specs.storage_gib,
                     price_cents_per_hour: it.price_cents_per_hour,
-                    regions: it
+                    regions: wrapper
                         .regions_with_capacity_available
                         .into_iter()
                         .map(|r| r.name)
