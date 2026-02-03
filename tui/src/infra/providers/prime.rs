@@ -54,7 +54,8 @@ impl PrimeProvider {
             return Err(anyhow!("API error {}: {}", status, text));
         }
 
-        response.json().context("Failed to parse response")
+        let text = response.text().context("Failed to read response body")?;
+        serde_json::from_str(&text).with_context(|| format!("Failed to parse response: {}", text))
     }
 
     fn post<T: for<'de> Deserialize<'de>>(
@@ -77,7 +78,8 @@ impl PrimeProvider {
             return Err(anyhow!("API error {}: {}", status, text));
         }
 
-        response.json().context("Failed to parse response")
+        let text = response.text().context("Failed to read response body")?;
+        serde_json::from_str(&text).with_context(|| format!("Failed to parse response: {}", text))
     }
 
     fn delete(&self, path: &str) -> Result<()> {
@@ -100,16 +102,17 @@ impl PrimeProvider {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum PodsResponse {
-    List(Vec<PrimePod>),
-    Object { pods: Vec<PrimePod> },
+struct PodsResponse {
+    #[serde(default)]
+    data: Vec<PrimePod>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PrimePod {
     id: serde_json::Value,
     name: Option<String>,
+    #[serde(alias = "ip_address")]
     ip_address: Option<String>,
     ssh_host: Option<String>,
     status: Option<String>,
@@ -128,23 +131,41 @@ impl PrimePod {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum GpusResponse {
-    List(Vec<PrimeGpu>),
-    Object { gpus: Vec<PrimeGpu> },
+struct GpusResponse {
+    #[serde(default)]
+    items: Vec<PrimeGpu>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PrimeGpu {
     gpu_type: Option<String>,
     gpu_count: Option<u32>,
-    description: Option<String>,
-    vcpus: Option<u32>,
-    memory_gib: Option<u32>,
-    storage_gib: Option<u32>,
-    price_per_hour: Option<f64>,
+    cloud_id: Option<String>,
     #[serde(default)]
-    regions: Vec<String>,
+    vcpu: Option<ResourceInfo>,
+    #[serde(default)]
+    memory: Option<ResourceInfo>,
+    #[serde(default)]
+    disk: Option<ResourceInfo>,
+    gpu_memory: Option<u32>,
+    #[serde(default)]
+    prices: Option<PriceInfo>,
+    region: Option<String>,
+    #[allow(dead_code)]
+    data_center: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ResourceInfo {
+    default_count: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PriceInfo {
+    on_demand: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -162,12 +183,8 @@ impl CloudProvider for PrimeProvider {
     fn list_instances(&self) -> Result<Vec<Instance>> {
         let response: PodsResponse = self.get("/pods/")?;
 
-        let pods = match response {
-            PodsResponse::List(pods) => pods,
-            PodsResponse::Object { pods } => pods,
-        };
-
-        Ok(pods
+        Ok(response
+            .data
             .into_iter()
             .map(|p| {
                 let id = p.id_string();
@@ -192,29 +209,27 @@ impl CloudProvider for PrimeProvider {
     fn list_instance_types(&self) -> Result<Vec<InstanceType>> {
         let response: GpusResponse = self.get("/availability/gpus")?;
 
-        let gpus = match response {
-            GpusResponse::List(gpus) => gpus,
-            GpusResponse::Object { gpus } => gpus,
-        };
-
-        Ok(gpus
+        Ok(response
+            .items
             .into_iter()
             .map(|g| {
                 let gpu_type = g.gpu_type.unwrap_or_else(|| "unknown".to_string());
                 let gpu_count = g.gpu_count.unwrap_or(1);
+                let price_per_hour = g.prices.and_then(|p| p.on_demand).unwrap_or(0.0);
+                let region = g.region.unwrap_or_else(|| "unknown".to_string());
 
                 InstanceType {
                     name: format!("{}x{}", gpu_type, gpu_count),
-                    description: g.description,
+                    description: g.cloud_id,
                     gpu_count,
                     gpu_name: Some(gpu_type),
                     gpu_description: None,
-                    gpu_memory_gib: 0,
-                    vcpus: g.vcpus.unwrap_or(0),
-                    memory_gib: g.memory_gib.unwrap_or(0),
-                    storage_gib: g.storage_gib.unwrap_or(0),
-                    price_cents_per_hour: (g.price_per_hour.unwrap_or(0.0) * 100.0) as u32,
-                    regions: g.regions,
+                    gpu_memory_gib: g.gpu_memory.unwrap_or(0),
+                    vcpus: g.vcpu.and_then(|r| r.default_count).unwrap_or(0),
+                    memory_gib: g.memory.and_then(|r| r.default_count).unwrap_or(0),
+                    storage_gib: g.disk.and_then(|r| r.default_count).unwrap_or(0),
+                    price_cents_per_hour: (price_per_hour * 100.0) as u32,
+                    regions: vec![region],
                 }
             })
             .collect())
