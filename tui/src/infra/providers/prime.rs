@@ -55,8 +55,7 @@ impl PrimeProvider {
         }
 
         let text = response.text().context("Failed to read response body")?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("Failed to parse response: {}", text))
+        serde_json::from_str(&text).with_context(|| format!("Failed to parse response: {}", text))
     }
 
     fn post<T: for<'de> Deserialize<'de>>(
@@ -80,8 +79,7 @@ impl PrimeProvider {
         }
 
         let text = response.text().context("Failed to read response body")?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("Failed to parse response: {}", text))
+        serde_json::from_str(&text).with_context(|| format!("Failed to parse response: {}", text))
     }
 
     fn delete(&self, path: &str) -> Result<()> {
