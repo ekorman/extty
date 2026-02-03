@@ -554,8 +554,6 @@ impl App {
         let python_version = self.session_python_version.clone();
         let command = self.session_command.clone();
         let skip_tmux = self.session_skip_tmux;
-        let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-
         let (tx, rx) = mpsc::channel();
         self.setup_rx = Some(rx);
         self.infra_error = Some("Syncing code...".to_string());
@@ -709,6 +707,7 @@ impl App {
 
             #[cfg(target_os = "macos")]
             {
+                let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
                 let applescript = if term_program == "iTerm.app" {
                     format!(
                         "tell application \"iTerm2\" to tell current window to create tab with default profile command \"{}\"",
