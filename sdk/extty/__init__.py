@@ -404,7 +404,7 @@ def push(
         List of pushed run paths (project/run_name format).
     """
     if s3_config is None:
-        s3_config = S3Config.from_env()
+        s3_config = S3Config.load()
     if s3_config is None:
         raise ValueError(
             "S3 configuration required. Set EXTTY_S3_BUCKET environment variable "

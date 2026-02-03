@@ -1012,7 +1012,7 @@ class TestSaveCheckpoint:
         """Test that save_checkpoint raises when no S3 is configured."""
         with (
             mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"),
-            mock.patch("extty.s3.S3Config.from_env", return_value=None),
+            mock.patch("extty.s3.S3Config.load", return_value=None),
         ):
             run = extty.init("test-project", name="no-s3-run", system_metrics=False)
             with pytest.raises(RuntimeError, match="S3 storage is not configured"):

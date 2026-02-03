@@ -50,17 +50,17 @@ jobs:
 
       - name: Build with cross
         if: matrix.cross
-        working-directory: tui-rs
+        working-directory: tui
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Build with cargo
         if: ${{ !matrix.cross }}
-        working-directory: tui-rs
+        working-directory: tui
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare artifact
         shell: bash
-        run: cp tui-rs/target/${{ matrix.target }}/release/${{ matrix.artifact }} ./extty-${{ matrix.target }}${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: cp tui/target/${{ matrix.target }}/release/${{ matrix.artifact }} ./extty-${{ matrix.target }}${{ runner.os == 'Windows' && '.exe' || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -84,11 +84,11 @@ jobs:
         run: pip install build twine
 
       - name: Build package
-        working-directory: python
+        working-directory: sdk
         run: python -m build
 
       - name: Publish to PyPI server
-        working-directory: python
+        working-directory: sdk
         env:
           TWINE_USERNAME: ${{ vars.PYPI_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
