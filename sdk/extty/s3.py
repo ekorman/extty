@@ -24,9 +24,9 @@ class S3Config:
     endpoint_url: str | None = None
 
     @classmethod
-    def from_env(cls) -> S3Config | None:
+    def load(cls) -> S3Config | None:
         """
-        Create S3Config from environment variables, falling back to config file.
+        Create S3Config from environment variables first then falls back to config file.
 
         Checks environment variables first, then ~/.extty/s3/config.toml.
 

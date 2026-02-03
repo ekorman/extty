@@ -128,7 +128,7 @@ class Run:
         self._meta: MetaData | None = None
 
         if s3_config is None:
-            s3_config = S3Config.from_env()
+            s3_config = S3Config.load()
         if s3_config is not None:
             self._s3_storage = S3Storage(s3_config, project, self.name)
 
