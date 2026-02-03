@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -32,8 +32,8 @@ use data::{
     load_all_evaluations, load_models, load_runs,
 };
 use infra::{
-    InfraConfig, Instance, InstanceStatus, InstanceType, Provider, get_provider, load_config,
-    save_config,
+    InfraConfig, Instance, InstanceStatus, InstanceType, Provider, generate_script, get_provider,
+    load_config, save_config,
 };
 use remote::RemoteSync;
 
@@ -68,6 +68,7 @@ enum View {
     Focused,
     InfraList,
     InfraConfig,
+    S3Config,
 }
 
 // Which panel has focus in the Infra dashboard
@@ -77,11 +78,47 @@ enum InfraPanel {
     Types,
 }
 
+#[derive(Clone, Copy, PartialEq, Default)]
+enum InfraTypeSort {
+    #[default]
+    Name,
+    Price,
+    Vram,
+}
+
+impl InfraTypeSort {
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Price,
+            Self::Price => Self::Vram,
+            Self::Vram => Self::Name,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Price => "Price",
+            Self::Vram => "VRAM",
+        }
+    }
+}
+
 // Which section is focused in the focused example view
 #[derive(Clone, Copy, PartialEq)]
 enum FocusedSection {
     Prompt,
     Response,
+}
+
+// Which field is focused in the session setup modal
+#[derive(Clone, Copy, PartialEq, Default)]
+enum SessionModalField {
+    #[default]
+    PythonVersion,
+    RepoPath,
+    Command,
+    SkipTmux,
 }
 
 // A card in the detail grid - either a chart, example group, or evaluation
@@ -139,14 +176,17 @@ struct App {
     infra_config: InfraConfig,
     infra_instances: Vec<Instance>,
     infra_types: Vec<InstanceType>,
-    selected_infra_provider: Option<Provider>,
+    selected_infra_provider: Provider,
     selected_infra_instance: usize,
     selected_infra_type: usize,
     infra_loading: bool,
     infra_error: Option<String>,
+    infra_message_time: Option<Instant>,
     show_terminate_confirm: bool,
     pending_terminate_instance: Option<usize>,
     infra_active_panel: InfraPanel,
+    infra_type_sort: InfraTypeSort,
+    infra_last_refresh: Instant,
     // Infra config editing
     config_provider_index: usize,
     config_api_key_input: String,
@@ -156,6 +196,20 @@ struct App {
     launch_name_input: String,
     launch_confirming: bool,
     launch_selecting_region: bool,
+    // S3 config editing
+    s3_config: s3::S3Config,
+    s3_config_field: usize,
+    s3_config_editing: bool,
+    s3_config_input: String,
+    s3_config_message: Option<String>,
+    // Session setup modal
+    session_modal_open: bool,
+    session_modal_instance: Option<Instance>,
+    session_python_version: String,
+    session_repo_path: String,
+    session_command: String,
+    session_skip_tmux: bool,
+    session_modal_focus: SessionModalField,
 }
 
 impl App {
@@ -164,6 +218,7 @@ impl App {
         let models = load_models();
         let model_evaluations = load_all_evaluations();
         let infra_config = load_config().unwrap_or_default();
+        let default_provider = infra_config.default_provider;
         App {
             runs,
             models,
@@ -195,14 +250,17 @@ impl App {
             infra_config,
             infra_instances: Vec::new(),
             infra_types: Vec::new(),
-            selected_infra_provider: None,
+            selected_infra_provider: default_provider,
             selected_infra_instance: 0,
             selected_infra_type: 0,
             infra_loading: false,
             infra_error: None,
+            infra_message_time: None,
             show_terminate_confirm: false,
             pending_terminate_instance: None,
             infra_active_panel: InfraPanel::Instances,
+            infra_type_sort: InfraTypeSort::default(),
+            infra_last_refresh: Instant::now(),
             config_provider_index: 0,
             config_api_key_input: String::new(),
             config_editing_key: false,
@@ -210,6 +268,18 @@ impl App {
             launch_name_input: String::new(),
             launch_confirming: false,
             launch_selecting_region: false,
+            s3_config: s3::load_config().ok().flatten().unwrap_or_default(),
+            s3_config_field: 0,
+            s3_config_editing: false,
+            s3_config_input: String::new(),
+            s3_config_message: None,
+            session_modal_open: false,
+            session_modal_instance: None,
+            session_python_version: "3.12".to_string(),
+            session_repo_path: String::new(),
+            session_command: String::new(),
+            session_skip_tmux: false,
+            session_modal_focus: SessionModalField::default(),
         }
     }
 
@@ -326,27 +396,22 @@ impl App {
         self.infra_error = None;
         self.infra_instances.clear();
 
-        let providers_to_query: Vec<Provider> = match self.selected_infra_provider {
-            Some(p) => vec![p],
-            None => Provider::all().to_vec(),
-        };
-
-        for provider in providers_to_query {
-            let config = self.infra_config.get_provider_config(provider);
-            if let Some(api_key) = &config.api_key {
-                let client = get_provider(provider, api_key);
-                match client.list_instances() {
-                    Ok(instances) => {
-                        self.infra_instances.extend(instances);
-                    }
-                    Err(e) => {
-                        self.infra_error = Some(format!("{}: {}", provider.display_name(), e));
-                    }
+        let provider = self.selected_infra_provider;
+        let config = self.infra_config.get_provider_config(provider);
+        if let Some(api_key) = &config.api_key {
+            let client = get_provider(provider, api_key);
+            match client.list_instances() {
+                Ok(instances) => {
+                    self.infra_instances.extend(instances);
+                }
+                Err(e) => {
+                    self.infra_error = Some(format!("{}: {}", provider.display_name(), e));
                 }
             }
         }
 
         self.infra_loading = false;
+        self.infra_last_refresh = Instant::now();
         self.selected_infra_instance = self
             .selected_infra_instance
             .min(self.infra_instances.len().saturating_sub(1));
@@ -357,9 +422,7 @@ impl App {
         self.infra_error = None;
         self.infra_types.clear();
 
-        let provider = self
-            .selected_infra_provider
-            .unwrap_or(self.infra_config.default_provider);
+        let provider = self.selected_infra_provider;
         let config = self.infra_config.get_provider_config(provider);
 
         if let Some(api_key) = &config.api_key {
@@ -380,9 +443,22 @@ impl App {
         }
 
         self.infra_loading = false;
+        self.sort_infra_types();
         self.selected_infra_type = self
             .selected_infra_type
             .min(self.infra_types.len().saturating_sub(1));
+    }
+
+    fn sort_infra_types(&mut self) {
+        match self.infra_type_sort {
+            InfraTypeSort::Name => self.infra_types.sort_by(|a, b| a.name.cmp(&b.name)),
+            InfraTypeSort::Price => self
+                .infra_types
+                .sort_by(|a, b| a.price_cents_per_hour.cmp(&b.price_cents_per_hour)),
+            InfraTypeSort::Vram => self
+                .infra_types
+                .sort_by(|a, b| b.gpu_memory_gib.cmp(&a.gpu_memory_gib)),
+        }
     }
 
     fn terminate_instance(&mut self, index: usize) {
@@ -423,11 +499,19 @@ impl App {
 
         #[cfg(target_os = "macos")]
         {
+            let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+            let script = if term_program == "iTerm.app" {
+                format!(
+                    "tell application \"iTerm2\" to tell current window to create tab with default profile command \"{}\"",
+                    ssh_cmd
+                )
+            } else {
+                format!("tell application \"Terminal\" to do script \"{}\"", ssh_cmd)
+            };
             std::process::Command::new("osascript")
-                .args([
-                    "-e",
-                    &format!("tell application \"Terminal\" to do script \"{}\"", ssh_cmd),
-                ])
+                .args(["-e", &script])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()?;
         }
 
@@ -435,21 +519,155 @@ impl App {
         {
             std::process::Command::new("x-terminal-emulator")
                 .args(["-e", &ssh_cmd])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()?;
         }
 
         Ok(())
     }
 
-    fn filtered_infra_instances(&self) -> Vec<&Instance> {
-        match self.selected_infra_provider {
-            Some(p) => self
-                .infra_instances
-                .iter()
-                .filter(|i| i.provider == p)
-                .collect(),
-            None => self.infra_instances.iter().collect(),
+    fn do_launch_ssh_with_setup(&mut self, instance: &Instance) {
+        let ip = match instance.ip.as_ref() {
+            Some(ip) => ip.clone(),
+            None => {
+                self.infra_error = Some("No IP address available".to_string());
+                return;
+            }
+        };
+
+        let (host, port) = if ip.contains(':') {
+            let parts: Vec<&str> = ip.split(':').collect();
+            (parts[0].to_string(), Some(parts[1].to_string()))
+        } else {
+            (ip.clone(), None)
+        };
+
+        let repo_path = &self.session_repo_path;
+        if repo_path.is_empty() {
+            self.infra_error = Some("No repository path specified".to_string());
+            return;
         }
+
+        self.infra_error = Some("Syncing code...".to_string());
+        self.infra_message_time = Some(Instant::now());
+
+        let mut rsync_cmd = std::process::Command::new("rsync");
+        rsync_cmd.args([
+            "-avz",
+            "--exclude",
+            ".git",
+            "--exclude",
+            "__pycache__",
+            "--exclude",
+            ".venv",
+            "--exclude",
+            "*.pyc",
+            "--exclude",
+            ".mypy_cache",
+            "--exclude",
+            "*.egg-info",
+        ]);
+
+        if let Some(p) = &port {
+            rsync_cmd.args(["-e", &format!("ssh -o StrictHostKeyChecking=no -p {}", p)]);
+        } else {
+            rsync_cmd.args(["-e", "ssh -o StrictHostKeyChecking=no"]);
+        }
+
+        let repo_with_slash = if repo_path.ends_with('/') {
+            repo_path.clone()
+        } else {
+            format!("{}/", repo_path)
+        };
+
+        rsync_cmd
+            .arg(&repo_with_slash)
+            .arg(format!("{}@{}:~/project/", instance.ssh_user, host));
+
+        match rsync_cmd.status() {
+            Ok(status) if status.success() => {
+                self.infra_error = Some("Code synced, launching SSH...".to_string());
+                self.infra_message_time = Some(Instant::now());
+            }
+            Ok(status) => {
+                self.infra_error = Some(format!("rsync failed with exit code: {}", status));
+                return;
+            }
+            Err(e) => {
+                self.infra_error = Some(format!("rsync failed: {}", e));
+                return;
+            }
+        }
+
+        let script = generate_script(
+            &self.session_python_version,
+            &self.session_command,
+            self.session_skip_tmux,
+        );
+
+        let script_path = std::env::temp_dir().join("extty_bootstrap.sh");
+        if let Err(e) = std::fs::write(&script_path, &script) {
+            self.infra_error = Some(format!("Failed to write bootstrap script: {}", e));
+            return;
+        }
+
+        let ssh_cmd = if let Some(p) = &port {
+            format!(
+                "ssh -o StrictHostKeyChecking=no -p {} {}@{} 'bash -s' < '{}'",
+                p,
+                instance.ssh_user,
+                host,
+                script_path.display()
+            )
+        } else {
+            format!(
+                "ssh -o StrictHostKeyChecking=no {}@{} 'bash -s' < '{}'",
+                instance.ssh_user,
+                host,
+                script_path.display()
+            )
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+            let script = if term_program == "iTerm.app" {
+                format!(
+                    "tell application \"iTerm2\" to tell current window to create tab with default profile command \"{}\"",
+                    ssh_cmd.replace('"', "\\\"")
+                )
+            } else {
+                format!(
+                    "tell application \"Terminal\" to do script \"{}\"",
+                    ssh_cmd.replace('"', "\\\"")
+                )
+            };
+            let _ = std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("x-terminal-emulator")
+                .args(["-e", "bash", "-c", &ssh_cmd])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+
+        self.infra_error = Some("SSH session launched".to_string());
+        self.infra_message_time = Some(Instant::now());
+    }
+
+    fn filtered_infra_instances(&self) -> Vec<&Instance> {
+        self.infra_instances
+            .iter()
+            .filter(|i| i.provider == self.selected_infra_provider)
+            .collect()
     }
 
     fn grid_layout(&self) -> (usize, usize) {
@@ -580,7 +798,7 @@ impl App {
                 ViewMode::Models => self.model_cards(),
                 ViewMode::Infra => vec![],
             },
-            View::InfraList | View::InfraConfig => vec![],
+            View::InfraList | View::InfraConfig | View::S3Config => vec![],
         }
     }
 
@@ -656,7 +874,14 @@ impl App {
         line_count.saturating_sub(visible_height)
     }
 
-    fn handle_key(&mut self, code: KeyCode) {
+    fn handle_key(&mut self, key: KeyEvent) {
+        let code = key.code;
+        let modifiers = key.modifiers;
+
+        if self.session_modal_open {
+            self.handle_session_modal_key(code);
+            return;
+        }
         if self.show_delete_confirm {
             self.handle_delete_confirm_key(code);
             return;
@@ -670,7 +895,7 @@ impl App {
             View::List => match self.view_mode {
                 ViewMode::Runs => self.handle_list_key(code),
                 ViewMode::Models => self.handle_model_list_key(code),
-                ViewMode::Infra => self.handle_infra_list_key(code),
+                ViewMode::Infra => self.handle_infra_list_key(code, modifiers),
             },
             View::RunDetail => {
                 let (visible_rows, cols) = self.grid_layout();
@@ -681,8 +906,9 @@ impl App {
                 self.handle_model_detail_key(code, visible_rows, cols);
             }
             View::Focused => self.handle_focused_key(code),
-            View::InfraList => self.handle_infra_list_key(code),
+            View::InfraList => self.handle_infra_list_key(code, modifiers),
             View::InfraConfig => self.handle_infra_config_key(code),
+            View::S3Config => self.handle_s3_config_key(code),
         }
     }
 
@@ -749,6 +975,12 @@ impl App {
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
+            KeyCode::Char('S') => {
+                self.view = View::S3Config;
+                self.s3_config_field = 0;
+                self.s3_config_editing = false;
+                self.s3_config_message = None;
+            }
             KeyCode::Up if self.selected_list_item > 0 => {
                 self.selected_list_item -= 1;
             }
@@ -805,6 +1037,12 @@ impl App {
                 self.view = View::InfraList;
                 self.refresh_infra();
                 self.refresh_infra_types();
+            }
+            KeyCode::Char('S') => {
+                self.view = View::S3Config;
+                self.s3_config_field = 0;
+                self.s3_config_editing = false;
+                self.s3_config_message = None;
             }
             KeyCode::Up if self.selected_model_list_item > 0 => {
                 self.selected_model_list_item -= 1;
@@ -1155,7 +1393,7 @@ impl App {
         }
     }
 
-    fn handle_infra_list_key(&mut self, code: KeyCode) {
+    fn handle_infra_list_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         if self.launch_confirming {
             self.handle_infra_launch_confirm_key(code);
             return;
@@ -1206,28 +1444,21 @@ impl App {
                 _ => {}
             },
             KeyCode::Char('1') => {
-                self.selected_infra_provider = Some(Provider::Lambda);
+                self.selected_infra_provider = Provider::Lambda;
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
             KeyCode::Char('2') => {
-                self.selected_infra_provider = Some(Provider::Vast);
+                self.selected_infra_provider = Provider::Vast;
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
             KeyCode::Char('3') => {
-                self.selected_infra_provider = Some(Provider::Prime);
-                self.selected_infra_instance = 0;
-                self.selected_infra_type = 0;
-                self.refresh_infra();
-                self.refresh_infra_types();
-            }
-            KeyCode::Char('0') => {
-                self.selected_infra_provider = None;
+                self.selected_infra_provider = Provider::Prime;
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
                 self.refresh_infra();
@@ -1240,7 +1471,11 @@ impl App {
                         && instance.ip.is_some()
                     {
                         let instance_clone = (*instance).clone();
-                        let _ = self.launch_ssh(&instance_clone);
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            self.open_session_modal(&instance_clone);
+                        } else {
+                            let _ = self.launch_ssh(&instance_clone);
+                        }
                     }
                 }
                 InfraPanel::Types if type_count > 0 => {
@@ -1259,6 +1494,15 @@ impl App {
                 }
                 _ => {}
             },
+            KeyCode::Char('S') if self.infra_active_panel == InfraPanel::Instances => {
+                let instances = self.filtered_infra_instances();
+                if let Some(instance) = instances.get(self.selected_infra_instance)
+                    && instance.ip.is_some()
+                {
+                    let instance_clone = (*instance).clone();
+                    self.open_session_modal(&instance_clone);
+                }
+            }
             KeyCode::Char('x') if self.infra_active_panel == InfraPanel::Instances => {
                 if instance_count > 0 && self.selected_infra_instance < instance_count {
                     self.pending_terminate_instance = Some(self.selected_infra_instance);
@@ -1274,6 +1518,10 @@ impl App {
                 self.config_provider_index = 0;
                 self.config_editing_key = false;
                 self.config_api_key_input.clear();
+            }
+            KeyCode::Char('s') if self.infra_active_panel == InfraPanel::Types => {
+                self.infra_type_sort = self.infra_type_sort.next();
+                self.sort_infra_types();
             }
             _ => {}
         }
@@ -1386,10 +1634,166 @@ impl App {
             }
         }
     }
+
+    fn handle_s3_config_key(&mut self, code: KeyCode) {
+        const FIELD_COUNT: usize = 6;
+        let field_names = [
+            "bucket",
+            "prefix",
+            "region",
+            "access_key_id",
+            "secret_access_key",
+            "endpoint_url",
+        ];
+
+        if self.s3_config_editing {
+            match code {
+                KeyCode::Esc => {
+                    self.s3_config_editing = false;
+                    self.s3_config_input.clear();
+                }
+                KeyCode::Enter => {
+                    let value = if self.s3_config_input.is_empty() {
+                        None
+                    } else {
+                        Some(self.s3_config_input.clone())
+                    };
+
+                    match self.s3_config_field {
+                        0 => self.s3_config.bucket = value.unwrap_or_default(),
+                        1 => self.s3_config.prefix = value.unwrap_or_default(),
+                        2 => self.s3_config.region = value,
+                        3 => self.s3_config.access_key_id = value,
+                        4 => self.s3_config.secret_access_key = value,
+                        5 => self.s3_config.endpoint_url = value,
+                        _ => {}
+                    }
+
+                    match s3::save_config(&self.s3_config) {
+                        Ok(()) => self.s3_config_message = Some("Saved".to_string()),
+                        Err(e) => self.s3_config_message = Some(format!("Error: {}", e)),
+                    }
+                    self.s3_config_editing = false;
+                    self.s3_config_input.clear();
+                }
+                KeyCode::Backspace => {
+                    self.s3_config_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.s3_config_input.push(c);
+                }
+                _ => {}
+            }
+        } else {
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.view = View::List;
+                    self.view_mode = ViewMode::Runs;
+                }
+                KeyCode::Up if self.s3_config_field > 0 => {
+                    self.s3_config_field -= 1;
+                    self.s3_config_message = None;
+                }
+                KeyCode::Down if self.s3_config_field < FIELD_COUNT - 1 => {
+                    self.s3_config_field += 1;
+                    self.s3_config_message = None;
+                }
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    self.s3_config_editing = true;
+                    self.s3_config_input = match self.s3_config_field {
+                        0 => self.s3_config.bucket.clone(),
+                        1 => self.s3_config.prefix.clone(),
+                        2 => self.s3_config.region.clone().unwrap_or_default(),
+                        3 => self.s3_config.access_key_id.clone().unwrap_or_default(),
+                        4 => self.s3_config.secret_access_key.clone().unwrap_or_default(),
+                        5 => self.s3_config.endpoint_url.clone().unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    self.s3_config_message = None;
+                }
+                KeyCode::Char('d') => {
+                    match self.s3_config_field {
+                        0 => self.s3_config.bucket.clear(),
+                        1 => self.s3_config.prefix.clear(),
+                        2 => self.s3_config.region = None,
+                        3 => self.s3_config.access_key_id = None,
+                        4 => self.s3_config.secret_access_key = None,
+                        5 => self.s3_config.endpoint_url = None,
+                        _ => {}
+                    }
+                    match s3::save_config(&self.s3_config) {
+                        Ok(()) => self.s3_config_message = Some("Cleared".to_string()),
+                        Err(e) => self.s3_config_message = Some(format!("Error: {}", e)),
+                    }
+                }
+                _ => {}
+            }
+        }
+        let _ = field_names;
+    }
+
+    fn handle_session_modal_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.session_modal_open = false;
+                self.session_modal_instance = None;
+            }
+            KeyCode::Tab => {
+                self.session_modal_focus = match self.session_modal_focus {
+                    SessionModalField::PythonVersion => SessionModalField::RepoPath,
+                    SessionModalField::RepoPath => SessionModalField::Command,
+                    SessionModalField::Command => SessionModalField::SkipTmux,
+                    SessionModalField::SkipTmux => SessionModalField::PythonVersion,
+                };
+            }
+            KeyCode::BackTab => {
+                self.session_modal_focus = match self.session_modal_focus {
+                    SessionModalField::PythonVersion => SessionModalField::SkipTmux,
+                    SessionModalField::RepoPath => SessionModalField::PythonVersion,
+                    SessionModalField::Command => SessionModalField::RepoPath,
+                    SessionModalField::SkipTmux => SessionModalField::Command,
+                };
+            }
+            KeyCode::Char(' ') if self.session_modal_focus == SessionModalField::SkipTmux => {
+                self.session_skip_tmux = !self.session_skip_tmux;
+            }
+            KeyCode::Char(c) => match self.session_modal_focus {
+                SessionModalField::PythonVersion => self.session_python_version.push(c),
+                SessionModalField::RepoPath => self.session_repo_path.push(c),
+                SessionModalField::Command => self.session_command.push(c),
+                SessionModalField::SkipTmux => {}
+            },
+            KeyCode::Backspace => match self.session_modal_focus {
+                SessionModalField::PythonVersion => {
+                    self.session_python_version.pop();
+                }
+                SessionModalField::RepoPath => {
+                    self.session_repo_path.pop();
+                }
+                SessionModalField::Command => {
+                    self.session_command.pop();
+                }
+                SessionModalField::SkipTmux => {}
+            },
+            KeyCode::Enter => {
+                if let Some(instance) = self.session_modal_instance.take() {
+                    self.do_launch_ssh_with_setup(&instance);
+                }
+                self.session_modal_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn open_session_modal(&mut self, instance: &Instance) {
+        self.session_skip_tmux = instance.provider == Provider::Vast;
+        self.session_modal_instance = Some(instance.clone());
+        self.session_modal_focus = SessionModalField::PythonVersion;
+        self.session_modal_open = true;
+    }
+
     fn do_launch_instance(&mut self) {
-        let provider = self
-            .selected_infra_provider
-            .unwrap_or(self.infra_config.default_provider);
+        let provider = self.selected_infra_provider;
         let config = self.infra_config.get_provider_config(provider);
 
         let Some(api_key) = &config.api_key else {
@@ -1434,6 +1838,7 @@ impl App {
                 self.infra_active_panel = InfraPanel::Instances;
                 if !ids.is_empty() {
                     self.infra_error = Some(format!("Launched: {}", ids.join(", ")));
+                    self.infra_message_time = Some(Instant::now());
                 }
             }
             Err(e) => {
@@ -1508,6 +1913,22 @@ fn run_tui(options: TuiOptions) -> Result<()> {
             last_list_refresh = Instant::now();
         }
 
+        // Auto-refresh infra instances when viewing infra tab (every 5 seconds)
+        if app.view_mode == ViewMode::Infra
+            && !app.show_config
+            && app.infra_last_refresh.elapsed() >= Duration::from_secs(5)
+        {
+            app.refresh_infra();
+        }
+
+        // Clear transient infra messages after 3 seconds
+        if let Some(msg_time) = app.infra_message_time
+            && msg_time.elapsed() >= Duration::from_secs(3)
+        {
+            app.infra_error = None;
+            app.infra_message_time = None;
+        }
+
         // Draw the UI
         terminal.draw(|frame| render(&app, frame))?;
 
@@ -1517,7 +1938,7 @@ fn run_tui(options: TuiOptions) -> Result<()> {
         {
             // Only handle key press, not release
             if key.kind == KeyEventKind::Press {
-                app.handle_key(key.code);
+                app.handle_key(key);
             }
         }
     }
@@ -1533,7 +1954,6 @@ fn run_s3_command(cmd: &str, options: SyncOptions) -> Result<()> {
         anyhow::anyhow!(
             "S3 not configured. Create ~/.extty/s3/config.toml with:\n\n\
              bucket = \"your-bucket\"\n\
-             prefix = \"extty\"\n\
              region = \"us-west-2\"\n"
         )
     })?;
@@ -1833,6 +2253,7 @@ fn render(app: &App, frame: &mut Frame) {
         View::Focused => render_focused(app, frame),
         View::InfraList => render_infra_dashboard(app, frame),
         View::InfraConfig => render_infra_config(app, frame),
+        View::S3Config => render_s3_config(app, frame),
     }
 
     if app.show_delete_confirm {
@@ -3870,6 +4291,9 @@ fn render_infra_dashboard(app: &App, frame: &mut Frame) {
     if app.launch_confirming {
         render_infra_launch_confirm(app, frame);
     }
+    if app.session_modal_open {
+        render_session_modal(app, frame);
+    }
 }
 
 fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
@@ -3877,10 +4301,9 @@ fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
     let vast_configured = app.infra_config.vast.api_key.is_some();
     let prime_configured = app.infra_config.prime.api_key.is_some();
 
-    let lambda_selected = app.selected_infra_provider == Some(Provider::Lambda);
-    let vast_selected = app.selected_infra_provider == Some(Provider::Vast);
-    let prime_selected = app.selected_infra_provider == Some(Provider::Prime);
-    let all_selected = app.selected_infra_provider.is_none();
+    let lambda_selected = app.selected_infra_provider == Provider::Lambda;
+    let vast_selected = app.selected_infra_provider == Provider::Vast;
+    let prime_selected = app.selected_infra_provider == Provider::Prime;
 
     let spans = vec![
         Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
@@ -3890,15 +4313,6 @@ fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("[Infra]", Style::default().fg(NEON_CYAN).bold()),
         Span::styled("   Provider: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            if all_selected { "[All]" } else { "All" },
-            if all_selected {
-                Style::default().fg(NEON_CYAN).bold()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        ),
-        Span::styled(" ", Style::default()),
         Span::styled(
             if lambda_selected {
                 "[λ Lambda"
@@ -4112,12 +4526,18 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
 fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
     let is_focused = app.infra_active_panel == InfraPanel::Types;
 
-    let title = Line::from(vec![Span::styled(
-        format!(" ◆ Instance Types ({}) ", app.infra_types.len()),
-        Style::default()
-            .fg(if is_focused { NEON_CYAN } else { Color::Gray })
-            .bold(),
-    )]);
+    let title = Line::from(vec![
+        Span::styled(
+            format!(" ◆ Instance Types ({}) ", app.infra_types.len()),
+            Style::default()
+                .fg(if is_focused { NEON_CYAN } else { Color::Gray })
+                .bold(),
+        ),
+        Span::styled(
+            format!("[sort: {}] ", app.infra_type_sort.label()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
 
     let border_color = if is_focused { NEON_CYAN } else { DIM_CYAN };
 
@@ -4135,9 +4555,7 @@ fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
     }
 
     if app.infra_types.is_empty() {
-        let provider = app
-            .selected_infra_provider
-            .unwrap_or(app.infra_config.default_provider);
+        let provider = app.selected_infra_provider;
         let config = app.infra_config.get_provider_config(provider);
         let msg = if config.api_key.is_none() {
             format!(
@@ -4230,31 +4648,49 @@ fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
-    let help = if app.launch_selecting_region || app.launch_confirming {
+    let help = if app.launch_selecting_region || app.launch_confirming || app.session_modal_open {
         Line::from(vec![])
+    } else if app.infra_active_panel == InfraPanel::Instances {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+            Span::styled("] panel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+            Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] ssh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("S", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] setup+ssh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("x", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] terminate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("1-3", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("R", Style::default().fg(NEON_CYAN)),
+            Span::styled("] refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+        ])
     } else {
         Line::from(vec![
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("Tab", Style::default().fg(NEON_CYAN)),
-            Span::styled("] switch panel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("] panel  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-            Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("Enter", Style::default().fg(NEON_GREEN)),
-            Span::styled("] ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                if app.infra_active_panel == InfraPanel::Instances {
-                    "ssh"
-                } else {
-                    "launch"
-                },
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled("  ", Style::default()),
+            Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("x", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] terminate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("s", Style::default().fg(NEON_CYAN)),
+            Span::styled("] sort  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("1-3", Style::default().fg(NEON_YELLOW)),
             Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
@@ -4399,6 +4835,120 @@ fn render_infra_launch_confirm(app: &App, frame: &mut Frame) {
         .block(block)
         .alignment(Alignment::Center);
 
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_session_modal(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let popup_width = 52u16.min(area.width.saturating_sub(4));
+    let popup_height = 14u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let instance_name = app
+        .session_modal_instance
+        .as_ref()
+        .map(|i| i.display_name().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let field_width = popup_width.saturating_sub(20) as usize;
+
+    let truncate = |s: &str, max_len: usize| -> String {
+        if s.len() > max_len {
+            format!("...{}", &s[s.len().saturating_sub(max_len - 3)..])
+        } else {
+            s.to_string()
+        }
+    };
+
+    let python_display = truncate(&app.session_python_version, field_width);
+    let repo_display = truncate(&app.session_repo_path, field_width);
+    let command_display = truncate(&app.session_command, field_width);
+
+    let focused_style = Style::default().fg(NEON_CYAN).bold();
+    let unfocused_style = Style::default().fg(Color::Gray);
+    let label_style = Style::default().fg(Color::DarkGray);
+
+    let py_style = if app.session_modal_focus == SessionModalField::PythonVersion {
+        focused_style
+    } else {
+        unfocused_style
+    };
+    let repo_style = if app.session_modal_focus == SessionModalField::RepoPath {
+        focused_style
+    } else {
+        unfocused_style
+    };
+    let cmd_style = if app.session_modal_focus == SessionModalField::Command {
+        focused_style
+    } else {
+        unfocused_style
+    };
+    let tmux_style = if app.session_modal_focus == SessionModalField::SkipTmux {
+        focused_style
+    } else {
+        unfocused_style
+    };
+
+    let checkbox = if app.session_skip_tmux { "[x]" } else { "[ ]" };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Instance: ", label_style),
+            Span::styled(&instance_name, Style::default().fg(NEON_YELLOW)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Python version: ", label_style),
+            Span::styled(format!("[{}]", python_display), py_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Local repo:     ", label_style),
+            Span::styled(format!("[{}]", repo_display), repo_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Command:        ", label_style),
+            Span::styled(format!("[{}]", command_display), cmd_style),
+        ]),
+        Line::from(Span::styled(
+            "  (runs from ~/project on remote)",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{} ", checkbox), tmux_style),
+            Span::styled("Skip tmux (already running)", tmux_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+            Span::styled("] next  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Launch  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " SSH with Setup ",
+            Style::default().fg(NEON_CYAN).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(NEON_CYAN))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
@@ -4588,4 +5138,163 @@ fn render_terminate_confirm(app: &App, frame: &mut Frame) {
         .alignment(Alignment::Center);
 
     frame.render_widget(paragraph, popup_area);
+}
+
+fn render_s3_config(app: &App, frame: &mut Frame) {
+    use ratatui::layout::Alignment;
+
+    let area = frame.area();
+
+    let fields: [(&str, String, bool); 6] = [
+        ("bucket", app.s3_config.bucket.clone(), true),
+        ("prefix", app.s3_config.prefix.clone(), false),
+        (
+            "region",
+            app.s3_config.region.clone().unwrap_or_default(),
+            false,
+        ),
+        (
+            "access_key_id",
+            app.s3_config.access_key_id.clone().unwrap_or_default(),
+            false,
+        ),
+        (
+            "secret_access_key",
+            app.s3_config.secret_access_key.clone().unwrap_or_default(),
+            false,
+        ),
+        (
+            "endpoint_url",
+            app.s3_config.endpoint_url.clone().unwrap_or_default(),
+            false,
+        ),
+    ];
+
+    let items: Vec<ListItem> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, (name, value, required))| {
+            let is_selected = i == app.s3_config_field;
+            let has_value = !value.is_empty();
+
+            let (status_icon, status_color) = if has_value {
+                ("✓", NEON_GREEN)
+            } else if *required {
+                ("✗", NEON_MAGENTA)
+            } else {
+                ("○", Color::DarkGray)
+            };
+
+            let name_style = if is_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let display_value = if *name == "secret_access_key" && has_value {
+                if value.len() > 8 {
+                    format!("{}...{}", &value[..4], &value[value.len() - 4..])
+                } else {
+                    "****".to_string()
+                }
+            } else if has_value {
+                value.clone()
+            } else {
+                "not set".to_string()
+            };
+
+            let mut spans = vec![
+                Span::styled(
+                    format!("{} ", status_icon),
+                    Style::default().fg(status_color),
+                ),
+                Span::styled(format!("{:<18}", name), name_style),
+                Span::styled(
+                    display_value,
+                    Style::default().fg(if has_value {
+                        NEON_YELLOW
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ];
+
+            if is_selected && app.s3_config_editing {
+                spans.clear();
+                spans.push(Span::styled(
+                    format!("{} ", status_icon),
+                    Style::default().fg(status_color),
+                ));
+                spans.push(Span::styled(format!("{:<18}", name), name_style));
+                spans.push(Span::styled(
+                    &app.s3_config_input,
+                    Style::default().fg(Color::White),
+                ));
+                spans.push(Span::styled("█", Style::default().fg(NEON_CYAN)));
+            }
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.s3_config_field));
+
+    let title = Line::from(vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("S3 Configuration", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(" (", Style::default().fg(Color::DarkGray)),
+        Span::styled("~/.extty/s3/config.toml", Style::default().fg(Color::Gray)),
+        Span::styled(")", Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN));
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(20, 20, 40)));
+
+    frame.render_stateful_widget(list, area, &mut state);
+
+    let help_text = if app.s3_config_editing {
+        vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(Color::Gray)),
+            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("e/Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Edit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("d", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] Clear  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q/Esc", Style::default().fg(Color::Gray)),
+            Span::styled("] Back", Style::default().fg(Color::DarkGray)),
+        ]
+    };
+
+    let mut help_line = help_text;
+    if let Some(msg) = &app.s3_config_message {
+        help_line.push(Span::styled("  ", Style::default()));
+        help_line.push(Span::styled(msg, Style::default().fg(NEON_GREEN)));
+    }
+
+    let help = Paragraph::new(Line::from(help_line)).alignment(Alignment::Center);
+    let help_area = ratatui::layout::Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(1),
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(help, help_area);
 }

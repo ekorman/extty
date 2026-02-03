@@ -22,6 +22,18 @@ fn normalize_status(raw: &str) -> InstanceStatus {
     }
 }
 
+fn parse_gpu_memory(desc: &Option<String>) -> u32 {
+    let Some(desc) = desc else { return 0 };
+    for part in desc.split_whitespace() {
+        if let Some(num_str) = part.strip_suffix("GB")
+            && let Ok(num) = num_str.parse::<u32>()
+        {
+            return num;
+        }
+    }
+    0
+}
+
 pub struct LambdaProvider {
     client: Client,
     headers: HeaderMap,
@@ -180,12 +192,14 @@ impl CloudProvider for LambdaProvider {
             .into_iter()
             .map(|(name, wrapper)| {
                 let it = wrapper.instance_type;
+                let gpu_memory_gib = parse_gpu_memory(&it.gpu_description);
                 InstanceType {
                     name,
                     description: it.description,
                     gpu_count: it.specs.gpus,
                     gpu_name: None,
                     gpu_description: it.gpu_description,
+                    gpu_memory_gib,
                     vcpus: it.specs.vcpus,
                     memory_gib: it.specs.memory_gib,
                     storage_gib: it.specs.storage_gib,

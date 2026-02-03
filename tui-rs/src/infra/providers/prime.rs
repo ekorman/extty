@@ -209,6 +209,7 @@ impl CloudProvider for PrimeProvider {
                     gpu_count,
                     gpu_name: Some(gpu_type),
                     gpu_description: None,
+                    gpu_memory_gib: 0,
                     vcpus: g.vcpus.unwrap_or(0),
                     memory_gib: g.memory_gib.unwrap_or(0),
                     storage_gib: g.storage_gib.unwrap_or(0),

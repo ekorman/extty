@@ -17,7 +17,7 @@ class S3Config:
     """Configuration for S3 storage."""
 
     bucket: str
-    prefix: str = "extty"
+    prefix: str = ""
     region: str | None = None
     access_key_id: str | None = None
     secret_access_key: str | None = None
@@ -26,24 +26,75 @@ class S3Config:
     @classmethod
     def from_env(cls) -> S3Config | None:
         """
-        Create S3Config from environment variables.
+        Create S3Config from environment variables, falling back to config file.
+
+        Checks environment variables first, then ~/.extty/s3/config.toml.
 
         Returns
         -------
         S3Config or None
-            Configuration if EXTTY_S3_BUCKET is set, None otherwise.
+            Configuration if found, None otherwise.
         """
         bucket = os.environ.get("EXTTY_S3_BUCKET")
-        if not bucket:
+        if bucket:
+            return cls(
+                bucket=bucket,
+                prefix=os.environ.get("EXTTY_S3_PREFIX", ""),
+                region=os.environ.get("EXTTY_S3_REGION"),
+                access_key_id=os.environ.get("EXTTY_S3_ACCESS_KEY_ID"),
+                secret_access_key=os.environ.get("EXTTY_S3_SECRET_ACCESS_KEY"),
+                endpoint_url=os.environ.get("EXTTY_S3_ENDPOINT_URL"),
+            )
+
+        return cls.from_file()
+
+    @classmethod
+    def from_file(cls) -> S3Config | None:
+        """
+        Load S3Config from ~/.extty/s3/config.toml.
+
+        Returns
+        -------
+        S3Config or None
+            Configuration if file exists and has a bucket, None otherwise.
+        """
+        from pathlib import Path
+
+        config_path = Path.home() / ".extty" / "s3" / "config.toml"
+        if not config_path.exists():
             return None
-        return cls(
-            bucket=bucket,
-            prefix=os.environ.get("EXTTY_S3_PREFIX", "extty"),
-            region=os.environ.get("EXTTY_S3_REGION"),
-            access_key_id=os.environ.get("EXTTY_S3_ACCESS_KEY_ID"),
-            secret_access_key=os.environ.get("EXTTY_S3_SECRET_ACCESS_KEY"),
-            endpoint_url=os.environ.get("EXTTY_S3_ENDPOINT_URL"),
-        )
+
+        try:
+            content = config_path.read_text()
+            config = _parse_toml(content)
+            bucket = config.get("bucket")
+            if not bucket:
+                return None
+            return cls(
+                bucket=bucket,
+                prefix=config.get("prefix") or "",
+                region=config.get("region"),
+                access_key_id=config.get("access_key_id"),
+                secret_access_key=config.get("secret_access_key"),
+                endpoint_url=config.get("endpoint_url"),
+            )
+        except Exception:
+            return None
+
+
+def _parse_toml(content: str) -> dict[str, str | None]:
+    """Simple TOML parser for flat key-value config."""
+    result: dict[str, str | None] = {}
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            result[key] = value if value else None
+    return result
 
 
 @dataclass
@@ -96,9 +147,10 @@ class S3Storage:
         self._client = boto3.client("s3", **kwargs)
 
     def _s3_key(self, *parts: str) -> str:
-        return "/".join(
-            [self.config.prefix, "runs", self.project, self.run_name, *parts]
-        )
+        path_parts = ["runs", self.project, self.run_name, *parts]
+        if self.config.prefix:
+            path_parts.insert(0, self.config.prefix)
+        return "/".join(path_parts)
 
     def log_metric(self, name: str, value: float, step: int) -> None:
         timestamp = time.time()

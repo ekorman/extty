@@ -94,6 +94,7 @@ pub struct InstanceType {
     pub gpu_count: u32,
     pub gpu_name: Option<String>,
     pub gpu_description: Option<String>,
+    pub gpu_memory_gib: u32,
     pub vcpus: u32,
     pub memory_gib: u32,
     pub storage_gib: u32,

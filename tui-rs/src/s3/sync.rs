@@ -24,9 +24,11 @@ impl S3Client {
     pub async fn new(config: S3Config) -> Result<Self> {
         let mut aws_config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
 
-        if let Some(region) = &config.region {
-            aws_config_builder = aws_config_builder.region(aws_config::Region::new(region.clone()));
-        }
+        let region = config
+            .region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".to_string());
+        aws_config_builder = aws_config_builder.region(aws_config::Region::new(region));
 
         if let (Some(access_key), Some(secret_key)) =
             (&config.access_key_id, &config.secret_access_key)
@@ -53,13 +55,70 @@ impl S3Client {
         Ok(Self { client, config })
     }
 
+    fn s3_prefix(&self, path: &str) -> String {
+        if self.config.prefix.is_empty() {
+            path.to_string()
+        } else {
+            format!("{}/{}", self.config.prefix, path)
+        }
+    }
+
     pub async fn list_runs(&self, project: Option<&str>) -> Result<Vec<RemoteRun>> {
-        let prefix = match project {
-            Some(p) => format!("{}/runs/{}/", self.config.prefix, p),
-            None => format!("{}/runs/", self.config.prefix),
+        let projects = match project {
+            Some(p) => vec![p.to_string()],
+            None => self.list_projects().await?,
         };
 
         let mut runs = Vec::new();
+        for proj in projects {
+            let prefix = self.s3_prefix(&format!("runs/{}/", proj));
+            let mut continuation_token: Option<String> = None;
+
+            loop {
+                let mut request = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(&self.config.bucket)
+                    .prefix(&prefix)
+                    .delimiter("/");
+
+                if let Some(token) = continuation_token.take() {
+                    request = request.continuation_token(token);
+                }
+
+                let response = request.send().await.context("Failed to list S3 objects")?;
+
+                for cp in response.common_prefixes() {
+                    if let Some(prefix_str) = cp.prefix() {
+                        let name = prefix_str
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        if !name.is_empty() {
+                            runs.push(RemoteRun {
+                                project: proj.clone(),
+                                name,
+                            });
+                        }
+                    }
+                }
+
+                if response.is_truncated() == Some(true) {
+                    continuation_token = response.next_continuation_token().map(|s| s.to_string());
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(runs)
+    }
+
+    async fn list_projects(&self) -> Result<Vec<String>> {
+        let prefix = self.s3_prefix("runs/");
+        let mut projects = Vec::new();
         let mut continuation_token: Option<String> = None;
 
         loop {
@@ -74,20 +133,18 @@ impl S3Client {
                 request = request.continuation_token(token);
             }
 
-            let response = request.send().await.context("Failed to list S3 objects")?;
+            let response = request.send().await.context("Failed to list S3 projects")?;
 
             for cp in response.common_prefixes() {
                 if let Some(prefix_str) = cp.prefix() {
-                    let parts: Vec<&str> = prefix_str.trim_end_matches('/').split('/').collect();
-                    if parts.len() >= 3 {
-                        let proj = parts[parts.len() - 2].to_string();
-                        let name = parts[parts.len() - 1].to_string();
-                        if project.is_none() || project == Some(&proj) {
-                            runs.push(RemoteRun {
-                                project: proj,
-                                name,
-                            });
-                        }
+                    let name = prefix_str
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        projects.push(name);
                     }
                 }
             }
@@ -99,7 +156,7 @@ impl S3Client {
             }
         }
 
-        Ok(runs)
+        Ok(projects)
     }
 
     pub async fn download_run(
@@ -110,7 +167,7 @@ impl S3Client {
         force: bool,
         dry_run: bool,
     ) -> Result<()> {
-        let prefix = format!("{}/runs/{}/{}/", self.config.prefix, project, run);
+        let prefix = self.s3_prefix(&format!("runs/{}/{}/", project, run));
         let run_dir = dest.join(project).join(run);
 
         if dry_run {
@@ -212,7 +269,7 @@ impl S3Client {
             return Ok(());
         }
 
-        let prefix = format!("{}/runs/{}/{}", self.config.prefix, project, run);
+        let prefix = self.s3_prefix(&format!("runs/{}/{}", project, run));
 
         for entry in walkdir(&run_dir)? {
             let relative_path = entry.strip_prefix(&run_dir)?;

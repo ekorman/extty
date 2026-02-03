@@ -10,6 +10,16 @@ use crate::infra::providers::CloudProvider;
 
 const BASE_URL: &str = "https://console.vast.ai/api/v0";
 
+fn parse_instance_type(instance_type: &str) -> Result<(&str, u32)> {
+    if let Some(pos) = instance_type.rfind('x') {
+        let (gpu_name, suffix) = instance_type.split_at(pos);
+        if let Ok(num) = suffix[1..].parse::<u32>() {
+            return Ok((gpu_name, num));
+        }
+    }
+    Err(anyhow!("Invalid instance type format: {}", instance_type))
+}
+
 fn normalize_status(raw: &str) -> InstanceStatus {
     match raw.to_lowercase().as_str() {
         "running" => InstanceStatus::Running,
@@ -149,6 +159,7 @@ struct VastOffer {
     id: i64,
     gpu_name: Option<String>,
     num_gpus: Option<u32>,
+    gpu_ram: Option<u64>,
     cpu_cores_effective: Option<f64>,
     cpu_ram: Option<f64>,
     disk_space: Option<f64>,
@@ -226,12 +237,16 @@ impl CloudProvider for VastProvider {
             let price_per_gpu = offer.dph_base.unwrap_or(0.0);
             let total_price = price_per_gpu * num_gpus as f64;
 
+            let gpu_ram_gb = offer.gpu_ram.map(|r| r / 1024);
+            let gpu_description = gpu_ram_gb.map(|gb| format!("{}GB", gb));
+
             types.push(InstanceType {
                 name: type_key,
                 description: Some(format!("{}x {}", num_gpus, gpu_name)),
                 gpu_count: num_gpus,
                 gpu_name: Some(gpu_name),
-                gpu_description: None,
+                gpu_description,
+                gpu_memory_gib: gpu_ram_gb.unwrap_or(0) as u32,
                 vcpus: offer.cpu_cores_effective.unwrap_or(0.0) as u32,
                 memory_gib: (offer.cpu_ram.unwrap_or(0.0) / 1024.0) as u32,
                 storage_gib: offer.disk_space.unwrap_or(0.0) as u32,
@@ -244,12 +259,14 @@ impl CloudProvider for VastProvider {
     }
 
     fn launch(&self, opts: &LaunchOptions) -> Result<Vec<String>> {
+        let (gpu_name, num_gpus) = parse_instance_type(&opts.instance_type)?;
+
         let search_body = serde_json::json!({
             "verified": {"eq": true},
             "external": {"eq": false},
             "rentable": {"eq": true},
-            "gpu_name": {"eq": opts.instance_type},
-            "num_gpus": {"gte": 1},
+            "gpu_name": {"eq": gpu_name},
+            "num_gpus": {"eq": num_gpus},
             "type": "on-demand",
             "order": [["dph_total", "asc"]],
             "limit": 1,
