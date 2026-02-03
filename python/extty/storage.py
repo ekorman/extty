@@ -14,12 +14,12 @@ from typing import Any
 
 def get_runs_dir() -> Path:
     """Get the default runs directory (~/.ex/runs/)."""
-    return Path.home() / ".ex" / "runs"
+    return Path.home() / ".extty" / "runs"
 
 
 def get_models_dir() -> Path:
     """Get the default models directory (~/.ex/models/)."""
-    return Path.home() / ".ex" / "models"
+    return Path.home() / ".extty" / "models"
 
 
 def sanitize_metric_name(name: str) -> str:

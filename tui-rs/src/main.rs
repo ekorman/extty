@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -24,15 +24,27 @@ const NEON_YELLOW: Color = Color::Rgb(255, 255, 0);
 const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
 mod data;
+mod infra;
 mod remote;
+mod s3;
 use data::{
     Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation, delete_model,
     load_all_evaluations, load_models, load_runs,
+};
+use infra::{
+    InfraConfig, Instance, InstanceStatus, InstanceType, Provider, generate_script, get_provider,
+    load_config, save_config,
 };
 use remote::RemoteSync;
 
 enum SyncMessage {
     SyncCompleted,
+}
+
+enum SetupMessage {
+    Status(String),
+    Done(String),
+    Error(String),
 }
 
 fn run_sync_loop(mut remote_sync: RemoteSync, tx: mpsc::Sender<SyncMessage>) {
@@ -45,11 +57,12 @@ fn run_sync_loop(mut remote_sync: RemoteSync, tx: mpsc::Sender<SyncMessage>) {
     }
 }
 
-// View mode: Runs or Models
+// View mode: Runs, Models, or Infra
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
     Runs,
     Models,
+    Infra,
 }
 
 // The views in our app
@@ -59,6 +72,42 @@ enum View {
     RunDetail,
     ModelDetail,
     Focused,
+    InfraList,
+    InfraConfig,
+    S3Config,
+}
+
+// Which panel has focus in the Infra dashboard
+#[derive(Clone, Copy, PartialEq)]
+enum InfraPanel {
+    Instances,
+    Types,
+}
+
+#[derive(Clone, Copy, PartialEq, Default)]
+enum InfraTypeSort {
+    #[default]
+    Name,
+    Price,
+    Vram,
+}
+
+impl InfraTypeSort {
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Price,
+            Self::Price => Self::Vram,
+            Self::Vram => Self::Name,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Price => "Price",
+            Self::Vram => "VRAM",
+        }
+    }
 }
 
 // Which section is focused in the focused example view
@@ -66,6 +115,16 @@ enum View {
 enum FocusedSection {
     Prompt,
     Response,
+}
+
+// Which field is focused in the session setup modal
+#[derive(Clone, Copy, PartialEq, Default)]
+enum SessionModalField {
+    #[default]
+    PythonVersion,
+    RepoPath,
+    Command,
+    SkipTmux,
 }
 
 // A card in the detail grid - either a chart, example group, or evaluation
@@ -119,6 +178,45 @@ struct App {
     pending_delete_eval: Option<usize>, // Index into model_evaluations of eval to delete
     term_width: u16,
     term_height: u16,
+    // Infra state
+    infra_config: InfraConfig,
+    infra_instances: Vec<Instance>,
+    infra_types: Vec<InstanceType>,
+    selected_infra_provider: Provider,
+    selected_infra_instance: usize,
+    selected_infra_type: usize,
+    infra_loading: bool,
+    infra_error: Option<String>,
+    infra_message_time: Option<Instant>,
+    show_terminate_confirm: bool,
+    pending_terminate_instance: Option<usize>,
+    infra_active_panel: InfraPanel,
+    infra_type_sort: InfraTypeSort,
+    infra_last_refresh: Instant,
+    // Infra config editing
+    config_provider_index: usize,
+    config_api_key_input: String,
+    config_editing_key: bool,
+    // Infra launch (inline in types panel)
+    launch_selected_region: usize,
+    launch_name_input: String,
+    launch_confirming: bool,
+    launch_selecting_region: bool,
+    // S3 config editing
+    s3_config: s3::S3Config,
+    s3_config_field: usize,
+    s3_config_editing: bool,
+    s3_config_input: String,
+    s3_config_message: Option<String>,
+    // Session setup modal
+    session_modal_open: bool,
+    session_modal_instance: Option<Instance>,
+    session_python_version: String,
+    session_repo_path: String,
+    session_command: String,
+    session_skip_tmux: bool,
+    session_modal_focus: SessionModalField,
+    setup_rx: Option<mpsc::Receiver<SetupMessage>>,
 }
 
 impl App {
@@ -126,6 +224,8 @@ impl App {
         let runs = load_runs();
         let models = load_models();
         let model_evaluations = load_all_evaluations();
+        let infra_config = load_config().unwrap_or_default();
+        let default_provider = infra_config.default_provider;
         App {
             runs,
             models,
@@ -154,6 +254,40 @@ impl App {
             pending_delete_eval: None,
             term_width: 80,
             term_height: 24,
+            infra_config,
+            infra_instances: Vec::new(),
+            infra_types: Vec::new(),
+            selected_infra_provider: default_provider,
+            selected_infra_instance: 0,
+            selected_infra_type: 0,
+            infra_loading: false,
+            infra_error: None,
+            infra_message_time: None,
+            show_terminate_confirm: false,
+            pending_terminate_instance: None,
+            infra_active_panel: InfraPanel::Instances,
+            infra_type_sort: InfraTypeSort::default(),
+            infra_last_refresh: Instant::now(),
+            config_provider_index: 0,
+            config_api_key_input: String::new(),
+            config_editing_key: false,
+            launch_selected_region: 0,
+            launch_name_input: String::new(),
+            launch_confirming: false,
+            launch_selecting_region: false,
+            s3_config: s3::load_config().ok().flatten().unwrap_or_default(),
+            s3_config_field: 0,
+            s3_config_editing: false,
+            s3_config_input: String::new(),
+            s3_config_message: None,
+            session_modal_open: false,
+            session_modal_instance: None,
+            session_python_version: "3.12".to_string(),
+            session_repo_path: String::new(),
+            session_command: String::new(),
+            session_skip_tmux: false,
+            session_modal_focus: SessionModalField::default(),
+            setup_rx: None,
         }
     }
 
@@ -263,6 +397,353 @@ impl App {
                 self.runs[self.selected_run] = updated;
             }
         }
+    }
+
+    fn refresh_infra(&mut self) {
+        self.infra_loading = true;
+        self.infra_error = None;
+        self.infra_instances.clear();
+
+        let provider = self.selected_infra_provider;
+        let config = self.infra_config.get_provider_config(provider);
+        if let Some(api_key) = &config.api_key {
+            let client = get_provider(provider, api_key);
+            match client.list_instances() {
+                Ok(instances) => {
+                    self.infra_instances.extend(instances);
+                }
+                Err(e) => {
+                    self.infra_error = Some(format!("{}: {}", provider.display_name(), e));
+                }
+            }
+        }
+
+        self.infra_loading = false;
+        self.infra_last_refresh = Instant::now();
+        self.selected_infra_instance = self
+            .selected_infra_instance
+            .min(self.infra_instances.len().saturating_sub(1));
+    }
+
+    fn refresh_infra_types(&mut self) {
+        self.infra_loading = true;
+        self.infra_error = None;
+        self.infra_types.clear();
+
+        let provider = self.selected_infra_provider;
+        let config = self.infra_config.get_provider_config(provider);
+
+        if let Some(api_key) = &config.api_key {
+            let client = get_provider(provider, api_key);
+            match client.list_instance_types() {
+                Ok(types) => {
+                    self.infra_types = types;
+                }
+                Err(e) => {
+                    self.infra_error = Some(format!("{}: {}", provider.display_name(), e));
+                }
+            }
+        } else {
+            self.infra_error = Some(format!(
+                "No API key configured for {}",
+                provider.display_name()
+            ));
+        }
+
+        self.infra_loading = false;
+        self.sort_infra_types();
+        self.selected_infra_type = self
+            .selected_infra_type
+            .min(self.infra_types.len().saturating_sub(1));
+    }
+
+    fn sort_infra_types(&mut self) {
+        match self.infra_type_sort {
+            InfraTypeSort::Name => self.infra_types.sort_by(|a, b| a.name.cmp(&b.name)),
+            InfraTypeSort::Price => self
+                .infra_types
+                .sort_by(|a, b| a.price_cents_per_hour.cmp(&b.price_cents_per_hour)),
+            InfraTypeSort::Vram => self
+                .infra_types
+                .sort_by(|a, b| b.gpu_memory_gib.cmp(&a.gpu_memory_gib)),
+        }
+    }
+
+    fn terminate_instance(&mut self, index: usize) {
+        if let Some(instance) = self.infra_instances.get(index) {
+            let provider = instance.provider;
+            let instance_id = instance.id.clone();
+            let config = self.infra_config.get_provider_config(provider);
+
+            if let Some(api_key) = &config.api_key {
+                let client = get_provider(provider, api_key);
+                if let Err(e) = client.terminate(&[instance_id]) {
+                    self.infra_error = Some(format!("Terminate failed: {}", e));
+                } else {
+                    self.refresh_infra();
+                }
+            }
+        }
+    }
+
+    fn launch_ssh(&self, instance: &Instance) -> Result<()> {
+        let ip = instance
+            .ip
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No IP address"))?;
+
+        let ssh_cmd = if ip.contains(':') {
+            let parts: Vec<&str> = ip.split(':').collect();
+            format!(
+                "ssh -o StrictHostKeyChecking=no -p {} {}@{}",
+                parts[1], instance.ssh_user, parts[0]
+            )
+        } else {
+            format!(
+                "ssh -o StrictHostKeyChecking=no {}@{}",
+                instance.ssh_user, ip
+            )
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+            let script = if term_program == "iTerm.app" {
+                format!(
+                    "tell application \"iTerm2\" to tell current window to create tab with default profile command \"{}\"",
+                    ssh_cmd
+                )
+            } else {
+                format!("tell application \"Terminal\" to do script \"{}\"", ssh_cmd)
+            };
+            std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            std::process::Command::new("x-terminal-emulator")
+                .args(["-e", &ssh_cmd])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+        }
+
+        Ok(())
+    }
+
+    fn do_launch_ssh_with_setup(&mut self, instance: &Instance) {
+        let ip = match instance.ip.as_ref() {
+            Some(ip) => ip.clone(),
+            None => {
+                self.infra_error = Some("No IP address available".to_string());
+                return;
+            }
+        };
+
+        let repo_path = self.session_repo_path.clone();
+        if repo_path.is_empty() {
+            self.infra_error = Some("No repository path specified".to_string());
+            return;
+        }
+
+        let ssh_user = instance.ssh_user.clone();
+        let python_version = self.session_python_version.clone();
+        let command = self.session_command.clone();
+        let skip_tmux = self.session_skip_tmux;
+        let (tx, rx) = mpsc::channel();
+        self.setup_rx = Some(rx);
+        self.infra_error = Some("Syncing code...".to_string());
+        self.infra_message_time = Some(Instant::now());
+
+        thread::spawn(move || {
+            let (host, port) = if ip.contains(':') {
+                let parts: Vec<&str> = ip.split(':').collect();
+                (parts[0].to_string(), Some(parts[1].to_string()))
+            } else {
+                (ip.clone(), None)
+            };
+
+            let ssh_port_args = port
+                .as_ref()
+                .map(|p| format!("-p {}", p))
+                .unwrap_or_default();
+
+            let ssh_base = if ssh_port_args.is_empty() {
+                format!("ssh -o StrictHostKeyChecking=no {}@{}", ssh_user, host)
+            } else {
+                format!(
+                    "ssh -o StrictHostKeyChecking=no {} {}@{}",
+                    ssh_port_args, ssh_user, host
+                )
+            };
+
+            let mut rsync_cmd = std::process::Command::new("rsync");
+            rsync_cmd
+                .args([
+                    "-az",
+                    "--exclude",
+                    ".git",
+                    "--exclude",
+                    "__pycache__",
+                    "--exclude",
+                    ".venv",
+                    "--exclude",
+                    "*.pyc",
+                    "--exclude",
+                    ".mypy_cache",
+                    "--exclude",
+                    "*.egg-info",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+
+            if let Some(p) = &port {
+                rsync_cmd.args(["-e", &format!("ssh -o StrictHostKeyChecking=no -p {}", p)]);
+            } else {
+                rsync_cmd.args(["-e", "ssh -o StrictHostKeyChecking=no"]);
+            }
+
+            let repo_with_slash = if repo_path.ends_with('/') {
+                repo_path.clone()
+            } else {
+                format!("{}/", repo_path)
+            };
+
+            rsync_cmd
+                .arg(&repo_with_slash)
+                .arg(format!("{}@{}:~/project/", ssh_user, host));
+
+            match rsync_cmd.status() {
+                Ok(status) if status.success() => {
+                    let _ = tx.send(SetupMessage::Status(
+                        "Code synced, copying config...".to_string(),
+                    ));
+                }
+                Ok(status) => {
+                    let _ = tx.send(SetupMessage::Error(format!(
+                        "rsync failed: exit {}",
+                        status
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(SetupMessage::Error(format!("rsync failed: {}", e)));
+                    return;
+                }
+            }
+
+            let s3_config_path = dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".extty")
+                .join("s3")
+                .join("config.toml");
+
+            if s3_config_path.exists() {
+                let mut scp_cmd = std::process::Command::new("bash");
+                scp_cmd
+                    .arg("-c")
+                    .arg(format!(
+                        "{} 'mkdir -p ~/.extty/s3' && scp -o StrictHostKeyChecking=no {} {} {}@{}:~/.extty/s3/config.toml",
+                        ssh_base,
+                        port.as_ref().map(|p| format!("-P {}", p)).unwrap_or_default(),
+                        s3_config_path.display(),
+                        ssh_user,
+                        host,
+                    ))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+
+                if let Ok(status) = scp_cmd.status()
+                    && !status.success()
+                {
+                    let _ = tx.send(SetupMessage::Status(
+                        "Warning: failed to copy S3 config".to_string(),
+                    ));
+                }
+            }
+
+            let _ = tx.send(SetupMessage::Status("Uploading script...".to_string()));
+
+            let script = generate_script(&python_version, &command, skip_tmux);
+
+            let upload_status = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "{} 'cat > /tmp/extty_bootstrap.sh && chmod +x /tmp/extty_bootstrap.sh'",
+                    ssh_base
+                ))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        stdin.write_all(script.as_bytes())?;
+                    }
+                    child.wait()
+                });
+
+            match upload_status {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    let _ = tx.send(SetupMessage::Error(format!(
+                        "Script upload failed: exit {}",
+                        status
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(SetupMessage::Error(format!("Script upload failed: {}", e)));
+                    return;
+                }
+            }
+
+            let ssh_cmd = format!("{} -t 'bash /tmp/extty_bootstrap.sh'", ssh_base);
+
+            #[cfg(target_os = "macos")]
+            {
+                let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+                let applescript = if term_program == "iTerm.app" {
+                    format!(
+                        "tell application \"iTerm2\" to tell current window to create tab with default profile command \"{}\"",
+                        ssh_cmd.replace('"', "\\\"")
+                    )
+                } else {
+                    format!(
+                        "tell application \"Terminal\" to do script \"{}\"",
+                        ssh_cmd.replace('"', "\\\"")
+                    )
+                };
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", &applescript])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("x-terminal-emulator")
+                    .args(["-e", "bash", "-c", &ssh_cmd])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+
+            let _ = tx.send(SetupMessage::Done("SSH session launched".to_string()));
+        });
+    }
+
+    fn filtered_infra_instances(&self) -> Vec<&Instance> {
+        self.infra_instances
+            .iter()
+            .filter(|i| i.provider == self.selected_infra_provider)
+            .collect()
     }
 
     fn grid_layout(&self) -> (usize, usize) {
@@ -391,7 +872,9 @@ impl App {
             View::Focused => match self.view_mode {
                 ViewMode::Runs => self.cards(),
                 ViewMode::Models => self.model_cards(),
+                ViewMode::Infra => vec![],
             },
+            View::InfraList | View::InfraConfig | View::S3Config => vec![],
         }
     }
 
@@ -436,7 +919,7 @@ impl App {
             }
             Some(Card::Evaluation { name }) => {
                 let eval = match self.view_mode {
-                    ViewMode::Runs => None,
+                    ViewMode::Runs | ViewMode::Infra => None,
                     ViewMode::Models => self.get_model_evaluation(name),
                 };
                 if let Some(eval) = eval {
@@ -467,9 +950,20 @@ impl App {
         line_count.saturating_sub(visible_height)
     }
 
-    fn handle_key(&mut self, code: KeyCode) {
+    fn handle_key(&mut self, key: KeyEvent) {
+        let code = key.code;
+        let modifiers = key.modifiers;
+
+        if self.session_modal_open {
+            self.handle_session_modal_key(code);
+            return;
+        }
         if self.show_delete_confirm {
             self.handle_delete_confirm_key(code);
+            return;
+        }
+        if self.show_terminate_confirm {
+            self.handle_terminate_confirm_key(code);
             return;
         }
 
@@ -477,6 +971,7 @@ impl App {
             View::List => match self.view_mode {
                 ViewMode::Runs => self.handle_list_key(code),
                 ViewMode::Models => self.handle_model_list_key(code),
+                ViewMode::Infra => self.handle_infra_list_key(code, modifiers),
             },
             View::RunDetail => {
                 let (visible_rows, cols) = self.grid_layout();
@@ -487,6 +982,9 @@ impl App {
                 self.handle_model_detail_key(code, visible_rows, cols);
             }
             View::Focused => self.handle_focused_key(code),
+            View::InfraList => self.handle_infra_list_key(code, modifiers),
+            View::InfraConfig => self.handle_infra_config_key(code),
+            View::S3Config => self.handle_s3_config_key(code),
         }
     }
 
@@ -547,6 +1045,18 @@ impl App {
                 self.selected_card = 0;
                 self.scroll_offset = 0;
             }
+            KeyCode::Char('i') => {
+                self.view_mode = ViewMode::Infra;
+                self.view = View::InfraList;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Char('S') => {
+                self.view = View::S3Config;
+                self.s3_config_field = 0;
+                self.s3_config_editing = false;
+                self.s3_config_message = None;
+            }
             KeyCode::Up if self.selected_list_item > 0 => {
                 self.selected_list_item -= 1;
             }
@@ -593,10 +1103,22 @@ impl App {
 
         match code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('m') => {
+            KeyCode::Char('r') => {
                 self.view_mode = ViewMode::Runs;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+            }
+            KeyCode::Char('i') => {
+                self.view_mode = ViewMode::Infra;
+                self.view = View::InfraList;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Char('S') => {
+                self.view = View::S3Config;
+                self.s3_config_field = 0;
+                self.s3_config_editing = false;
+                self.s3_config_message = None;
             }
             KeyCode::Up if self.selected_model_list_item > 0 => {
                 self.selected_model_list_item -= 1;
@@ -752,6 +1274,7 @@ impl App {
         let (card_count, cards) = match self.view_mode {
             ViewMode::Runs => (self.card_count(), self.cards()),
             ViewMode::Models => (self.model_card_count(), self.model_cards()),
+            ViewMode::Infra => (0, vec![]),
         };
         let current_card = cards.get(self.selected_card);
 
@@ -762,7 +1285,7 @@ impl App {
                 .map(|e| e.len())
                 .unwrap_or(0),
             Some(Card::Evaluation { name }) => match self.view_mode {
-                ViewMode::Runs => 0,
+                ViewMode::Runs | ViewMode::Infra => 0,
                 ViewMode::Models => self
                     .get_model_evaluation(name)
                     .map(|e| e.examples.len())
@@ -808,6 +1331,7 @@ impl App {
                 self.view = match self.view_mode {
                     ViewMode::Runs => View::RunDetail,
                     ViewMode::Models => View::ModelDetail,
+                    ViewMode::Infra => View::InfraList,
                 };
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
@@ -927,11 +1451,491 @@ impl App {
             _ => {}
         }
     }
+
+    fn handle_terminate_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(idx) = self.pending_terminate_instance {
+                    self.terminate_instance(idx);
+                }
+                self.show_terminate_confirm = false;
+                self.pending_terminate_instance = None;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.show_terminate_confirm = false;
+                self.pending_terminate_instance = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_infra_list_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if self.launch_confirming {
+            self.handle_infra_launch_confirm_key(code);
+            return;
+        }
+        if self.launch_selecting_region {
+            self.handle_infra_region_select_key(code);
+            return;
+        }
+
+        let instances = self.filtered_infra_instances();
+        let instance_count = instances.len();
+        let type_count = self.infra_types.len();
+
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('r') => {
+                self.view_mode = ViewMode::Runs;
+                self.view = View::List;
+            }
+            KeyCode::Char('m') => {
+                self.view_mode = ViewMode::Models;
+                self.view = View::List;
+            }
+            KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                self.infra_active_panel = match self.infra_active_panel {
+                    InfraPanel::Instances => InfraPanel::Types,
+                    InfraPanel::Types => InfraPanel::Instances,
+                };
+            }
+            KeyCode::Up => match self.infra_active_panel {
+                InfraPanel::Instances if self.selected_infra_instance > 0 => {
+                    self.selected_infra_instance -= 1;
+                }
+                InfraPanel::Types if self.selected_infra_type > 0 => {
+                    self.selected_infra_type -= 1;
+                }
+                _ => {}
+            },
+            KeyCode::Down => match self.infra_active_panel {
+                InfraPanel::Instances
+                    if self.selected_infra_instance < instance_count.saturating_sub(1) =>
+                {
+                    self.selected_infra_instance += 1;
+                }
+                InfraPanel::Types if self.selected_infra_type < type_count.saturating_sub(1) => {
+                    self.selected_infra_type += 1;
+                }
+                _ => {}
+            },
+            KeyCode::Char('1') => {
+                self.selected_infra_provider = Provider::Lambda;
+                self.selected_infra_instance = 0;
+                self.selected_infra_type = 0;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Char('2') => {
+                self.selected_infra_provider = Provider::Vast;
+                self.selected_infra_instance = 0;
+                self.selected_infra_type = 0;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Char('3') => {
+                self.selected_infra_provider = Provider::Prime;
+                self.selected_infra_instance = 0;
+                self.selected_infra_type = 0;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Enter => match self.infra_active_panel {
+                InfraPanel::Instances => {
+                    let instances = self.filtered_infra_instances();
+                    if let Some(instance) = instances.get(self.selected_infra_instance)
+                        && instance.ip.is_some()
+                    {
+                        let instance_clone = (*instance).clone();
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            self.open_session_modal(&instance_clone);
+                        } else {
+                            let _ = self.launch_ssh(&instance_clone);
+                        }
+                    }
+                }
+                InfraPanel::Types if type_count > 0 => {
+                    if let Some(instance_type) = self.infra_types.get(self.selected_infra_type) {
+                        if instance_type.regions.is_empty() {
+                            self.infra_error = Some("No availability for this type".to_string());
+                        } else if instance_type.regions.len() == 1 {
+                            self.launch_selected_region = 0;
+                            self.launch_name_input.clear();
+                            self.launch_confirming = true;
+                        } else {
+                            self.launch_selected_region = 0;
+                            self.launch_selecting_region = true;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Char('S') if self.infra_active_panel == InfraPanel::Instances => {
+                let instances = self.filtered_infra_instances();
+                if let Some(instance) = instances.get(self.selected_infra_instance)
+                    && instance.ip.is_some()
+                {
+                    let instance_clone = (*instance).clone();
+                    self.open_session_modal(&instance_clone);
+                }
+            }
+            KeyCode::Char('x') if self.infra_active_panel == InfraPanel::Instances => {
+                if instance_count > 0 && self.selected_infra_instance < instance_count {
+                    self.pending_terminate_instance = Some(self.selected_infra_instance);
+                    self.show_terminate_confirm = true;
+                }
+            }
+            KeyCode::Char('R') => {
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Char('c') => {
+                self.view = View::InfraConfig;
+                self.config_provider_index = 0;
+                self.config_editing_key = false;
+                self.config_api_key_input.clear();
+            }
+            KeyCode::Char('s') if self.infra_active_panel == InfraPanel::Types => {
+                self.infra_type_sort = self.infra_type_sort.next();
+                self.sort_infra_types();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_infra_launch_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.do_launch_instance();
+                self.launch_confirming = false;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.launch_confirming = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_infra_region_select_key(&mut self, code: KeyCode) {
+        let regions_count = self
+            .infra_types
+            .get(self.selected_infra_type)
+            .map(|t| t.regions.len())
+            .unwrap_or(0);
+
+        match code {
+            KeyCode::Esc => {
+                self.launch_selecting_region = false;
+            }
+            KeyCode::Up if self.launch_selected_region > 0 => {
+                self.launch_selected_region -= 1;
+            }
+            KeyCode::Down if self.launch_selected_region < regions_count.saturating_sub(1) => {
+                self.launch_selected_region += 1;
+            }
+            KeyCode::Enter => {
+                self.launch_selecting_region = false;
+                self.launch_confirming = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_infra_config_key(&mut self, code: KeyCode) {
+        let providers = Provider::all();
+
+        if self.config_editing_key {
+            match code {
+                KeyCode::Esc => {
+                    self.config_editing_key = false;
+                    self.config_api_key_input.clear();
+                }
+                KeyCode::Enter => {
+                    let provider = providers[self.config_provider_index];
+                    let api_key = if self.config_api_key_input.is_empty() {
+                        None
+                    } else {
+                        Some(self.config_api_key_input.clone())
+                    };
+
+                    match provider {
+                        Provider::Lambda => self.infra_config.lambda_config.api_key = api_key,
+                        Provider::Vast => self.infra_config.vast.api_key = api_key,
+                        Provider::Prime => self.infra_config.prime.api_key = api_key,
+                    }
+
+                    let _ = save_config(&self.infra_config);
+                    self.config_editing_key = false;
+                    self.config_api_key_input.clear();
+                }
+                KeyCode::Backspace => {
+                    self.config_api_key_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.config_api_key_input.push(c);
+                }
+                _ => {}
+            }
+        } else {
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.view = View::InfraList;
+                }
+                KeyCode::Up if self.config_provider_index > 0 => {
+                    self.config_provider_index -= 1;
+                }
+                KeyCode::Down if self.config_provider_index < providers.len().saturating_sub(1) => {
+                    self.config_provider_index += 1;
+                }
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    self.config_editing_key = true;
+                    let provider = providers[self.config_provider_index];
+                    let current_key = match provider {
+                        Provider::Lambda => &self.infra_config.lambda_config.api_key,
+                        Provider::Vast => &self.infra_config.vast.api_key,
+                        Provider::Prime => &self.infra_config.prime.api_key,
+                    };
+                    self.config_api_key_input = current_key.clone().unwrap_or_default();
+                }
+                KeyCode::Char('d') => {
+                    let provider = providers[self.config_provider_index];
+                    match provider {
+                        Provider::Lambda => self.infra_config.lambda_config.api_key = None,
+                        Provider::Vast => self.infra_config.vast.api_key = None,
+                        Provider::Prime => self.infra_config.prime.api_key = None,
+                    }
+                    let _ = save_config(&self.infra_config);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_s3_config_key(&mut self, code: KeyCode) {
+        const FIELD_COUNT: usize = 6;
+        let field_names = [
+            "bucket",
+            "prefix",
+            "region",
+            "access_key_id",
+            "secret_access_key",
+            "endpoint_url",
+        ];
+
+        if self.s3_config_editing {
+            match code {
+                KeyCode::Esc => {
+                    self.s3_config_editing = false;
+                    self.s3_config_input.clear();
+                }
+                KeyCode::Enter => {
+                    let value = if self.s3_config_input.is_empty() {
+                        None
+                    } else {
+                        Some(self.s3_config_input.clone())
+                    };
+
+                    match self.s3_config_field {
+                        0 => self.s3_config.bucket = value.unwrap_or_default(),
+                        1 => self.s3_config.prefix = value.unwrap_or_default(),
+                        2 => self.s3_config.region = value,
+                        3 => self.s3_config.access_key_id = value,
+                        4 => self.s3_config.secret_access_key = value,
+                        5 => self.s3_config.endpoint_url = value,
+                        _ => {}
+                    }
+
+                    match s3::save_config(&self.s3_config) {
+                        Ok(()) => self.s3_config_message = Some("Saved".to_string()),
+                        Err(e) => self.s3_config_message = Some(format!("Error: {}", e)),
+                    }
+                    self.s3_config_editing = false;
+                    self.s3_config_input.clear();
+                }
+                KeyCode::Backspace => {
+                    self.s3_config_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.s3_config_input.push(c);
+                }
+                _ => {}
+            }
+        } else {
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.view = View::List;
+                    self.view_mode = ViewMode::Runs;
+                }
+                KeyCode::Up if self.s3_config_field > 0 => {
+                    self.s3_config_field -= 1;
+                    self.s3_config_message = None;
+                }
+                KeyCode::Down if self.s3_config_field < FIELD_COUNT - 1 => {
+                    self.s3_config_field += 1;
+                    self.s3_config_message = None;
+                }
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    self.s3_config_editing = true;
+                    self.s3_config_input = match self.s3_config_field {
+                        0 => self.s3_config.bucket.clone(),
+                        1 => self.s3_config.prefix.clone(),
+                        2 => self.s3_config.region.clone().unwrap_or_default(),
+                        3 => self.s3_config.access_key_id.clone().unwrap_or_default(),
+                        4 => self.s3_config.secret_access_key.clone().unwrap_or_default(),
+                        5 => self.s3_config.endpoint_url.clone().unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    self.s3_config_message = None;
+                }
+                KeyCode::Char('d') => {
+                    match self.s3_config_field {
+                        0 => self.s3_config.bucket.clear(),
+                        1 => self.s3_config.prefix.clear(),
+                        2 => self.s3_config.region = None,
+                        3 => self.s3_config.access_key_id = None,
+                        4 => self.s3_config.secret_access_key = None,
+                        5 => self.s3_config.endpoint_url = None,
+                        _ => {}
+                    }
+                    match s3::save_config(&self.s3_config) {
+                        Ok(()) => self.s3_config_message = Some("Cleared".to_string()),
+                        Err(e) => self.s3_config_message = Some(format!("Error: {}", e)),
+                    }
+                }
+                _ => {}
+            }
+        }
+        let _ = field_names;
+    }
+
+    fn handle_session_modal_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.session_modal_open = false;
+                self.session_modal_instance = None;
+            }
+            KeyCode::Tab => {
+                self.session_modal_focus = match self.session_modal_focus {
+                    SessionModalField::PythonVersion => SessionModalField::RepoPath,
+                    SessionModalField::RepoPath => SessionModalField::Command,
+                    SessionModalField::Command => SessionModalField::SkipTmux,
+                    SessionModalField::SkipTmux => SessionModalField::PythonVersion,
+                };
+            }
+            KeyCode::BackTab => {
+                self.session_modal_focus = match self.session_modal_focus {
+                    SessionModalField::PythonVersion => SessionModalField::SkipTmux,
+                    SessionModalField::RepoPath => SessionModalField::PythonVersion,
+                    SessionModalField::Command => SessionModalField::RepoPath,
+                    SessionModalField::SkipTmux => SessionModalField::Command,
+                };
+            }
+            KeyCode::Char(' ') if self.session_modal_focus == SessionModalField::SkipTmux => {
+                self.session_skip_tmux = !self.session_skip_tmux;
+            }
+            KeyCode::Char(c) => match self.session_modal_focus {
+                SessionModalField::PythonVersion => self.session_python_version.push(c),
+                SessionModalField::RepoPath => self.session_repo_path.push(c),
+                SessionModalField::Command => self.session_command.push(c),
+                SessionModalField::SkipTmux => {}
+            },
+            KeyCode::Backspace => match self.session_modal_focus {
+                SessionModalField::PythonVersion => {
+                    self.session_python_version.pop();
+                }
+                SessionModalField::RepoPath => {
+                    self.session_repo_path.pop();
+                }
+                SessionModalField::Command => {
+                    self.session_command.pop();
+                }
+                SessionModalField::SkipTmux => {}
+            },
+            KeyCode::Enter => {
+                if let Some(instance) = self.session_modal_instance.take() {
+                    self.do_launch_ssh_with_setup(&instance);
+                }
+                self.session_modal_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn open_session_modal(&mut self, instance: &Instance) {
+        self.session_skip_tmux = false;
+        self.session_modal_instance = Some(instance.clone());
+        self.session_modal_focus = SessionModalField::PythonVersion;
+        self.session_modal_open = true;
+    }
+
+    fn do_launch_instance(&mut self) {
+        let provider = self.selected_infra_provider;
+        let config = self.infra_config.get_provider_config(provider);
+
+        let Some(api_key) = &config.api_key else {
+            self.infra_error = Some(format!("No API key for {}", provider.display_name()));
+            return;
+        };
+
+        let Some(instance_type) = self.infra_types.get(self.selected_infra_type) else {
+            self.infra_error = Some("No instance type selected".to_string());
+            return;
+        };
+
+        let region = if instance_type.regions.is_empty() {
+            config.default_region.clone()
+        } else {
+            instance_type
+                .regions
+                .get(self.launch_selected_region)
+                .cloned()
+        };
+
+        let name = if self.launch_name_input.is_empty() {
+            None
+        } else {
+            Some(self.launch_name_input.clone())
+        };
+
+        let ssh_key_names = config.ssh_key_name.as_ref().map(|k| vec![k.clone()]);
+
+        let opts = infra::models::LaunchOptions {
+            instance_type: instance_type.name.clone(),
+            region,
+            ssh_key_names,
+            name,
+        };
+
+        let client = get_provider(provider, api_key);
+        match client.launch(&opts) {
+            Ok(ids) => {
+                self.infra_error = None;
+                self.refresh_infra();
+                self.infra_active_panel = InfraPanel::Instances;
+                if !ids.is_empty() {
+                    self.infra_error = Some(format!("Launched: {}", ids.join(", ")));
+                    self.infra_message_time = Some(Instant::now());
+                }
+            }
+            Err(e) => {
+                self.infra_error = Some(format!("Launch failed: {}", e));
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
-    let options = parse_options()?;
+    let command = parse_command()?;
 
+    match command {
+        Command::Tui(options) => run_tui(options),
+        Command::Pull(options) => run_s3_command("pull", options),
+        Command::Push(options) => run_s3_command("push", options),
+        Command::Sync(options) => run_s3_command("sync", options),
+    }
+}
+
+fn run_tui(options: TuiOptions) -> Result<()> {
     let sync_rx: Option<Receiver<SyncMessage>> = if let Some(remote_url) = options.remote_url {
         let runs_dir = remote_runs_dir();
         let token = options
@@ -985,6 +1989,47 @@ fn main() -> Result<()> {
             last_list_refresh = Instant::now();
         }
 
+        // Auto-refresh infra instances when viewing infra tab (every 5 seconds)
+        if app.view_mode == ViewMode::Infra
+            && !app.show_config
+            && app.infra_last_refresh.elapsed() >= Duration::from_secs(5)
+        {
+            app.refresh_infra();
+        }
+
+        // Poll setup background task
+        if let Some(rx) = &app.setup_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    SetupMessage::Status(s) => {
+                        app.infra_error = Some(s);
+                        app.infra_message_time = Some(Instant::now());
+                    }
+                    SetupMessage::Done(s) => {
+                        app.infra_error = Some(s);
+                        app.infra_message_time = Some(Instant::now());
+                        app.setup_rx = None;
+                        break;
+                    }
+                    SetupMessage::Error(s) => {
+                        app.infra_error = Some(s);
+                        app.infra_message_time = Some(Instant::now());
+                        app.setup_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Clear transient infra messages after 3 seconds
+        if let Some(msg_time) = app.infra_message_time
+            && msg_time.elapsed() >= Duration::from_secs(3)
+            && app.setup_rx.is_none()
+        {
+            app.infra_error = None;
+            app.infra_message_time = None;
+        }
+
         // Draw the UI
         terminal.draw(|frame| render(&app, frame))?;
 
@@ -994,7 +2039,7 @@ fn main() -> Result<()> {
         {
             // Only handle key press, not release
             if key.kind == KeyEventKind::Press {
-                app.handle_key(key.code);
+                app.handle_key(key);
             }
         }
     }
@@ -1005,41 +2050,295 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-struct Options {
+fn run_s3_command(cmd: &str, options: SyncOptions) -> Result<()> {
+    let config = s3::load_config()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "S3 not configured. Create ~/.extty/s3/config.toml with:\n\n\
+             bucket = \"your-bucket\"\n\
+             region = \"us-west-2\"\n"
+        )
+    })?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let client = s3::S3Client::new(config).await?;
+        let runs_dir = runs_dir();
+
+        let (project_filter, run_filter) = parse_target(&options.target);
+
+        match cmd {
+            "pull" => {
+                let runs = client.list_runs(project_filter.as_deref()).await?;
+                let runs_to_sync: Vec<_> = runs
+                    .into_iter()
+                    .filter(|r| run_filter.as_ref().is_none_or(|rf| r.name == *rf))
+                    .collect();
+
+                if runs_to_sync.is_empty() {
+                    println!("No runs found to pull.");
+                    return Ok(());
+                }
+
+                for run in runs_to_sync {
+                    client
+                        .download_run(
+                            &run.project,
+                            &run.name,
+                            &runs_dir,
+                            options.force,
+                            options.dry_run,
+                        )
+                        .await?;
+                    if !options.dry_run {
+                        println!("Pulled: {}/{}", run.project, run.name);
+                    }
+                }
+            }
+            "push" => {
+                let local_runs = list_local_runs(&runs_dir, project_filter.as_deref())?;
+                let runs_to_sync: Vec<_> = local_runs
+                    .into_iter()
+                    .filter(|(_, name)| run_filter.as_ref().is_none_or(|rf| name == rf))
+                    .collect();
+
+                if runs_to_sync.is_empty() {
+                    println!("No runs found to push.");
+                    return Ok(());
+                }
+
+                for (project, name) in runs_to_sync {
+                    client
+                        .upload_run(&project, &name, &runs_dir, options.force, options.dry_run)
+                        .await?;
+                    if !options.dry_run {
+                        println!("Pushed: {}/{}", project, name);
+                    }
+                }
+            }
+            "sync" => {
+                let remote_runs = client.list_runs(project_filter.as_deref()).await?;
+                let local_runs = list_local_runs(&runs_dir, project_filter.as_deref())?;
+
+                let mut all_runs: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                for r in &remote_runs {
+                    all_runs.insert((r.project.clone(), r.name.clone()));
+                }
+                for (p, n) in &local_runs {
+                    all_runs.insert((p.clone(), n.clone()));
+                }
+
+                let runs_to_sync: Vec<_> = all_runs
+                    .into_iter()
+                    .filter(|(_, name)| run_filter.as_ref().is_none_or(|rf| name == rf))
+                    .collect();
+
+                if runs_to_sync.is_empty() {
+                    println!("No runs found to sync.");
+                    return Ok(());
+                }
+
+                for (project, name) in runs_to_sync {
+                    client
+                        .sync_run(&project, &name, &runs_dir, options.dry_run)
+                        .await?;
+                    if !options.dry_run {
+                        println!("Synced: {}/{}", project, name);
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(())
+    })
+}
+
+fn parse_target(target: &Option<String>) -> (Option<String>, Option<String>) {
+    match target {
+        None => (None, None),
+        Some(t) => {
+            if t.ends_with('/') {
+                (Some(t.trim_end_matches('/').to_string()), None)
+            } else if t.contains('/') {
+                let parts: Vec<&str> = t.splitn(2, '/').collect();
+                (Some(parts[0].to_string()), Some(parts[1].to_string()))
+            } else {
+                (Some(t.clone()), None)
+            }
+        }
+    }
+}
+
+fn runs_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".extty")
+        .join("runs")
+}
+
+fn list_local_runs(
+    runs_dir: &PathBuf,
+    project_filter: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let mut runs = Vec::new();
+
+    if !runs_dir.exists() {
+        return Ok(runs);
+    }
+
+    for proj_entry in std::fs::read_dir(runs_dir)? {
+        let proj_entry = proj_entry?;
+        let proj_path = proj_entry.path();
+        if !proj_path.is_dir() {
+            continue;
+        }
+
+        let proj_name = proj_entry.file_name().to_string_lossy().to_string();
+        if let Some(filter) = project_filter
+            && proj_name != filter
+        {
+            continue;
+        }
+
+        for run_entry in std::fs::read_dir(&proj_path)? {
+            let run_entry = run_entry?;
+            let run_path = run_entry.path();
+            if run_path.is_dir() && run_path.join("meta.json").exists() {
+                runs.push((
+                    proj_name.clone(),
+                    run_entry.file_name().to_string_lossy().to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(runs)
+}
+
+enum Command {
+    Tui(TuiOptions),
+    Pull(SyncOptions),
+    Push(SyncOptions),
+    Sync(SyncOptions),
+}
+
+struct TuiOptions {
     remote_url: Option<String>,
     token: Option<String>,
 }
 
-fn parse_options() -> Result<Options> {
+struct SyncOptions {
+    target: Option<String>,
+    force: bool,
+    dry_run: bool,
+}
+
+fn parse_command() -> Result<Command> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.is_empty() {
+        return Ok(Command::Tui(TuiOptions {
+            remote_url: None,
+            token: None,
+        }));
+    }
+
+    match args[0].as_str() {
+        "pull" | "push" | "sync" => {
+            let cmd = args.remove(0);
+            let opts = parse_sync_options(&mut args)?;
+            match cmd.as_str() {
+                "pull" => Ok(Command::Pull(opts)),
+                "push" => Ok(Command::Push(opts)),
+                "sync" => Ok(Command::Sync(opts)),
+                _ => unreachable!(),
+            }
+        }
+        "--remote" | "--token" => {
+            let opts = parse_tui_options(&mut args)?;
+            Ok(Command::Tui(opts))
+        }
+        other if other.starts_with('-') => Err(anyhow::anyhow!("Unknown option: {}", other)),
+        _ => Err(anyhow::anyhow!(
+            "Unknown command: {}. Valid commands: pull, push, sync",
+            args[0]
+        )),
+    }
+}
+
+fn parse_tui_options(args: &mut Vec<String>) -> Result<TuiOptions> {
     let mut remote_url = None;
     let mut token = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
+
+    while !args.is_empty() {
+        match args[0].as_str() {
             "--remote" => {
+                args.remove(0);
                 remote_url = Some(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--remote requires a URL"))?,
+                    args.first()
+                        .ok_or_else(|| anyhow::anyhow!("--remote requires a URL"))?
+                        .clone(),
                 );
+                args.remove(0);
             }
             "--token" => {
+                args.remove(0);
                 token = Some(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--token requires a value"))?,
+                    args.first()
+                        .ok_or_else(|| anyhow::anyhow!("--token requires a value"))?
+                        .clone(),
                 );
+                args.remove(0);
             }
             other => {
                 return Err(anyhow::anyhow!("Unknown option: {}", other));
             }
         }
     }
-    Ok(Options { remote_url, token })
+
+    Ok(TuiOptions { remote_url, token })
+}
+
+fn parse_sync_options(args: &mut Vec<String>) -> Result<SyncOptions> {
+    let mut target = None;
+    let mut force = false;
+    let mut dry_run = false;
+
+    while !args.is_empty() {
+        match args[0].as_str() {
+            "-f" | "--force" => {
+                force = true;
+                args.remove(0);
+            }
+            "-n" | "--dry-run" => {
+                dry_run = true;
+                args.remove(0);
+            }
+            s if s.starts_with('-') => {
+                return Err(anyhow::anyhow!("Unknown option: {}", s));
+            }
+            _ => {
+                if target.is_none() {
+                    target = Some(args.remove(0));
+                } else {
+                    return Err(anyhow::anyhow!("Unexpected argument: {}", args[0]));
+                }
+            }
+        }
+    }
+
+    Ok(SyncOptions {
+        target,
+        force,
+        dry_run,
+    })
 }
 
 fn remote_runs_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ex")
+        .join(".extty")
         .join("remote_runs")
 }
 
@@ -1048,14 +2347,21 @@ fn render(app: &App, frame: &mut Frame) {
         View::List => match app.view_mode {
             ViewMode::Runs => render_runs_list(app, frame),
             ViewMode::Models => render_models_list(app, frame),
+            ViewMode::Infra => render_infra_dashboard(app, frame),
         },
         View::RunDetail => render_run_detail(app, frame),
         View::ModelDetail => render_model_detail(app, frame),
         View::Focused => render_focused(app, frame),
+        View::InfraList => render_infra_dashboard(app, frame),
+        View::InfraConfig => render_infra_config(app, frame),
+        View::S3Config => render_s3_config(app, frame),
     }
 
     if app.show_delete_confirm {
         render_delete_confirm(app, frame);
+    }
+    if app.show_terminate_confirm {
+        render_terminate_confirm(app, frame);
     }
 }
 
@@ -1173,6 +2479,8 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled("[Runs]", Style::default().fg(NEON_CYAN).bold()),
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("Models", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Infra", Style::default().fg(Color::DarkGray)),
         Span::styled(" ", Style::default()),
     ]);
 
@@ -1194,8 +2502,11 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled("m", Style::default().fg(NEON_YELLOW)),
         Span::styled("] models  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("i", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] infra  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-        Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Tab", Style::default().fg(NEON_CYAN)),
         Span::styled("] expand  ", Style::default().fg(Color::DarkGray)),
@@ -1299,6 +2610,8 @@ fn render_models_list(app: &App, frame: &mut Frame) {
         Span::styled("Runs", Style::default().fg(Color::DarkGray)),
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("[Models]", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Infra", Style::default().fg(Color::DarkGray)),
         Span::styled(" ", Style::default()),
     ]);
 
@@ -1317,11 +2630,14 @@ fn render_models_list(app: &App, frame: &mut Frame) {
 
     let help = Line::from(vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("m", Style::default().fg(NEON_YELLOW)),
+        Span::styled("r", Style::default().fg(NEON_YELLOW)),
         Span::styled("] runs  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("i", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] infra  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-        Span::styled("] navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Tab", Style::default().fg(NEON_CYAN)),
         Span::styled("] expand  ", Style::default().fg(Color::DarkGray)),
@@ -2089,6 +3405,7 @@ fn render_focused(app: &App, frame: &mut Frame) {
     match app.view_mode {
         ViewMode::Runs => render_focused_run(app, frame, area),
         ViewMode::Models => render_focused_model(app, frame, area),
+        ViewMode::Infra => {}
     }
 }
 
@@ -3044,4 +4361,1041 @@ fn render_delete_confirm(app: &App, frame: &mut Frame) {
         .alignment(Alignment::Center);
 
     frame.render_widget(paragraph, popup_area);
+}
+
+fn render_infra_dashboard(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(10),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_infra_provider_tabs(app, frame, v_chunks[0]);
+
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(v_chunks[1]);
+
+    render_infra_instances_panel(app, frame, h_chunks[0]);
+    render_infra_types_panel(app, frame, h_chunks[1]);
+    render_infra_help_bar(app, frame, v_chunks[2]);
+
+    if app.launch_selecting_region {
+        render_infra_region_popup(app, frame);
+    }
+    if app.launch_confirming {
+        render_infra_launch_confirm(app, frame);
+    }
+    if app.session_modal_open {
+        render_session_modal(app, frame);
+    }
+}
+
+fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
+    let lambda_configured = app.infra_config.lambda_config.api_key.is_some();
+    let vast_configured = app.infra_config.vast.api_key.is_some();
+    let prime_configured = app.infra_config.prime.api_key.is_some();
+
+    let lambda_selected = app.selected_infra_provider == Provider::Lambda;
+    let vast_selected = app.selected_infra_provider == Provider::Vast;
+    let prime_selected = app.selected_infra_provider == Provider::Prime;
+
+    let spans = vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("Runs", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Models", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("[Infra]", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled("   Provider: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            if lambda_selected {
+                "[λ Lambda"
+            } else {
+                "λ Lambda"
+            },
+            if lambda_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if lambda_configured {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(
+            if lambda_configured { " ✓" } else { " ✗" },
+            Style::default().fg(if lambda_configured {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            if lambda_selected { "]" } else { "" },
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            if vast_selected { "[V Vast" } else { "V Vast" },
+            if vast_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if vast_configured {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(
+            if vast_configured { " ✓" } else { " ✗" },
+            Style::default().fg(if vast_configured {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            if vast_selected { "]" } else { "" },
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            if prime_selected {
+                "[P Prime"
+            } else {
+                "P Prime"
+            },
+            if prime_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if prime_configured {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(
+            if prime_configured { " ✓" } else { " ✗" },
+            Style::default().fg(if prime_configured {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            if prime_selected { "]" } else { "" },
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+        Span::styled("          ", Style::default()),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("c", Style::default().fg(NEON_CYAN)),
+        Span::styled("] config", Style::default().fg(Color::DarkGray)),
+    ];
+
+    let line = Line::from(spans);
+    let para = Paragraph::new(line);
+    frame.render_widget(para, area);
+}
+
+fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
+    let instances = app.filtered_infra_instances();
+    let is_focused = app.infra_active_panel == InfraPanel::Instances;
+
+    let title = Line::from(vec![Span::styled(
+        format!(" ◆ Active Instances ({}) ", instances.len()),
+        Style::default()
+            .fg(if is_focused { NEON_CYAN } else { Color::Gray })
+            .bold(),
+    )]);
+
+    let border_color = if is_focused { NEON_CYAN } else { DIM_CYAN };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    if app.infra_loading {
+        let loading = Paragraph::new(Span::styled("Loading...", Style::default().fg(NEON_YELLOW)))
+            .block(block);
+        frame.render_widget(loading, area);
+        return;
+    }
+
+    if instances.is_empty() {
+        let empty_text = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No active instances",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press → or Tab to browse",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "available instance types",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "and launch a new instance.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        let empty = Paragraph::new(empty_text).block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = instances
+        .iter()
+        .enumerate()
+        .map(|(i, instance)| {
+            let is_selected = is_focused && i == app.selected_infra_instance;
+
+            let (status_icon, status_color) = match instance.status {
+                InstanceStatus::Running => ("●", NEON_GREEN),
+                InstanceStatus::Booting | InstanceStatus::Pending => ("○", NEON_YELLOW),
+                InstanceStatus::Stopping => ("◐", NEON_YELLOW),
+                InstanceStatus::Stopped => ("○", Color::DarkGray),
+                InstanceStatus::Terminated => ("×", Color::DarkGray),
+                InstanceStatus::Error => ("!", NEON_MAGENTA),
+            };
+
+            let name_style = if is_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if instance.status.is_active() {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let provider_char = match instance.provider {
+                Provider::Lambda => "λ",
+                Provider::Vast => "V",
+                Provider::Prime => "P",
+            };
+
+            let ip_display = instance.ip.as_deref().unwrap_or("pending...");
+
+            let line1 = Line::from(vec![
+                Span::styled(
+                    format!("{} ", status_icon),
+                    Style::default().fg(status_color),
+                ),
+                Span::styled(instance.display_name().to_string(), name_style),
+                Span::styled("  ", Style::default()),
+                Span::styled(provider_char, Style::default().fg(Color::DarkGray)),
+                Span::styled("  ", Style::default()),
+                Span::styled(&instance.instance_type, Style::default().fg(NEON_YELLOW)),
+            ]);
+
+            let line2 = Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    instance.status.as_str().to_string(),
+                    Style::default().fg(status_color),
+                ),
+                Span::styled("  ", Style::default()),
+                Span::styled(&instance.region, Style::default().fg(Color::DarkGray)),
+                Span::styled("  ", Style::default()),
+                Span::styled(ip_display, Style::default().fg(NEON_CYAN)),
+            ]);
+
+            ListItem::new(vec![line1, line2])
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    if is_focused {
+        state.select(Some(app.selected_infra_instance));
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
+    let is_focused = app.infra_active_panel == InfraPanel::Types;
+
+    let title = Line::from(vec![
+        Span::styled(
+            format!(" ◆ Instance Types ({}) ", app.infra_types.len()),
+            Style::default()
+                .fg(if is_focused { NEON_CYAN } else { Color::Gray })
+                .bold(),
+        ),
+        Span::styled(
+            format!("[sort: {}] ", app.infra_type_sort.label()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let border_color = if is_focused { NEON_CYAN } else { DIM_CYAN };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    if app.infra_loading {
+        let loading = Paragraph::new(Span::styled("Loading...", Style::default().fg(NEON_YELLOW)))
+            .block(block);
+        frame.render_widget(loading, area);
+        return;
+    }
+
+    if app.infra_types.is_empty() {
+        let provider = app.selected_infra_provider;
+        let config = app.infra_config.get_provider_config(provider);
+        let msg = if config.api_key.is_none() {
+            format!(
+                "No API key for {}. Press [c] to configure.",
+                provider.display_name()
+            )
+        } else {
+            "No instance types available".to_string()
+        };
+        let empty =
+            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))).block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .infra_types
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            let is_selected = is_focused && i == app.selected_infra_type;
+            let has_availability = !it.regions.is_empty();
+
+            let name_style = if is_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if has_availability {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            let gpu_info = if let Some(gpu_desc) = &it.gpu_description {
+                gpu_desc.clone()
+            } else if let Some(gpu_name) = &it.gpu_name {
+                format!("{}x {}", it.gpu_count, gpu_name)
+            } else {
+                format!("{}x GPU", it.gpu_count)
+            };
+
+            let region_info = if it.regions.is_empty() {
+                "-".to_string()
+            } else if it.regions.len() == 1 {
+                it.regions[0].clone()
+            } else {
+                format!("{} regions", it.regions.len())
+            };
+
+            let spans = vec![
+                Span::styled(format!("{:<22}", it.name), name_style),
+                Span::styled(
+                    format!("{:<30}", gpu_info),
+                    if has_availability {
+                        Style::default().fg(NEON_YELLOW)
+                    } else {
+                        Style::default().fg(Color::Rgb(80, 80, 40))
+                    },
+                ),
+                Span::styled(
+                    format!("{:<12}", it.price_display()),
+                    if has_availability {
+                        Style::default().fg(NEON_GREEN)
+                    } else {
+                        Style::default().fg(Color::Rgb(40, 80, 40))
+                    },
+                ),
+                Span::styled(
+                    region_info,
+                    if has_availability {
+                        Style::default().fg(Color::Gray)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+            ];
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    if is_focused {
+        state.select(Some(app.selected_infra_type));
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
+    let help = if app.launch_selecting_region || app.launch_confirming || app.session_modal_open {
+        Line::from(vec![])
+    } else if app.infra_active_panel == InfraPanel::Instances {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+            Span::styled("] panel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+            Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] ssh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("S", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] setup+ssh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("x", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] terminate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("1-3", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("R", Style::default().fg(NEON_CYAN)),
+            Span::styled("] refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+            Span::styled("] panel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+            Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("s", Style::default().fg(NEON_CYAN)),
+            Span::styled("] sort  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("1-3", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("R", Style::default().fg(NEON_CYAN)),
+            Span::styled("] refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+        ])
+    };
+
+    if let Some(error) = &app.infra_error {
+        let error_line = Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(error, Style::default().fg(NEON_YELLOW)),
+        ]);
+        frame.render_widget(Paragraph::new(error_line), area);
+    } else {
+        frame.render_widget(Paragraph::new(help), area);
+    }
+}
+
+fn render_infra_region_popup(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let selected_type = app.infra_types.get(app.selected_infra_type);
+    let regions: Vec<&str> = selected_type
+        .map(|t| t.regions.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+
+    let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
+
+    let area = frame.area();
+    let popup_width = 40u16.min(area.width.saturating_sub(4));
+    let popup_height = (regions.len() as u16 + 5).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("Type: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(type_name, Style::default().fg(NEON_YELLOW)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Select Region:",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    for (i, region) in regions.iter().enumerate() {
+        let is_selected = i == app.launch_selected_region;
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let style = if is_selected {
+            Style::default().fg(NEON_CYAN).bold()
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{}{}", prefix, region),
+            style,
+        )));
+    }
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Select Region ",
+            Style::default().fg(NEON_CYAN).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(NEON_CYAN))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_infra_launch_confirm(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let selected_type = app.infra_types.get(app.selected_infra_type);
+    let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
+    let type_price = selected_type
+        .map(|t| t.price_display())
+        .unwrap_or_else(|| "?".to_string());
+    let region = selected_type
+        .and_then(|t| t.regions.get(app.launch_selected_region))
+        .map(|s| s.as_str())
+        .unwrap_or("default");
+
+    let area = frame.area();
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_height = 8u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Launch ", Style::default().fg(Color::White)),
+            Span::styled(type_name, Style::default().fg(NEON_YELLOW).bold()),
+            Span::styled(" in ", Style::default().fg(Color::White)),
+            Span::styled(region, Style::default().fg(NEON_CYAN)),
+            Span::styled("?", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("Price: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&type_price, Style::default().fg(NEON_GREEN)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("y", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Yes  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("n", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Launch Instance ",
+            Style::default().fg(NEON_GREEN).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(NEON_GREEN))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center);
+
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_session_modal(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let popup_width = 52u16.min(area.width.saturating_sub(4));
+    let popup_height = 14u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let instance_name = app
+        .session_modal_instance
+        .as_ref()
+        .map(|i| i.display_name().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let field_width = popup_width.saturating_sub(20) as usize;
+
+    let truncate = |s: &str, max_len: usize| -> String {
+        if s.len() > max_len {
+            format!("...{}", &s[s.len().saturating_sub(max_len - 3)..])
+        } else {
+            s.to_string()
+        }
+    };
+
+    let python_display = truncate(&app.session_python_version, field_width);
+    let repo_display = truncate(&app.session_repo_path, field_width);
+    let command_display = truncate(&app.session_command, field_width);
+
+    let focused_style = Style::default().fg(NEON_CYAN).bold();
+    let unfocused_style = Style::default().fg(Color::Gray);
+    let label_style = Style::default().fg(Color::DarkGray);
+
+    let py_style = if app.session_modal_focus == SessionModalField::PythonVersion {
+        focused_style
+    } else {
+        unfocused_style
+    };
+    let repo_style = if app.session_modal_focus == SessionModalField::RepoPath {
+        focused_style
+    } else {
+        unfocused_style
+    };
+    let cmd_style = if app.session_modal_focus == SessionModalField::Command {
+        focused_style
+    } else {
+        unfocused_style
+    };
+    let tmux_style = if app.session_modal_focus == SessionModalField::SkipTmux {
+        focused_style
+    } else {
+        unfocused_style
+    };
+
+    let checkbox = if app.session_skip_tmux { "[x]" } else { "[ ]" };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Instance: ", label_style),
+            Span::styled(&instance_name, Style::default().fg(NEON_YELLOW)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Python version: ", label_style),
+            Span::styled(format!("[{}]", python_display), py_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Local repo:     ", label_style),
+            Span::styled(format!("[{}]", repo_display), repo_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Command:        ", label_style),
+            Span::styled(format!("[{}]", command_display), cmd_style),
+        ]),
+        Line::from(Span::styled(
+            "  (runs from ~/project on remote)",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{} ", checkbox), tmux_style),
+            Span::styled("Skip tmux (already running)", tmux_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+            Span::styled("] next  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Launch  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " SSH with Setup ",
+            Style::default().fg(NEON_CYAN).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(NEON_CYAN))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_infra_config(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+    let providers = Provider::all();
+
+    let items: Vec<ListItem> = providers
+        .iter()
+        .enumerate()
+        .map(|(i, provider)| {
+            let is_selected = i == app.config_provider_index;
+            let config = app.infra_config.get_provider_config(*provider);
+            let has_key = config.api_key.is_some();
+
+            let (status_icon, status_color) = if has_key {
+                ("✓", NEON_GREEN)
+            } else {
+                ("✗", Color::DarkGray)
+            };
+
+            let name_style = if is_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let key_display = if has_key {
+                let key = config.api_key.as_ref().unwrap();
+                if key.len() > 8 {
+                    format!("{}...{}", &key[..4], &key[key.len() - 4..])
+                } else {
+                    "****".to_string()
+                }
+            } else {
+                "not configured".to_string()
+            };
+
+            let mut spans = vec![
+                Span::styled(
+                    format!("{} ", status_icon),
+                    Style::default().fg(status_color),
+                ),
+                Span::styled(format!("{:<12}", provider.display_name()), name_style),
+                Span::styled("  API Key: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    key_display,
+                    Style::default().fg(if has_key {
+                        NEON_YELLOW
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ];
+
+            if is_selected && app.config_editing_key {
+                spans.push(Span::styled("  → ", Style::default().fg(NEON_MAGENTA)));
+                spans.push(Span::styled(
+                    &app.config_api_key_input,
+                    Style::default().fg(Color::White),
+                ));
+                spans.push(Span::styled("█", Style::default().fg(NEON_CYAN)));
+            }
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.config_provider_index));
+
+    let title = Line::from(vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled(
+            "Provider Configuration",
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN));
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, area, &mut state);
+
+    let help = if app.config_editing_key {
+        Line::from(vec![
+            Span::styled("Type API key, then ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+            Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("e", Style::default().fg(NEON_GREEN)),
+            Span::styled("] edit key  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("d", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] delete key  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] back", Style::default().fg(Color::DarkGray)),
+        ])
+    };
+
+    let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
+    frame.render_widget(Paragraph::new(help), help_area);
+}
+
+fn render_terminate_confirm(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let instance_name = app
+        .pending_terminate_instance
+        .and_then(|idx| {
+            app.filtered_infra_instances()
+                .get(idx)
+                .map(|i| i.display_name().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let area = frame.area();
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 7u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Terminate instance ", Style::default().fg(Color::White)),
+            Span::styled(&instance_name, Style::default().fg(NEON_CYAN).bold()),
+            Span::styled("? (y/n)", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "This will stop the instance and may delete data.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("y", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Yes  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("n", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] No  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(Color::Gray)),
+            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " ⚠ CONFIRM TERMINATE ",
+            Style::default().fg(NEON_MAGENTA).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_MAGENTA))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center);
+
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_s3_config(app: &App, frame: &mut Frame) {
+    use ratatui::layout::Alignment;
+
+    let area = frame.area();
+
+    let fields: [(&str, String, bool); 6] = [
+        ("bucket", app.s3_config.bucket.clone(), true),
+        ("prefix", app.s3_config.prefix.clone(), false),
+        (
+            "region",
+            app.s3_config.region.clone().unwrap_or_default(),
+            false,
+        ),
+        (
+            "access_key_id",
+            app.s3_config.access_key_id.clone().unwrap_or_default(),
+            false,
+        ),
+        (
+            "secret_access_key",
+            app.s3_config.secret_access_key.clone().unwrap_or_default(),
+            false,
+        ),
+        (
+            "endpoint_url",
+            app.s3_config.endpoint_url.clone().unwrap_or_default(),
+            false,
+        ),
+    ];
+
+    let items: Vec<ListItem> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, (name, value, required))| {
+            let is_selected = i == app.s3_config_field;
+            let has_value = !value.is_empty();
+
+            let (status_icon, status_color) = if has_value {
+                ("✓", NEON_GREEN)
+            } else if *required {
+                ("✗", NEON_MAGENTA)
+            } else {
+                ("○", Color::DarkGray)
+            };
+
+            let name_style = if is_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let display_value = if *name == "secret_access_key" && has_value {
+                if value.len() > 8 {
+                    format!("{}...{}", &value[..4], &value[value.len() - 4..])
+                } else {
+                    "****".to_string()
+                }
+            } else if has_value {
+                value.clone()
+            } else {
+                "not set".to_string()
+            };
+
+            let mut spans = vec![
+                Span::styled(
+                    format!("{} ", status_icon),
+                    Style::default().fg(status_color),
+                ),
+                Span::styled(format!("{:<18}", name), name_style),
+                Span::styled(
+                    display_value,
+                    Style::default().fg(if has_value {
+                        NEON_YELLOW
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ];
+
+            if is_selected && app.s3_config_editing {
+                spans.clear();
+                spans.push(Span::styled(
+                    format!("{} ", status_icon),
+                    Style::default().fg(status_color),
+                ));
+                spans.push(Span::styled(format!("{:<18}", name), name_style));
+                spans.push(Span::styled(
+                    &app.s3_config_input,
+                    Style::default().fg(Color::White),
+                ));
+                spans.push(Span::styled("█", Style::default().fg(NEON_CYAN)));
+            }
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.s3_config_field));
+
+    let title = Line::from(vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("S3 Configuration", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(" (", Style::default().fg(Color::DarkGray)),
+        Span::styled("~/.extty/s3/config.toml", Style::default().fg(Color::Gray)),
+        Span::styled(")", Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN));
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(20, 20, 40)));
+
+    frame.render_stateful_widget(list, area, &mut state);
+
+    let help_text = if app.s3_config_editing {
+        vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(Color::Gray)),
+            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("e/Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Edit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("d", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] Clear  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q/Esc", Style::default().fg(Color::Gray)),
+            Span::styled("] Back", Style::default().fg(Color::DarkGray)),
+        ]
+    };
+
+    let mut help_line = help_text;
+    if let Some(msg) = &app.s3_config_message {
+        help_line.push(Span::styled("  ", Style::default()));
+        help_line.push(Span::styled(msg, Style::default().fg(NEON_GREEN)));
+    }
+
+    let help = Paragraph::new(Line::from(help_line)).alignment(Alignment::Center);
+    let help_area = ratatui::layout::Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(1),
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(help, help_area);
 }

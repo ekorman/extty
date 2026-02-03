@@ -16,6 +16,7 @@ from extty.storage import (
 )
 from extty.system_monitor import SystemMonitor
 from extty.server import QueueStorage, ServerManager, ServerSettings, ServerInfo
+from extty.s3 import S3Config, S3Storage
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,56 @@ class StorageSink(Protocol):
     def close(self) -> None: ...
 
 
+class MultiSink:
+    """Dispatches storage operations to multiple sinks."""
+
+    def __init__(
+        self, primary: StorageSink, secondary: S3Storage | None = None
+    ) -> None:
+        self._primary = primary
+        self._secondary = secondary
+
+    def log_metric(self, name: str, value: float, step: int) -> None:
+        self._primary.log_metric(name, value, step)
+        if self._secondary:
+            self._secondary.log_metric(name, value, step)
+
+    def log_example(self, name: str, data: dict[str, Any], step: int) -> None:
+        self._primary.log_example(name, data, step)
+        if self._secondary:
+            self._secondary.log_example(name, data, step)
+
+    def log_system(
+        self,
+        ram_used_gb: float,
+        ram_total_gb: float,
+        gpu_mem_used_gb: float | None = None,
+        gpu_mem_total_gb: float | None = None,
+        gpu_util_pct: float | None = None,
+    ) -> None:
+        self._primary.log_system(
+            ram_used_gb, ram_total_gb, gpu_mem_used_gb, gpu_mem_total_gb, gpu_util_pct
+        )
+        if self._secondary:
+            self._secondary.log_system(
+                ram_used_gb,
+                ram_total_gb,
+                gpu_mem_used_gb,
+                gpu_mem_total_gb,
+                gpu_util_pct,
+            )
+
+    def flush(self) -> None:
+        self._primary.flush()
+        if self._secondary:
+            self._secondary.flush()
+
+    def close(self) -> None:
+        self._primary.close()
+        if self._secondary:
+            self._secondary.close()
+
+
 @runtime_checkable
 class FinishableStorage(Protocol):
     def finish(self, finished_at: str, status: str) -> None: ...
@@ -63,6 +114,7 @@ class Run:
         config: dict[str, Any] | None = None,
         system_metrics: bool = True,
         server: ServerConfig | None = None,
+        s3_config: S3Config | None = None,
     ) -> None:
         self.project = project
         self.name = name or generate_random_name()
@@ -72,15 +124,22 @@ class Run:
         self._server_manager: ServerManager | None = None
         self._server_info: ServerInfo | None = None
         self._storage: StorageSink
+        self._s3_storage: S3Storage | None = None
         self._meta: MetaData | None = None
 
+        if s3_config is None:
+            s3_config = S3Config.from_env()
+        if s3_config is not None:
+            self._s3_storage = S3Storage(s3_config, project, self.name)
+
+        primary_storage: StorageSink
         if server is not None and server.enabled:
             settings = server.settings or ServerSettings()
             self._server_manager = ServerManager(settings)
             self._server_manager.start()
             self._server_info = self._server_manager.info
             started_at = datetime.now(timezone.utc).isoformat()
-            self._storage = QueueStorage(
+            primary_storage = QueueStorage(
                 self._server_manager,
                 run_name=self.name,
                 project=project,
@@ -96,14 +155,17 @@ class Run:
         else:
             project_dir = project if project else "_default"
             run_dir = get_runs_dir() / project_dir / self.name
-            self._storage = RunStorage(run_dir=run_dir)
+            local_storage = RunStorage(run_dir=run_dir)
+            primary_storage = local_storage
             self._meta = MetaData(
                 project=project,
                 run_name=self.name,
                 config=self.config,
                 started_at=datetime.now(timezone.utc).isoformat(),
             )
-            self._storage.write_meta(self._meta)
+            local_storage.write_meta(self._meta)
+
+        self._storage = MultiSink(primary_storage, self._s3_storage)
 
         self._system_monitor: SystemMonitor | None = None
         if system_metrics:
@@ -165,13 +227,19 @@ class Run:
         if self._meta is not None:
             self._meta.finished_at = datetime.now(timezone.utc).isoformat()
             self._meta.status = "completed"
-            if isinstance(self._storage, RunStorage):
-                self._storage.write_meta(self._meta)
-            if isinstance(self._storage, FinishableStorage):
-                self._storage.finish(self._meta.finished_at, self._meta.status)
+            primary = (
+                self._storage._primary
+                if isinstance(self._storage, MultiSink)
+                else self._storage
+            )
+            if isinstance(primary, RunStorage):
+                primary.write_meta(self._meta)
+            if isinstance(primary, FinishableStorage):
+                primary.finish(self._meta.finished_at, self._meta.status)
+            if self._s3_storage:
+                self._s3_storage.write_meta(self._meta.to_dict())
 
         if self._server_manager is not None:
-            # sleep a little so that the finished state can be picked up
             time.sleep(5)
             self._storage.close()
             self._server_manager.stop()
@@ -188,8 +256,13 @@ class Run:
     @property
     def run_dir(self) -> str:
         """Return the path to this run's directory."""
-        if isinstance(self._storage, RunStorage):
-            return str(self._storage.run_dir)
+        primary = (
+            self._storage._primary
+            if isinstance(self._storage, MultiSink)
+            else self._storage
+        )
+        if isinstance(primary, RunStorage):
+            return str(primary.run_dir)
         return ""
 
     @property

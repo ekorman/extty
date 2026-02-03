@@ -11,7 +11,8 @@ from typing import Any, Callable, ParamSpec, TypeVar
 from extty.example import BatchExample, Example
 from extty.run import Run, ServerConfig
 from extty.server import ServerSettings
-from extty.storage import log_model_evaluation, generate_random_name
+from extty.storage import log_model_evaluation, generate_random_name, get_runs_dir
+from extty.s3 import S3Config
 
 __all__ = [
     "init",
@@ -241,7 +242,6 @@ def evaluation(
         return wrapper
 
     return dec
-    # metrics, examples = pass
 
 
 def experiment(
@@ -304,8 +304,314 @@ def experiment(
                 )
                 return fn(*args, **kwargs)
             finally:
-                finish()
+                global _active_run
+                if _active_run is not None:
+                    finish()
 
         return wrapper
 
     return dec
+
+
+def list_local_runs(project: str | None = None) -> list[tuple[str, str]]:
+    """
+    List all local runs.
+
+    Parameters
+    ----------
+    project : str, optional
+        Filter to runs in this project only.
+
+    Returns
+    -------
+    list[tuple[str, str]]
+        List of (project, run_name) tuples.
+    """
+    runs_dir = get_runs_dir()
+    if not runs_dir.exists():
+        return []
+
+    result = []
+    for proj_dir in runs_dir.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        proj_name = proj_dir.name
+        if project is not None and proj_name != project:
+            continue
+        for run_dir in proj_dir.iterdir():
+            if run_dir.is_dir() and (run_dir / "meta.json").exists():
+                result.append((proj_name, run_dir.name))
+    return result
+
+
+def push(
+    target: str | None = None,
+    *,
+    s3_config: S3Config | None = None,
+    force: bool = False,
+    dry_run: bool = False,
+) -> list[str]:
+    """
+    Push local runs to S3.
+
+    Parameters
+    ----------
+    target : str, optional
+        Target to push. Format: "project/run-name" for single run,
+        "project/" for all runs in project, or None for all runs.
+    s3_config : S3Config, optional
+        S3 configuration. If not provided, reads from environment variables.
+    force : bool, default False
+        Overwrite remote data without merging.
+    dry_run : bool, default False
+        Show what would be pushed without actually pushing.
+
+    Returns
+    -------
+    list[str]
+        List of pushed run paths (project/run_name format).
+    """
+    if s3_config is None:
+        s3_config = S3Config.from_env()
+    if s3_config is None:
+        raise ValueError(
+            "S3 configuration required. Set EXTTY_S3_BUCKET environment variable "
+            "or provide s3_config parameter."
+        )
+
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError(
+            "boto3 is required for S3 operations. Install with: pip install extty[s3]"
+        )
+
+    kwargs: dict = {}
+    if s3_config.region:
+        kwargs["region_name"] = s3_config.region
+    if s3_config.access_key_id and s3_config.secret_access_key:
+        kwargs["aws_access_key_id"] = s3_config.access_key_id
+        kwargs["aws_secret_access_key"] = s3_config.secret_access_key
+    if s3_config.endpoint_url:
+        kwargs["endpoint_url"] = s3_config.endpoint_url
+
+    client = boto3.client("s3", **kwargs)
+
+    project_filter = None
+    run_filter = None
+    if target:
+        if target.endswith("/"):
+            project_filter = target.rstrip("/")
+        elif "/" in target:
+            project_filter, run_filter = target.split("/", 1)
+        else:
+            project_filter = target
+
+    runs_to_push = []
+    for proj, run_name in list_local_runs(project_filter):
+        if run_filter is not None and run_name != run_filter:
+            continue
+        runs_to_push.append((proj, run_name))
+
+    if dry_run:
+        for proj, run_name in runs_to_push:
+            print(f"Would push: {proj}/{run_name}")
+        return [f"{p}/{r}" for p, r in runs_to_push]
+
+    pushed = []
+    runs_dir = get_runs_dir()
+    for proj, run_name in runs_to_push:
+        local_run_dir = runs_dir / proj / run_name
+        s3_prefix = f"{s3_config.prefix}/runs/{proj}/{run_name}"
+
+        _push_run_to_s3(client, s3_config.bucket, s3_prefix, local_run_dir, force=force)
+        pushed.append(f"{proj}/{run_name}")
+        print(f"Pushed: {proj}/{run_name}")
+
+    return pushed
+
+
+def _push_run_to_s3(
+    client,
+    bucket: str,
+    s3_prefix: str,
+    local_run_dir,
+    force: bool = False,
+) -> None:
+    """Push a single run directory to S3."""
+    import json
+
+    meta_path = local_run_dir / "meta.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta_content = f.read()
+        if force:
+            client.put_object(
+                Bucket=bucket,
+                Key=f"{s3_prefix}/meta.json",
+                Body=meta_content.encode("utf-8"),
+                ContentType="application/json",
+            )
+        else:
+            try:
+                response = client.get_object(
+                    Bucket=bucket, Key=f"{s3_prefix}/meta.json"
+                )
+                remote_meta = json.loads(response["Body"].read().decode("utf-8"))
+                local_meta = json.loads(meta_content)
+                merged_meta = _merge_meta(local_meta, remote_meta)
+                client.put_object(
+                    Bucket=bucket,
+                    Key=f"{s3_prefix}/meta.json",
+                    Body=json.dumps(merged_meta, indent=2).encode("utf-8"),
+                    ContentType="application/json",
+                )
+            except client.exceptions.NoSuchKey:
+                client.put_object(
+                    Bucket=bucket,
+                    Key=f"{s3_prefix}/meta.json",
+                    Body=meta_content.encode("utf-8"),
+                    ContentType="application/json",
+                )
+
+    metrics_dir = local_run_dir / "metrics"
+    if metrics_dir.exists():
+        for csv_file in metrics_dir.rglob("*.csv"):
+            relative_path = csv_file.relative_to(metrics_dir)
+            s3_key = f"{s3_prefix}/metrics/{relative_path}"
+            _push_csv_file(client, bucket, s3_key, csv_file, force=force)
+
+    examples_dir = local_run_dir / "examples"
+    if examples_dir.exists():
+        for jsonl_file in examples_dir.rglob("*.jsonl"):
+            relative_path = jsonl_file.relative_to(examples_dir)
+            s3_key = f"{s3_prefix}/examples/{relative_path}"
+            _push_jsonl_file(client, bucket, s3_key, jsonl_file, force=force)
+
+    system_csv = local_run_dir / "system.csv"
+    if system_csv.exists():
+        s3_key = f"{s3_prefix}/system.csv"
+        _push_csv_file(client, bucket, s3_key, system_csv, force=force)
+
+
+def _merge_meta(local: dict, remote: dict) -> dict:
+    """Merge meta.json from local and remote."""
+    if local.get("status") == "completed":
+        return local
+    if remote.get("status") == "completed":
+        return remote
+    local_finished = local.get("finished_at")
+    remote_finished = remote.get("finished_at")
+    if local_finished and remote_finished:
+        return local if local_finished >= remote_finished else remote
+    if local_finished:
+        return local
+    if remote_finished:
+        return remote
+    return local
+
+
+def _push_csv_file(client, bucket: str, s3_key: str, local_path, force: bool) -> None:
+    """Push a CSV file to S3, optionally merging with existing data."""
+    import csv
+    import io
+
+    with open(local_path) as f:
+        reader = csv.DictReader(f)
+        local_rows = list(reader)
+        if not local_rows:
+            return
+        fieldnames = reader.fieldnames or []
+
+    if force:
+        with open(local_path, "rb") as f:
+            client.put_object(
+                Bucket=bucket, Key=s3_key, Body=f.read(), ContentType="text/csv"
+            )
+        return
+
+    existing_keys: set[tuple] = set()
+    existing_rows: list[dict] = []
+    try:
+        response = client.get_object(Bucket=bucket, Key=s3_key)
+        content = response["Body"].read().decode("utf-8")
+        reader = csv.DictReader(io.StringIO(content))
+        for row in reader:
+            key = (row.get("step", ""), row.get("timestamp", ""))
+            existing_keys.add(key)
+            existing_rows.append(row)
+    except client.exceptions.NoSuchKey:
+        pass
+
+    for row in local_rows:
+        key = (row.get("step", ""), row.get("timestamp", ""))
+        if key not in existing_keys:
+            existing_keys.add(key)
+            existing_rows.append(row)
+
+    existing_rows.sort(
+        key=lambda r: (float(r.get("step", 0)), float(r.get("timestamp", 0)))
+    )
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(existing_rows)
+
+    client.put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=output.getvalue().encode("utf-8"),
+        ContentType="text/csv",
+    )
+
+
+def _push_jsonl_file(client, bucket: str, s3_key: str, local_path, force: bool) -> None:
+    """Push a JSONL file to S3, optionally merging with existing data."""
+    import json
+
+    with open(local_path) as f:
+        local_records = [json.loads(line) for line in f if line.strip()]
+
+    if force:
+        with open(local_path, "rb") as f:
+            client.put_object(
+                Bucket=bucket,
+                Key=s3_key,
+                Body=f.read(),
+                ContentType="application/x-ndjson",
+            )
+        return
+
+    existing_keys: set[tuple] = set()
+    existing_records: list[dict] = []
+    try:
+        response = client.get_object(Bucket=bucket, Key=s3_key)
+        content = response["Body"].read().decode("utf-8")
+        for line in content.strip().split("\n"):
+            if line:
+                record = json.loads(line)
+                key = (record.get("step"), record.get("timestamp"))
+                existing_keys.add(key)
+                existing_records.append(record)
+    except client.exceptions.NoSuchKey:
+        pass
+
+    for record in local_records:
+        key = (record.get("step"), record.get("timestamp"))
+        if key not in existing_keys:
+            existing_keys.add(key)
+            existing_records.append(record)
+
+    existing_records.sort(key=lambda r: (r.get("step", 0), r.get("timestamp", 0)))
+
+    output = "\n".join(json.dumps(r) for r in existing_records)
+    if output:
+        output += "\n"
+
+    client.put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=output.encode("utf-8"),
+        ContentType="application/x-ndjson",
+    )

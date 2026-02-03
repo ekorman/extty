@@ -127,7 +127,7 @@ struct RunMeta {
 fn runs_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ex")
+        .join(".extty")
         .join("runs")
 }
 
@@ -135,7 +135,7 @@ fn runs_dir() -> PathBuf {
 fn models_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ex")
+        .join(".extty")
         .join("models")
 }
 
@@ -143,7 +143,7 @@ fn models_dir() -> PathBuf {
 fn remote_runs_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ex")
+        .join(".extty")
         .join("remote_runs")
 }
 
