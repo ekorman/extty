@@ -622,7 +622,7 @@ impl App {
             match rsync_cmd.status() {
                 Ok(status) if status.success() => {
                     let _ = tx.send(SetupMessage::Status(
-                        "Code synced, uploading script...".to_string(),
+                        "Code synced, copying config...".to_string(),
                     ));
                 }
                 Ok(status) => {
@@ -637,6 +637,38 @@ impl App {
                     return;
                 }
             }
+
+            let s3_config_path = dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".extty")
+                .join("s3")
+                .join("config.toml");
+
+            if s3_config_path.exists() {
+                let mut scp_cmd = std::process::Command::new("bash");
+                scp_cmd
+                    .arg("-c")
+                    .arg(format!(
+                        "{} 'mkdir -p ~/.extty/s3' && scp -o StrictHostKeyChecking=no {} {} {}@{}:~/.extty/s3/config.toml",
+                        ssh_base,
+                        port.as_ref().map(|p| format!("-P {}", p)).unwrap_or_default(),
+                        s3_config_path.display(),
+                        ssh_user,
+                        host,
+                    ))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+
+                if let Ok(status) = scp_cmd.status()
+                    && !status.success()
+                {
+                    let _ = tx.send(SetupMessage::Status(
+                        "Warning: failed to copy S3 config".to_string(),
+                    ));
+                }
+            }
+
+            let _ = tx.send(SetupMessage::Status("Uploading script...".to_string()));
 
             let script = generate_script(&python_version, &command, skip_tmux);
 
