@@ -73,6 +73,14 @@ pub struct Model {
     pub updated_at: Option<DateTime<Local>>,
 }
 
+// A checkpoint saved during training
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    pub step: u64,
+    pub timestamp: Option<DateTime<Local>>,
+    pub size_bytes: Option<u64>,
+}
+
 // Run status
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunStatus {
@@ -95,6 +103,7 @@ pub struct Run {
     pub status: RunStatus,
     pub config: Option<serde_json::Value>,
     pub remote_url: Option<String>,
+    pub checkpoints: Vec<Checkpoint>,
 }
 
 impl Run {
@@ -229,6 +238,7 @@ fn load_run(path: &Path) -> Option<Run> {
     let name = path.file_name()?.to_string_lossy().to_string();
     let metrics = load_metrics(path);
     let examples = load_examples(path);
+    let checkpoints = load_checkpoints(path);
 
     let (project, start_time, end_time, status, config, remote_url) = load_run_meta(path);
 
@@ -243,6 +253,7 @@ fn load_run(path: &Path) -> Option<Run> {
         status,
         config,
         remote_url,
+        checkpoints,
     })
 }
 
@@ -455,6 +466,42 @@ pub fn load_all_evaluations() -> Vec<Evaluation> {
     }
 
     evaluations
+}
+
+// Load checkpoints from checkpoints.json
+fn load_checkpoints(run_path: &Path) -> Vec<Checkpoint> {
+    let checkpoints_path = run_path.join("checkpoints.json");
+    if !checkpoints_path.exists() {
+        return vec![];
+    }
+
+    let Ok(content) = fs::read_to_string(&checkpoints_path) else {
+        return vec![];
+    };
+
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&content) else {
+        return vec![];
+    };
+
+    let mut checkpoints: Vec<Checkpoint> = entries
+        .iter()
+        .filter_map(|entry| {
+            let step = entry.get("step")?.as_u64()?;
+            let timestamp = entry
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(parse_datetime);
+            let size_bytes = entry.get("size_bytes").and_then(|v| v.as_u64());
+            Some(Checkpoint {
+                step,
+                timestamp,
+                size_bytes,
+            })
+        })
+        .collect();
+
+    checkpoints.sort_by(|a, b| b.step.cmp(&a.step));
+    checkpoints
 }
 
 /// Return type for run metadata

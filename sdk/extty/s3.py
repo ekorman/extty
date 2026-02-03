@@ -382,5 +382,132 @@ class S3Storage:
             ContentType="application/json",
         )
 
+    def save_checkpoint(
+        self,
+        step: int,
+        path: str | None = None,
+        state_dict: Any = None,
+        optimizer_state_dict: Any = None,
+    ) -> None:
+        """
+        Save a checkpoint to S3.
+
+        Parameters
+        ----------
+        step : int
+            The training step for this checkpoint.
+        path : str or None
+            Path to a local file to upload directly.
+        state_dict : Any or None
+            Model state dict to serialize with torch.save.
+        optimizer_state_dict : Any or None
+            Optimizer state dict to include when using state_dict.
+
+        Raises
+        ------
+        ValueError
+            If neither or both of path and state_dict are provided.
+        """
+        if (path is None) == (state_dict is None):
+            raise ValueError("Exactly one of `path` or `state_dict` must be provided.")
+
+        import tempfile
+
+        if path is not None:
+            local_path = path
+        else:
+            import torch
+
+            save_obj: dict[str, Any] = {"model_state_dict": state_dict}
+            if optimizer_state_dict is not None:
+                save_obj["optimizer_state_dict"] = optimizer_state_dict
+            tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+            try:
+                torch.save(save_obj, tmp.name)
+                tmp.close()
+                local_path = tmp.name
+            except Exception:
+                tmp.close()
+                os.unlink(tmp.name)
+                raise
+
+        try:
+            file_size = os.path.getsize(local_path)
+            checkpoint_key = self._s3_key("checkpoints", str(step), "checkpoint.pt")
+            with open(local_path, "rb") as f:
+                self._client.put_object(
+                    Bucket=self.config.bucket,
+                    Key=checkpoint_key,
+                    Body=f.read(),
+                    ContentType="application/octet-stream",
+                )
+
+            timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            meta_entry = {
+                "step": step,
+                "timestamp": timestamp,
+                "size_bytes": file_size,
+                "files": ["checkpoint.pt"],
+            }
+
+            meta_key = self._s3_key("checkpoints", str(step), "meta.json")
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=meta_key,
+                Body=json.dumps(meta_entry, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+
+            self._update_checkpoints_index(meta_entry)
+        finally:
+            if state_dict is not None:
+                os.unlink(local_path)
+
+    def _update_checkpoints_index(self, entry: dict[str, Any]) -> None:
+        index_key = self._s3_key("checkpoints.json")
+        existing: list[dict[str, Any]] = []
+        try:
+            response = self._client.get_object(Bucket=self.config.bucket, Key=index_key)
+            content = response["Body"].read().decode("utf-8")
+            existing = json.loads(content)
+        except self._client.exceptions.NoSuchKey:
+            pass
+        except Exception:
+            pass
+
+        existing_steps = {e["step"] for e in existing}
+        if entry["step"] not in existing_steps:
+            existing.append(entry)
+        else:
+            existing = [entry if e["step"] == entry["step"] else e for e in existing]
+
+        existing.sort(key=lambda e: e["step"])
+
+        self._client.put_object(
+            Bucket=self.config.bucket,
+            Key=index_key,
+            Body=json.dumps(existing, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+    def list_checkpoints(self) -> list[dict[str, Any]]:
+        """
+        List all checkpoints for this run.
+
+        Returns
+        -------
+        list[dict]
+            Parsed contents of checkpoints.json.
+        """
+        index_key = self._s3_key("checkpoints.json")
+        try:
+            response = self._client.get_object(Bucket=self.config.bucket, Key=index_key)
+            content = response["Body"].read().decode("utf-8")
+            return json.loads(content)
+        except self._client.exceptions.NoSuchKey:
+            return []
+        except Exception:
+            return []
+
     def close(self) -> None:
         self.flush()

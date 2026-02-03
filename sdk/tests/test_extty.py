@@ -19,6 +19,7 @@ from extty.storage import (
     generate_random_name,
     sanitize_metric_name,
 )
+from extty.s3 import S3Config, S3Storage
 
 
 class TestVersion:
@@ -872,3 +873,148 @@ class TestEvaluationDecorator:
             assert "logged_at" in content
             assert content["started_at"] <= content["finished_at"]
             assert content["finished_at"] <= content["logged_at"]
+
+
+class TestSaveCheckpoint:
+    """Tests for save_checkpoint functionality."""
+
+    def _make_mock_s3_client(
+        self, stored: dict[str, bytes] | None = None
+    ) -> mock.MagicMock:
+        if stored is None:
+            stored = {}
+        client = mock.MagicMock()
+
+        def put_object(Bucket, Key, Body, ContentType=None):
+            if isinstance(Body, str):
+                Body = Body.encode("utf-8")
+            stored[Key] = Body
+
+        def get_object(Bucket, Key):
+            if Key in stored:
+                body = mock.MagicMock()
+                body.read.return_value = stored[Key]
+                return {"Body": body}
+            raise client.exceptions.NoSuchKey(
+                {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+            )
+
+        client.put_object.side_effect = put_object
+        client.get_object.side_effect = get_object
+        client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+        return client, stored
+
+    def _make_storage(
+        self,
+        client: mock.MagicMock,
+        bucket: str = "test-bucket",
+        prefix: str = "test",
+        project: str = "myproject",
+        run_name: str = "run-001",
+    ) -> S3Storage:
+        config = S3Config(bucket=bucket, prefix=prefix)
+        with mock.patch("boto3.client", return_value=client):
+            storage = S3Storage(config, project, run_name)
+        return storage
+
+    def test_save_checkpoint_with_path(self, tmp_path: Path) -> None:
+        """Test save_checkpoint uploads file and updates checkpoints.json."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(
+            client, prefix="test", project="myproject", run_name="run-001"
+        )
+
+        fake_file = tmp_path / "model.pt"
+        fake_file.write_bytes(b"fake model data")
+
+        storage.save_checkpoint(step=100, path=str(fake_file))
+
+        checkpoint_key = "test/runs/myproject/run-001/checkpoints/100/checkpoint.pt"
+        assert checkpoint_key in stored
+        assert stored[checkpoint_key] == b"fake model data"
+
+        meta_key = "test/runs/myproject/run-001/checkpoints/100/meta.json"
+        assert meta_key in stored
+        meta = json.loads(stored[meta_key])
+        assert meta["step"] == 100
+        assert meta["size_bytes"] == len(b"fake model data")
+        assert meta["files"] == ["checkpoint.pt"]
+
+        index_key = "test/runs/myproject/run-001/checkpoints.json"
+        assert index_key in stored
+        index = json.loads(stored[index_key])
+        assert len(index) == 1
+        assert index[0]["step"] == 100
+
+    def test_save_checkpoint_updates_existing_index(self, tmp_path: Path) -> None:
+        """Test that saving a second checkpoint appends to index."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(
+            client, prefix="pfx", project="proj", run_name="run-x"
+        )
+
+        file1 = tmp_path / "ckpt1.pt"
+        file1.write_bytes(b"ckpt1")
+        file2 = tmp_path / "ckpt2.pt"
+        file2.write_bytes(b"ckpt2data")
+
+        storage.save_checkpoint(step=50, path=str(file1))
+        storage.save_checkpoint(step=100, path=str(file2))
+
+        index_key = "pfx/runs/proj/run-x/checkpoints.json"
+        index = json.loads(stored[index_key])
+        assert len(index) == 2
+        assert index[0]["step"] == 50
+        assert index[1]["step"] == 100
+
+    def test_save_checkpoint_requires_exactly_one_source(self) -> None:
+        """Test that providing both or neither path and state_dict raises ValueError."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(
+            client, bucket="b", prefix="", project="p", run_name="r"
+        )
+
+        with pytest.raises(ValueError, match="Exactly one"):
+            storage.save_checkpoint(step=1)
+
+        with pytest.raises(ValueError, match="Exactly one"):
+            storage.save_checkpoint(step=1, path="/a", state_dict={"k": "v"})
+
+    def test_list_checkpoints_empty(self) -> None:
+        """Test list_checkpoints returns empty list when no checkpoints exist."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(
+            client, bucket="b", prefix="", project="p", run_name="r"
+        )
+        assert storage.list_checkpoints() == []
+
+    def test_list_checkpoints_returns_entries(self, tmp_path: Path) -> None:
+        """Test list_checkpoints returns saved checkpoint metadata."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client, prefix="pfx", project="p", run_name="r")
+
+        fake_file = tmp_path / "ckpt.pt"
+        fake_file.write_bytes(b"data")
+
+        storage.save_checkpoint(step=10, path=str(fake_file))
+        result = storage.list_checkpoints()
+
+        assert len(result) == 1
+        assert result[0]["step"] == 10
+
+    def test_module_level_save_checkpoint_without_init_raises(self) -> None:
+        """Test that calling extty.save_checkpoint without init raises RuntimeError."""
+        extty._active_run = None
+        with pytest.raises(RuntimeError, match="No active run"):
+            extty.save_checkpoint(step=1, path="/nonexistent")
+
+    def test_run_save_checkpoint_without_s3_raises(self, tmp_path: Path) -> None:
+        """Test that save_checkpoint raises when no S3 is configured."""
+        with (
+            mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"),
+            mock.patch("extty.s3.S3Config.from_env", return_value=None),
+        ):
+            run = extty.init("test-project", name="no-s3-run", system_metrics=False)
+            with pytest.raises(RuntimeError, match="S3 storage is not configured"):
+                run.save_checkpoint(step=1, path="/nonexistent")
+            extty.finish()
