@@ -425,12 +425,7 @@ dependencies = [
     { name = "psutil" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "pre-commit" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-]
+[package.optional-dependencies]
 gpu = [
     { name = "nvidia-ml-py" },
 ]
@@ -438,11 +433,21 @@ modal = [
     { name = "modal" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pre-commit" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.34.0" },
+    { name = "modal", marker = "extra == 'modal'", specifier = ">=1.3.0.post1" },
+    { name = "nvidia-ml-py", marker = "extra == 'gpu'", specifier = ">=12.0.0" },
     { name = "psutil", specifier = ">=5.9.0" },
 ]
+provides-extras = ["modal", "gpu"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -450,8 +455,6 @@ dev = [
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-cov", specifier = ">=4.0.0" },
 ]
-gpu = [{ name = "nvidia-ml-py", specifier = ">=12.0.0" }]
-modal = [{ name = "modal", specifier = ">=1.3.0.post1" }]
 
 [[package]]
 name = "filelock"
