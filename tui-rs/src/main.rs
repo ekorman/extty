@@ -41,6 +41,12 @@ enum SyncMessage {
     SyncCompleted,
 }
 
+enum SetupMessage {
+    Status(String),
+    Done(String),
+    Error(String),
+}
+
 fn run_sync_loop(mut remote_sync: RemoteSync, tx: mpsc::Sender<SyncMessage>) {
     loop {
         thread::sleep(Duration::from_millis(500));
@@ -210,6 +216,7 @@ struct App {
     session_command: String,
     session_skip_tmux: bool,
     session_modal_focus: SessionModalField,
+    setup_rx: Option<mpsc::Receiver<SetupMessage>>,
 }
 
 impl App {
@@ -280,6 +287,7 @@ impl App {
             session_command: String::new(),
             session_skip_tmux: false,
             session_modal_focus: SessionModalField::default(),
+            setup_rx: None,
         }
     }
 
@@ -536,131 +544,168 @@ impl App {
             }
         };
 
-        let (host, port) = if ip.contains(':') {
-            let parts: Vec<&str> = ip.split(':').collect();
-            (parts[0].to_string(), Some(parts[1].to_string()))
-        } else {
-            (ip.clone(), None)
-        };
-
-        let repo_path = &self.session_repo_path;
+        let repo_path = self.session_repo_path.clone();
         if repo_path.is_empty() {
             self.infra_error = Some("No repository path specified".to_string());
             return;
         }
 
+        let ssh_user = instance.ssh_user.clone();
+        let python_version = self.session_python_version.clone();
+        let command = self.session_command.clone();
+        let skip_tmux = self.session_skip_tmux;
+        let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+
+        let (tx, rx) = mpsc::channel();
+        self.setup_rx = Some(rx);
         self.infra_error = Some("Syncing code...".to_string());
         self.infra_message_time = Some(Instant::now());
 
-        let mut rsync_cmd = std::process::Command::new("rsync");
-        rsync_cmd.args([
-            "-avz",
-            "--exclude",
-            ".git",
-            "--exclude",
-            "__pycache__",
-            "--exclude",
-            ".venv",
-            "--exclude",
-            "*.pyc",
-            "--exclude",
-            ".mypy_cache",
-            "--exclude",
-            "*.egg-info",
-        ]);
+        thread::spawn(move || {
+            let (host, port) = if ip.contains(':') {
+                let parts: Vec<&str> = ip.split(':').collect();
+                (parts[0].to_string(), Some(parts[1].to_string()))
+            } else {
+                (ip.clone(), None)
+            };
 
-        if let Some(p) = &port {
-            rsync_cmd.args(["-e", &format!("ssh -o StrictHostKeyChecking=no -p {}", p)]);
-        } else {
-            rsync_cmd.args(["-e", "ssh -o StrictHostKeyChecking=no"]);
-        }
+            let ssh_port_args = port
+                .as_ref()
+                .map(|p| format!("-p {}", p))
+                .unwrap_or_default();
 
-        let repo_with_slash = if repo_path.ends_with('/') {
-            repo_path.clone()
-        } else {
-            format!("{}/", repo_path)
-        };
-
-        rsync_cmd
-            .arg(&repo_with_slash)
-            .arg(format!("{}@{}:~/project/", instance.ssh_user, host));
-
-        match rsync_cmd.status() {
-            Ok(status) if status.success() => {
-                self.infra_error = Some("Code synced, launching SSH...".to_string());
-                self.infra_message_time = Some(Instant::now());
-            }
-            Ok(status) => {
-                self.infra_error = Some(format!("rsync failed with exit code: {}", status));
-                return;
-            }
-            Err(e) => {
-                self.infra_error = Some(format!("rsync failed: {}", e));
-                return;
-            }
-        }
-
-        let script = generate_script(
-            &self.session_python_version,
-            &self.session_command,
-            self.session_skip_tmux,
-        );
-
-        let script_path = std::env::temp_dir().join("extty_bootstrap.sh");
-        if let Err(e) = std::fs::write(&script_path, &script) {
-            self.infra_error = Some(format!("Failed to write bootstrap script: {}", e));
-            return;
-        }
-
-        let ssh_cmd = if let Some(p) = &port {
-            format!(
-                "ssh -o StrictHostKeyChecking=no -p {} {}@{} 'bash -s' < '{}'",
-                p,
-                instance.ssh_user,
-                host,
-                script_path.display()
-            )
-        } else {
-            format!(
-                "ssh -o StrictHostKeyChecking=no {}@{} 'bash -s' < '{}'",
-                instance.ssh_user,
-                host,
-                script_path.display()
-            )
-        };
-
-        #[cfg(target_os = "macos")]
-        {
-            let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-            let script = if term_program == "iTerm.app" {
-                format!(
-                    "tell application \"iTerm2\" to tell current window to create tab with default profile command \"{}\"",
-                    ssh_cmd.replace('"', "\\\"")
-                )
+            let ssh_base = if ssh_port_args.is_empty() {
+                format!("ssh -o StrictHostKeyChecking=no {}@{}", ssh_user, host)
             } else {
                 format!(
-                    "tell application \"Terminal\" to do script \"{}\"",
-                    ssh_cmd.replace('"', "\\\"")
+                    "ssh -o StrictHostKeyChecking=no {} {}@{}",
+                    ssh_port_args, ssh_user, host
                 )
             };
-            let _ = std::process::Command::new("osascript")
-                .args(["-e", &script])
+
+            let mut rsync_cmd = std::process::Command::new("rsync");
+            rsync_cmd
+                .args([
+                    "-az",
+                    "--exclude",
+                    ".git",
+                    "--exclude",
+                    "__pycache__",
+                    "--exclude",
+                    ".venv",
+                    "--exclude",
+                    "*.pyc",
+                    "--exclude",
+                    ".mypy_cache",
+                    "--exclude",
+                    "*.egg-info",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+
+            if let Some(p) = &port {
+                rsync_cmd.args(["-e", &format!("ssh -o StrictHostKeyChecking=no -p {}", p)]);
+            } else {
+                rsync_cmd.args(["-e", "ssh -o StrictHostKeyChecking=no"]);
+            }
+
+            let repo_with_slash = if repo_path.ends_with('/') {
+                repo_path.clone()
+            } else {
+                format!("{}/", repo_path)
+            };
+
+            rsync_cmd
+                .arg(&repo_with_slash)
+                .arg(format!("{}@{}:~/project/", ssh_user, host));
+
+            match rsync_cmd.status() {
+                Ok(status) if status.success() => {
+                    let _ = tx.send(SetupMessage::Status(
+                        "Code synced, uploading script...".to_string(),
+                    ));
+                }
+                Ok(status) => {
+                    let _ = tx.send(SetupMessage::Error(format!(
+                        "rsync failed: exit {}",
+                        status
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(SetupMessage::Error(format!("rsync failed: {}", e)));
+                    return;
+                }
+            }
+
+            let script = generate_script(&python_version, &command, skip_tmux);
+
+            let upload_status = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "{} 'cat > /tmp/extty_bootstrap.sh && chmod +x /tmp/extty_bootstrap.sh'",
+                    ssh_base
+                ))
+                .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .spawn();
-        }
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        stdin.write_all(script.as_bytes())?;
+                    }
+                    child.wait()
+                });
 
-        #[cfg(target_os = "linux")]
-        {
-            let _ = std::process::Command::new("x-terminal-emulator")
-                .args(["-e", "bash", "-c", &ssh_cmd])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
+            match upload_status {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    let _ = tx.send(SetupMessage::Error(format!(
+                        "Script upload failed: exit {}",
+                        status
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(SetupMessage::Error(format!("Script upload failed: {}", e)));
+                    return;
+                }
+            }
 
-        self.infra_error = Some("SSH session launched".to_string());
-        self.infra_message_time = Some(Instant::now());
+            let ssh_cmd = format!("{} -t 'bash /tmp/extty_bootstrap.sh'", ssh_base);
+
+            #[cfg(target_os = "macos")]
+            {
+                let applescript = if term_program == "iTerm.app" {
+                    format!(
+                        "tell application \"iTerm2\" to tell current window to create tab with default profile command \"{}\"",
+                        ssh_cmd.replace('"', "\\\"")
+                    )
+                } else {
+                    format!(
+                        "tell application \"Terminal\" to do script \"{}\"",
+                        ssh_cmd.replace('"', "\\\"")
+                    )
+                };
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", &applescript])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("x-terminal-emulator")
+                    .args(["-e", "bash", "-c", &ssh_cmd])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+
+            let _ = tx.send(SetupMessage::Done("SSH session launched".to_string()));
+        });
     }
 
     fn filtered_infra_instances(&self) -> Vec<&Instance> {
@@ -1786,7 +1831,7 @@ impl App {
     }
 
     fn open_session_modal(&mut self, instance: &Instance) {
-        self.session_skip_tmux = instance.provider == Provider::Vast;
+        self.session_skip_tmux = false;
         self.session_modal_instance = Some(instance.clone());
         self.session_modal_focus = SessionModalField::PythonVersion;
         self.session_modal_open = true;
@@ -1921,9 +1966,34 @@ fn run_tui(options: TuiOptions) -> Result<()> {
             app.refresh_infra();
         }
 
+        // Poll setup background task
+        if let Some(rx) = &app.setup_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    SetupMessage::Status(s) => {
+                        app.infra_error = Some(s);
+                        app.infra_message_time = Some(Instant::now());
+                    }
+                    SetupMessage::Done(s) => {
+                        app.infra_error = Some(s);
+                        app.infra_message_time = Some(Instant::now());
+                        app.setup_rx = None;
+                        break;
+                    }
+                    SetupMessage::Error(s) => {
+                        app.infra_error = Some(s);
+                        app.infra_message_time = Some(Instant::now());
+                        app.setup_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+
         // Clear transient infra messages after 3 seconds
         if let Some(msg_time) = app.infra_message_time
             && msg_time.elapsed() >= Duration::from_secs(3)
+            && app.setup_rx.is_none()
         {
             app.infra_error = None;
             app.infra_message_time = None;

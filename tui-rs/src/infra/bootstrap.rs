@@ -6,7 +6,10 @@ pub fn generate_script(python_version: &str, command: &str, skip_tmux: bool) -> 
         r##"#!/bin/bash
 set -e
 
-# tmux handling (skip if already in tmux or if skip_tmux is set)
+# Disable provider auto-tmux (Vast.ai)
+touch ~/.no_auto_tmux
+
+# tmux handling
 if [ -z "$TMUX" ] && [ "{skip_tmux}" != "true" ]; then
     if [ "$1" != "--in-tmux" ]; then
         exec tmux new-session -s extty "$0 --in-tmux"
@@ -34,10 +37,10 @@ cd ~/project
 if [ -n "{command}" ]; then
     echo "Running: {command}"
     {command}
-else
-    echo "Setup complete. Project directory: ~/project"
-    exec $SHELL
 fi
+
+# Drop into a shell so the session stays alive
+exec $SHELL
 "##,
         skip_tmux = skip_tmux_str,
         python_version = python_version,
@@ -55,6 +58,8 @@ mod tests {
         assert!(script.contains("uv python install 3.11"));
         assert!(script.contains("uv run train.py"));
         assert!(script.contains("cd ~/project"));
+        assert!(script.contains("exec $SHELL"));
+        assert!(script.contains("touch ~/.no_auto_tmux"));
     }
 
     #[test]
