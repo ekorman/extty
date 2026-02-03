@@ -28,8 +28,8 @@ mod infra;
 mod remote;
 mod s3;
 use data::{
-    Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation, delete_model,
-    load_all_evaluations, load_models, load_runs,
+    Checkpoint, Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation,
+    delete_model, load_all_evaluations, load_models, load_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, Provider, generate_script, get_provider,
@@ -133,6 +133,7 @@ enum Card {
     Chart { name: String },
     Examples { name: String },
     Evaluation { name: String },
+    Checkpoints,
 }
 
 // Represents an item in the hierarchical list view (runs)
@@ -793,6 +794,10 @@ impl App {
         example_names.sort();
         for name in example_names {
             cards.push(Card::Examples { name: name.clone() });
+        }
+
+        if !run.checkpoints.is_empty() {
+            cards.push(Card::Checkpoints);
         }
 
         cards
@@ -2737,6 +2742,17 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         ),
         Span::styled(" examples", Style::default().fg(Color::DarkGray)),
     ];
+    if !run.checkpoints.is_empty() {
+        header_spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
+        header_spans.push(Span::styled(
+            format!("{}", run.checkpoints.len()),
+            Style::default().fg(NEON_MAGENTA),
+        ));
+        header_spans.push(Span::styled(
+            " checkpoints",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     if let Some(url) = &run.remote_url {
         header_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
         header_spans.push(Span::styled(
@@ -3000,6 +3016,9 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                 if let Some(examples) = run.examples.get(name) {
                     render_examples_card(frame, card_area, name, examples, is_selected);
                 }
+            }
+            Card::Checkpoints => {
+                render_checkpoints_card(frame, card_area, &run.checkpoints, is_selected);
             }
             Card::Evaluation { .. } => {}
         }
@@ -3268,6 +3287,72 @@ fn render_examples_card(
     frame.render_widget(paragraph, area);
 }
 
+fn render_checkpoints_card(
+    frame: &mut Frame,
+    area: Rect,
+    checkpoints: &[Checkpoint],
+    selected: bool,
+) {
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    let max_lines = area.height.saturating_sub(3) as usize;
+    let content: Vec<Line> = checkpoints
+        .iter()
+        .take(max_lines)
+        .map(|ckpt| {
+            let mut spans = vec![
+                Span::styled("step ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", ckpt.step),
+                    Style::default().fg(NEON_YELLOW).bold(),
+                ),
+            ];
+            if let Some(ts) = ckpt.timestamp {
+                spans.push(Span::styled(
+                    format!("  {}", ts.format("%Y-%m-%d %H:%M")),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(size) = ckpt.size_bytes {
+                let size_str = if size >= 1_073_741_824 {
+                    format!("{:.1} GB", size as f64 / 1_073_741_824.0)
+                } else if size >= 1_048_576 {
+                    format!("{:.1} MB", size as f64 / 1_048_576.0)
+                } else {
+                    format!("{:.1} KB", size as f64 / 1024.0)
+                };
+                spans.push(Span::styled(
+                    format!("  {}", size_str),
+                    Style::default().fg(NEON_GREEN),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    let title = Line::from(vec![
+        Span::styled("Checkpoints ", title_style),
+        Span::styled(
+            format!("({})", checkpoints.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let paragraph = Paragraph::new(content).block(block);
+    frame.render_widget(paragraph, area);
+}
+
 fn render_evaluation_card(frame: &mut Frame, area: Rect, eval: &Evaluation, selected: bool) {
     let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
     let title_style = if selected {
@@ -3530,6 +3615,24 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                 let footer = Line::from(footer_spans);
                 frame.render_widget(Paragraph::new(footer), chunks[1]);
             }
+        }
+        Card::Checkpoints => {
+            if let Some(run) = app.current_run() {
+                render_checkpoints_card(frame, chunks[0], &run.checkpoints, true);
+            }
+            let footer = Line::from(vec![
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+                Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}/{}", app.selected_card + 1, cards.len()),
+                    Style::default().fg(NEON_GREEN),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
         Card::Evaluation { .. } => {}
     }

@@ -18,6 +18,7 @@ __all__ = [
     "init",
     "log",
     "log_evaluation",
+    "save_checkpoint",
     "finish",
     "Run",
     "push",
@@ -127,6 +128,37 @@ def log(metrics: dict[str, Any], *, step: int) -> None:
     if _active_run is None:
         raise RuntimeError("No active run. Call extty.init() first.")
     _active_run.log(metrics, step=step)
+
+
+def save_checkpoint(
+    step: int,
+    *,
+    path: str | None = None,
+    state_dict: Any = None,
+    optimizer_state_dict: Any = None,
+) -> None:
+    """
+    Save a checkpoint to S3 for the active run.
+
+    Parameters
+    ----------
+    step : int
+        The training step for this checkpoint.
+    path : str or None
+        Path to a local file to upload directly.
+    state_dict : Any or None
+        Model state dict to serialize with torch.save.
+    optimizer_state_dict : Any or None
+        Optimizer state dict to include when using state_dict.
+    """
+    if _active_run is None:
+        raise RuntimeError("No active run. Call extty.init() first.")
+    _active_run.save_checkpoint(
+        step,
+        path=path,
+        state_dict=state_dict,
+        optimizer_state_dict=optimizer_state_dict,
+    )
 
 
 def log_evaluation(

@@ -207,6 +207,48 @@ class Run:
                 else:
                     self._storage.log_metric(name, float(value), step)
 
+    def save_checkpoint(
+        self,
+        step: int,
+        *,
+        path: str | None = None,
+        state_dict: Any = None,
+        optimizer_state_dict: Any = None,
+    ) -> None:
+        """
+        Save a checkpoint to S3.
+
+        Parameters
+        ----------
+        step : int
+            The training step for this checkpoint.
+        path : str or None
+            Path to a local file to upload directly.
+        state_dict : Any or None
+            Model state dict to serialize with torch.save.
+        optimizer_state_dict : Any or None
+            Optimizer state dict to include when using state_dict.
+
+        Raises
+        ------
+        RuntimeError
+            If no S3 storage is configured or the run is finished.
+        """
+        with self._lock:
+            if self._finished:
+                raise RuntimeError("Cannot save checkpoint on a finished run.")
+        if self._s3_storage is None:
+            raise RuntimeError(
+                "S3 storage is not configured. "
+                "Set EXTTY_S3_BUCKET or provide s3_config to save checkpoints."
+            )
+        self._s3_storage.save_checkpoint(
+            step,
+            path=path,
+            state_dict=state_dict,
+            optimizer_state_dict=optimizer_state_dict,
+        )
+
     def finish(self) -> None:
         """
         Finish the run.
