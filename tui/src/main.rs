@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{DateTime, Local};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -139,15 +140,26 @@ enum Card {
 // Represents an item in the hierarchical list view (runs)
 #[derive(Clone, Debug)]
 enum ListEntry {
-    Project { name: String },
+    Project {
+        name: String,
+        run_count: usize,
+        has_running: bool,
+    },
     Run { run_index: usize },
 }
 
 // Represents an item in the hierarchical list view (models)
 #[derive(Clone, Debug)]
 enum ModelListEntry {
-    Project { name: String },
-    Model { model_index: usize },
+    Project {
+        name: String,
+        model_count: usize,
+    },
+    Model {
+        model_index: usize,
+        eval_count: usize,
+        latest_eval_time: Option<DateTime<Local>>,
+    },
 }
 
 // All application state lives here
@@ -218,6 +230,11 @@ struct App {
     session_skip_tmux: bool,
     session_modal_focus: SessionModalField,
     setup_rx: Option<mpsc::Receiver<SetupMessage>>,
+    // Caches (invalidated when underlying data changes)
+    cached_cards: Option<Vec<Card>>,
+    cached_model_cards: Option<Vec<Card>>,
+    cached_list_entries: Option<Vec<ListEntry>>,
+    cached_model_list_entries: Option<Vec<ModelListEntry>>,
 }
 
 impl App {
@@ -289,6 +306,10 @@ impl App {
             session_skip_tmux: false,
             session_modal_focus: SessionModalField::default(),
             setup_rx: None,
+            cached_cards: None,
+            cached_model_cards: None,
+            cached_list_entries: None,
+            cached_model_list_entries: None,
         }
     }
 
@@ -297,8 +318,49 @@ impl App {
         self.term_height = height;
     }
 
+    // Invalidate all caches (call when underlying data changes)
+    fn invalidate_caches(&mut self) {
+        self.cached_cards = None;
+        self.cached_model_cards = None;
+        self.cached_list_entries = None;
+        self.cached_model_list_entries = None;
+    }
+
+    // Ensure caches are populated for the current frame
+    fn ensure_caches(&mut self) {
+        if self.cached_list_entries.is_none() {
+            self.cached_list_entries = Some(self.build_list_entries());
+        }
+        if self.cached_model_list_entries.is_none() {
+            self.cached_model_list_entries = Some(self.build_model_list_entries());
+        }
+        if self.cached_cards.is_none() {
+            self.cached_cards = Some(self.build_cards());
+        }
+        if self.cached_model_cards.is_none() {
+            self.cached_model_cards = Some(self.build_model_cards());
+        }
+    }
+
+    // Access cached values (panics if ensure_caches not called first)
+    fn list_entries(&self) -> &[ListEntry] {
+        self.cached_list_entries.as_deref().unwrap_or(&[])
+    }
+
+    fn model_list_entries(&self) -> &[ModelListEntry] {
+        self.cached_model_list_entries.as_deref().unwrap_or(&[])
+    }
+
+    fn cards(&self) -> &[Card] {
+        self.cached_cards.as_deref().unwrap_or(&[])
+    }
+
+    fn model_cards(&self) -> &[Card] {
+        self.cached_model_cards.as_deref().unwrap_or(&[])
+    }
+
     // Build the flattened list of entries (projects and runs)
-    fn list_entries(&self) -> Vec<ListEntry> {
+    fn build_list_entries(&self) -> Vec<ListEntry> {
         use std::collections::BTreeMap;
 
         // Group runs by project
@@ -315,8 +377,15 @@ impl App {
         let mut entries = Vec::new();
 
         for (project_name, run_indices) in projects {
+            let run_count = run_indices.len();
+            let has_running = run_indices
+                .iter()
+                .any(|&idx| self.runs[idx].is_running());
+
             entries.push(ListEntry::Project {
                 name: project_name.clone(),
+                run_count,
+                has_running,
             });
 
             if self.expanded_projects.contains(&project_name) {
@@ -330,7 +399,7 @@ impl App {
     }
 
     // Build the flattened list of entries (projects and models)
-    fn model_list_entries(&self) -> Vec<ModelListEntry> {
+    fn build_model_list_entries(&self) -> Vec<ModelListEntry> {
         use std::collections::BTreeMap;
 
         let mut projects: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -342,13 +411,30 @@ impl App {
         let mut entries = Vec::new();
 
         for (project_name, model_indices) in projects {
+            let model_count = model_indices.len();
             entries.push(ModelListEntry::Project {
                 name: project_name.clone(),
+                model_count,
             });
 
             if self.expanded_model_projects.contains(&project_name) {
                 for model_index in model_indices {
-                    entries.push(ModelListEntry::Model { model_index });
+                    let model = &self.models[model_index];
+                    let evals: Vec<_> = self
+                        .model_evaluations
+                        .iter()
+                        .filter(|e| e.model_name == model.name && e.project == model.project)
+                        .collect();
+                    let eval_count = evals.len();
+                    let latest_eval_time = evals
+                        .iter()
+                        .filter_map(|e| e.started_at.or(e.logged_at))
+                        .max();
+                    entries.push(ModelListEntry::Model {
+                        model_index,
+                        eval_count,
+                        latest_eval_time,
+                    });
                 }
             }
         }
@@ -359,6 +445,7 @@ impl App {
     fn refresh_runs(&mut self) {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
         self.runs = load_runs();
+        self.invalidate_caches();
 
         if let Some(name) = current_name {
             if let Some(idx) = self.runs.iter().position(|r| r.name == name) {
@@ -368,14 +455,15 @@ impl App {
             }
         }
 
-        let entries = self.list_entries();
-        self.selected_list_item = self.selected_list_item.min(entries.len().saturating_sub(1));
+        let entry_count = self.build_list_entries().len();
+        self.selected_list_item = self.selected_list_item.min(entry_count.saturating_sub(1));
     }
 
     fn refresh_models(&mut self) {
         let current_name = self.models.get(self.selected_model).map(|m| m.name.clone());
         self.models = load_models();
         self.model_evaluations = load_all_evaluations();
+        self.invalidate_caches();
 
         if let Some(name) = current_name {
             if let Some(idx) = self.models.iter().position(|m| m.name == name) {
@@ -385,10 +473,10 @@ impl App {
             }
         }
 
-        let entries = self.model_list_entries();
+        let entry_count = self.build_model_list_entries().len();
         self.selected_model_list_item = self
             .selected_model_list_item
-            .min(entries.len().saturating_sub(1));
+            .min(entry_count.saturating_sub(1));
     }
 
     fn refresh_current_run(&mut self) {
@@ -396,6 +484,7 @@ impl App {
             let path = run.path.clone();
             if let Some(updated) = data::reload_run(&path) {
                 self.runs[self.selected_run] = updated;
+                self.invalidate_caches();
             }
         }
     }
@@ -777,7 +866,7 @@ impl App {
         self.models.get(self.selected_model)
     }
 
-    fn cards(&self) -> Vec<Card> {
+    fn build_cards(&self) -> Vec<Card> {
         let Some(run) = self.current_run() else {
             return vec![];
         };
@@ -803,7 +892,7 @@ impl App {
         cards
     }
 
-    fn model_cards(&self) -> Vec<Card> {
+    fn build_model_cards(&self) -> Vec<Card> {
         let Some(model) = self.current_model() else {
             return vec![];
         };
@@ -870,16 +959,16 @@ impl App {
         count
     }
 
-    fn active_cards(&self) -> Vec<Card> {
+    fn active_cards(&self) -> &[Card] {
         match self.view {
             View::RunDetail | View::List => self.cards(),
             View::ModelDetail => self.model_cards(),
             View::Focused => match self.view_mode {
                 ViewMode::Runs => self.cards(),
                 ViewMode::Models => self.model_cards(),
-                ViewMode::Infra => vec![],
+                ViewMode::Infra => &[],
             },
-            View::InfraList | View::InfraConfig | View::S3Config => vec![],
+            View::InfraList | View::InfraConfig | View::S3Config => &[],
         }
     }
 
@@ -896,8 +985,9 @@ impl App {
         };
 
         let wrap_width = self.term_width.saturating_sub(4) as usize;
+        let empty = String::new();
 
-        let text = match current_card {
+        let text: &str = match current_card {
             Some(Card::Examples { name }) => {
                 if let Some(examples) = self.current_run().and_then(|r| r.examples.get(name)) {
                     if let Some(example) = examples.get(self.selected_example) {
@@ -905,21 +995,21 @@ impl App {
                             example
                                 .prompts
                                 .get(self.selected_prompt)
-                                .cloned()
-                                .unwrap_or_default()
+                                .map(|s| s.as_str())
+                                .unwrap_or("")
                         } else {
                             example
                                 .responses
                                 .get(self.selected_prompt)
                                 .and_then(|r| r.get(self.selected_response))
-                                .cloned()
-                                .unwrap_or_default()
+                                .map(|s| s.as_str())
+                                .unwrap_or("")
                         }
                     } else {
-                        String::new()
+                        &empty
                     }
                 } else {
-                    String::new()
+                    &empty
                 }
             }
             Some(Card::Evaluation { name }) => {
@@ -932,26 +1022,26 @@ impl App {
                         if is_prompt {
                             ex.prompts
                                 .get(self.selected_prompt)
-                                .cloned()
-                                .unwrap_or_default()
+                                .map(|s| s.as_str())
+                                .unwrap_or("")
                         } else {
                             ex.responses
                                 .get(self.selected_prompt)
                                 .and_then(|r| r.get(self.selected_response))
-                                .cloned()
-                                .unwrap_or_default()
+                                .map(|s| s.as_str())
+                                .unwrap_or("")
                         }
                     } else {
-                        String::new()
+                        &empty
                     }
                 } else {
-                    String::new()
+                    &empty
                 }
             }
-            _ => String::new(),
+            _ => &empty,
         };
 
-        let line_count = Self::wrapped_line_count(&text, wrap_width);
+        let line_count = Self::wrapped_line_count(text, wrap_width);
         line_count.saturating_sub(visible_height)
     }
 
@@ -1040,8 +1130,14 @@ impl App {
     }
 
     fn handle_list_key(&mut self, code: KeyCode) {
-        let entries = self.list_entries();
-        let entry_count = entries.len();
+        let entry_count = self.list_entries().len();
+
+        // Extract data from cached entries before mutating self
+        let selected_entry_info = match self.list_entries().get(self.selected_list_item) {
+            Some(ListEntry::Project { name, .. }) => Some((true, name.clone(), 0)),
+            Some(ListEntry::Run { run_index }) => Some((false, String::new(), *run_index)),
+            None => None,
+        };
 
         match code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -1069,7 +1165,7 @@ impl App {
                 self.selected_list_item += 1;
             }
             KeyCode::Tab => {
-                if let Some(ListEntry::Project { name }) = entries.get(self.selected_list_item) {
+                if let Some((true, ref name, _)) = selected_entry_info {
                     if self.expanded_projects.contains(name) {
                         self.expanded_projects.remove(name);
                     } else {
@@ -1077,15 +1173,15 @@ impl App {
                     }
                 }
             }
-            KeyCode::Enter => match entries.get(self.selected_list_item) {
-                Some(ListEntry::Project { name }) => {
+            KeyCode::Enter => match &selected_entry_info {
+                Some((true, name, _)) => {
                     if self.expanded_projects.contains(name) {
                         self.expanded_projects.remove(name);
                     } else {
                         self.expanded_projects.insert(name.clone());
                     }
                 }
-                Some(ListEntry::Run { run_index }) => {
+                Some((false, _, run_index)) => {
                     self.selected_run = *run_index;
                     self.selected_card = 0;
                     self.view = View::RunDetail;
@@ -1093,8 +1189,8 @@ impl App {
                 None => {}
             },
             KeyCode::Char('d') => {
-                if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
-                    self.pending_delete_run = Some(*run_index);
+                if let Some((false, _, run_index)) = selected_entry_info {
+                    self.pending_delete_run = Some(run_index);
                     self.show_delete_confirm = true;
                 }
             }
@@ -1103,8 +1199,17 @@ impl App {
     }
 
     fn handle_model_list_key(&mut self, code: KeyCode) {
-        let entries = self.model_list_entries();
-        let entry_count = entries.len();
+        let entry_count = self.model_list_entries().len();
+
+        // Extract data from cached entries before mutating self
+        let selected_entry_info = match self.model_list_entries().get(self.selected_model_list_item)
+        {
+            Some(ModelListEntry::Project { name, .. }) => Some((true, name.clone(), 0)),
+            Some(ModelListEntry::Model { model_index, .. }) => {
+                Some((false, String::new(), *model_index))
+            }
+            None => None,
+        };
 
         match code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -1132,9 +1237,7 @@ impl App {
                 self.selected_model_list_item += 1;
             }
             KeyCode::Tab => {
-                if let Some(ModelListEntry::Project { name }) =
-                    entries.get(self.selected_model_list_item)
-                {
+                if let Some((true, ref name, _)) = selected_entry_info {
                     if self.expanded_model_projects.contains(name) {
                         self.expanded_model_projects.remove(name);
                     } else {
@@ -1142,15 +1245,15 @@ impl App {
                     }
                 }
             }
-            KeyCode::Enter => match entries.get(self.selected_model_list_item) {
-                Some(ModelListEntry::Project { name }) => {
+            KeyCode::Enter => match &selected_entry_info {
+                Some((true, name, _)) => {
                     if self.expanded_model_projects.contains(name) {
                         self.expanded_model_projects.remove(name);
                     } else {
                         self.expanded_model_projects.insert(name.clone());
                     }
                 }
-                Some(ModelListEntry::Model { model_index }) => {
+                Some((false, _, model_index)) => {
                     self.selected_model = *model_index;
                     self.selected_card = 0;
                     self.view = View::ModelDetail;
@@ -1158,10 +1261,8 @@ impl App {
                 None => {}
             },
             KeyCode::Char('d') => {
-                if let Some(ModelListEntry::Model { model_index }) =
-                    entries.get(self.selected_model_list_item)
-                {
-                    self.pending_delete_model = Some(*model_index);
+                if let Some((false, _, model_index)) = selected_entry_info {
+                    self.pending_delete_model = Some(model_index);
                     self.show_delete_confirm = true;
                 }
             }
@@ -1276,10 +1377,10 @@ impl App {
     }
 
     fn handle_focused_key(&mut self, code: KeyCode) {
-        let (card_count, cards) = match self.view_mode {
+        let (card_count, cards): (usize, &[Card]) = match self.view_mode {
             ViewMode::Runs => (self.card_count(), self.cards()),
             ViewMode::Models => (self.model_card_count(), self.model_cards()),
-            ViewMode::Infra => (0, vec![]),
+            ViewMode::Infra => (0, &[]),
         };
         let current_card = cards.get(self.selected_card);
 
@@ -2035,6 +2136,9 @@ fn run_tui(options: TuiOptions) -> Result<()> {
             app.infra_message_time = None;
         }
 
+        // Ensure caches are populated before rendering and event handling
+        app.ensure_caches();
+
         // Draw the UI
         terminal.draw(|frame| render(&app, frame))?;
 
@@ -2045,6 +2149,8 @@ fn run_tui(options: TuiOptions) -> Result<()> {
             // Only handle key press, not release
             if key.kind == KeyEventKind::Press {
                 app.handle_key(key);
+                // Invalidate caches after key handling since state may have changed
+                app.invalidate_caches();
             }
         }
     }
@@ -2374,34 +2480,47 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
     let area = frame.area();
     let entries = app.list_entries();
 
+    // Calculate visible range for virtualization
+    let visible_height = area.height.saturating_sub(3) as usize; // borders + help line
+    let selected = app.selected_list_item;
+    let total = entries.len();
+
+    // Calculate scroll offset to keep selected item visible
+    let scroll_offset = if selected < visible_height / 2 {
+        0
+    } else if selected > total.saturating_sub(visible_height / 2) {
+        total.saturating_sub(visible_height)
+    } else {
+        selected.saturating_sub(visible_height / 2)
+    };
+
+    let visible_start = scroll_offset;
+    let visible_end = (scroll_offset + visible_height + 2).min(total); // +2 buffer
+
+    // Only build detailed ListItems for visible entries
     let items: Vec<ListItem> = entries
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let is_selected = i == app.selected_list_item;
+            // Use cheap placeholder for off-screen items
+            if i < visible_start || i >= visible_end {
+                return ListItem::new(Line::from(""));
+            }
+
+            let is_selected = i == selected;
 
             match entry {
-                ListEntry::Project { name } => {
+                ListEntry::Project {
+                    name,
+                    run_count,
+                    has_running,
+                } => {
                     let is_expanded = app.expanded_projects.contains(name);
                     let icon = if is_expanded { "▼ " } else { "▶ " };
 
-                    // Count runs in this project
-                    let run_count = app
-                        .runs
-                        .iter()
-                        .filter(|r| r.project.as_deref().unwrap_or("(no project)") == name)
-                        .count();
-
-                    // Check if any runs in this project are running
-                    let has_running = app
-                        .runs
-                        .iter()
-                        .filter(|r| r.project.as_deref().unwrap_or("(no project)") == name)
-                        .any(|r| r.is_running());
-
                     let name_style = if is_selected {
                         Style::default().fg(NEON_MAGENTA).bold()
-                    } else if has_running {
+                    } else if *has_running {
                         Style::default().fg(NEON_GREEN).bold()
                     } else {
                         Style::default().fg(NEON_CYAN).bold()
@@ -2533,18 +2652,37 @@ fn render_models_list(app: &App, frame: &mut Frame) {
     let area = frame.area();
     let entries = app.model_list_entries();
 
+    // Calculate visible range for virtualization
+    let visible_height = area.height.saturating_sub(3) as usize;
+    let selected = app.selected_model_list_item;
+    let total = entries.len();
+
+    let scroll_offset = if selected < visible_height / 2 {
+        0
+    } else if selected > total.saturating_sub(visible_height / 2) {
+        total.saturating_sub(visible_height)
+    } else {
+        selected.saturating_sub(visible_height / 2)
+    };
+
+    let visible_start = scroll_offset;
+    let visible_end = (scroll_offset + visible_height + 2).min(total);
+
     let items: Vec<ListItem> = entries
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let is_selected = i == app.selected_model_list_item;
+            // Use cheap placeholder for off-screen items
+            if i < visible_start || i >= visible_end {
+                return ListItem::new(Line::from(""));
+            }
+
+            let is_selected = i == selected;
 
             match entry {
-                ModelListEntry::Project { name } => {
+                ModelListEntry::Project { name, model_count } => {
                     let is_expanded = app.expanded_model_projects.contains(name);
                     let icon = if is_expanded { "▼ " } else { "▶ " };
-
-                    let model_count = app.models.iter().filter(|m| &m.project == name).count();
 
                     let name_style = if is_selected {
                         Style::default().fg(NEON_MAGENTA).bold()
@@ -2561,21 +2699,12 @@ fn render_models_list(app: &App, frame: &mut Frame) {
                         ),
                     ]))
                 }
-                ModelListEntry::Model { model_index } => {
+                ModelListEntry::Model {
+                    model_index,
+                    eval_count,
+                    latest_eval_time,
+                } => {
                     let model = &app.models[*model_index];
-
-                    let model_evals: Vec<_> = app
-                        .model_evaluations
-                        .iter()
-                        .filter(|e| e.model_name == model.name && e.project == model.project)
-                        .collect();
-                    let eval_count = model_evals.len();
-
-                    // Find the latest evaluation timestamp (prefer started_at, fall back to logged_at)
-                    let latest_eval_time = model_evals
-                        .iter()
-                        .filter_map(|e| e.started_at.or(e.logged_at))
-                        .max();
 
                     let name_style = if is_selected {
                         Style::default().fg(NEON_CYAN).bold()
@@ -2985,22 +3114,19 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let scroll = app.scroll_offset.min(max_scroll);
 
-    for (i, card) in cards.iter().enumerate() {
+    // Start iterating from the first visible card to skip off-screen items
+    let first_visible = scroll * cols;
+    for (i, card) in cards.iter().enumerate().skip(first_visible) {
         let col = i % cols;
         let row = i / cols;
-
-        // Skip rows above scroll offset
-        if row < scroll {
-            continue;
-        }
 
         let visible_row = row - scroll;
         let x = area.x + (col as u16) * card_width;
         let y = area.y + (visible_row as u16) * card_height;
 
-        // Skip if outside visible area
+        // Break once we're past the visible area (all subsequent cards will also be off-screen)
         if y + card_height > area.bottom() {
-            continue;
+            break;
         }
 
         let card_area = Rect::new(x, y, card_width.min(area.right() - x), card_height);
@@ -3045,22 +3171,34 @@ fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value
     frame.render_widget(paragraph, area);
 }
 
+// Pre-computed indentation strings to avoid repeated allocation
+const JSON_PADS: [&str; 8] = ["", "  ", "    ", "      ", "        ", "          ", "            ", "              "];
+
+fn json_pad(indent: usize) -> &'static str {
+    if indent < JSON_PADS.len() {
+        JSON_PADS[indent]
+    } else {
+        // Fallback for deeply nested (unlikely in practice)
+        JSON_PADS[JSON_PADS.len() - 1]
+    }
+}
+
 fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<Line>) {
-    let pad = "  ".repeat(indent);
+    let pad = json_pad(indent);
     match value {
         serde_json::Value::Object(map) => {
             for (key, val) in map {
                 match val {
                     serde_json::Value::Object(_) => {
                         lines.push(Line::from(vec![
-                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(pad, Style::default()),
                             Span::styled(format!("{}:", key), Style::default().fg(NEON_MAGENTA)),
                         ]));
                         render_json_value(val, indent + 1, lines);
                     }
                     serde_json::Value::Array(arr) => {
                         lines.push(Line::from(vec![
-                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(pad, Style::default()),
                             Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
                             Span::styled(
                                 format!("[{}]", arr.len()),
@@ -3071,7 +3209,7 @@ fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<L
                     _ => {
                         let val_str = format_json_primitive(val);
                         lines.push(Line::from(vec![
-                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(pad, Style::default()),
                             Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
                             Span::styled(val_str, Style::default().fg(Color::White)),
                         ]));

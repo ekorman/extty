@@ -111,10 +111,10 @@ impl Run {
         self.status == RunStatus::Running
     }
 
-    pub fn display_name(&self) -> String {
+    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
         match &self.project {
-            Some(project) => format!("{}/{}", project, self.name),
-            None => self.name.clone(),
+            Some(project) => std::borrow::Cow::Owned(format!("{}/{}", project, self.name)),
+            None => std::borrow::Cow::Borrowed(&self.name),
         }
     }
 }
