@@ -588,8 +588,8 @@ impl App {
             rsync_cmd.arg("-az");
 
             if exttyignore_path.exists() {
-                let filter_arg = format!("merge {}", exttyignore_path.display());
-                rsync_cmd.args(["--filter", &filter_arg]);
+                let filter_path = exttyignore_path.to_string_lossy();
+                rsync_cmd.args(["--exclude-from", &filter_path]);
             }
 
             rsync_cmd
@@ -3176,8 +3176,7 @@ fn render_chart(
     let num_y_ticks = 5;
     let y_labels: Vec<Span> = (0..num_y_ticks)
         .map(|i| {
-            let v = y_min + (y_max - y_min) * i as f64 / (num_y_ticks - 1) as f64;
-            let v = v.clamp(y_data_min, y_data_max);
+            let v = y_data_min + (y_data_max - y_data_min) * i as f64 / (num_y_ticks - 1) as f64;
             Span::styled(format!("{:.2}", v), label_style)
         })
         .collect();
