@@ -582,10 +582,18 @@ impl App {
                 )
             };
 
+            let exttyignore_path = std::path::Path::new(&repo_path).join(".exttyignore");
+
             let mut rsync_cmd = std::process::Command::new("rsync");
+            rsync_cmd.arg("-az");
+
+            if exttyignore_path.exists() {
+                let filter_path = exttyignore_path.to_string_lossy();
+                rsync_cmd.args(["--exclude-from", &filter_path]);
+            }
+
             rsync_cmd
                 .args([
-                    "-az",
                     "--exclude",
                     ".git",
                     "--exclude",
@@ -3140,13 +3148,13 @@ fn render_chart(
     // Find bounds
     let x_min = data.first().map(|p| p.0).unwrap_or(0.0);
     let x_max = data.last().map(|p| p.0).unwrap_or(1.0);
-    let y_min = data.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-    let y_max = data.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    let y_data_min = data.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let y_data_max = data.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
 
-    // Add some padding to y bounds
-    let y_range = (y_max - y_min).max(0.001);
-    let y_min = y_min - y_range * 0.1;
-    let y_max = y_max + y_range * 0.1;
+    // Pad chart bounds so data doesn't clip at edges, but use actual data range for labels
+    let y_range = (y_data_max - y_data_min).max(0.001);
+    let y_min = y_data_min - y_range * 0.1;
+    let y_max = y_data_max + y_range * 0.1;
 
     let dataset = Dataset::default()
         .marker(Marker::Braille)
@@ -3156,6 +3164,22 @@ fn render_chart(
 
     let axis_style = Style::default().fg(DIM_CYAN);
     let label_style = Style::default().fg(Color::DarkGray);
+
+    let num_x_ticks = 5;
+    let x_labels: Vec<Span> = (0..num_x_ticks)
+        .map(|i| {
+            let v = x_min + (x_max - x_min) * i as f64 / (num_x_ticks - 1) as f64;
+            Span::styled(format!("{:.0}", v), label_style)
+        })
+        .collect();
+
+    let num_y_ticks = 5;
+    let y_labels: Vec<Span> = (0..num_y_ticks)
+        .map(|i| {
+            let v = y_data_min + (y_data_max - y_data_min) * i as f64 / (num_y_ticks - 1) as f64;
+            Span::styled(format!("{:.2}", v), label_style)
+        })
+        .collect();
 
     let chart = Chart::new(vec![dataset])
         .block(
@@ -3169,19 +3193,13 @@ fn render_chart(
             Axis::default()
                 .style(axis_style)
                 .bounds([x_min, x_max])
-                .labels(vec![
-                    Span::styled(format!("{:.0}", x_min), label_style),
-                    Span::styled(format!("{:.0}", x_max), label_style),
-                ]),
+                .labels(x_labels),
         )
         .y_axis(
             Axis::default()
                 .style(axis_style)
                 .bounds([y_min, y_max])
-                .labels(vec![
-                    Span::styled(format!("{:.2}", y_min), label_style),
-                    Span::styled(format!("{:.2}", y_max), label_style),
-                ]),
+                .labels(y_labels),
         );
 
     frame.render_widget(chart, area);
