@@ -594,12 +594,18 @@ impl App {
 
             rsync_cmd
                 .args([
-                    "--exclude", ".git",
-                    "--exclude", "__pycache__",
-                    "--exclude", ".venv",
-                    "--exclude", "*.pyc",
-                    "--exclude", ".mypy_cache",
-                    "--exclude", "*.egg-info",
+                    "--exclude",
+                    ".git",
+                    "--exclude",
+                    "__pycache__",
+                    "--exclude",
+                    ".venv",
+                    "--exclude",
+                    "*.pyc",
+                    "--exclude",
+                    ".mypy_cache",
+                    "--exclude",
+                    "*.egg-info",
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
