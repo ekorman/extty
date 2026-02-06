@@ -585,11 +585,11 @@ impl App {
             let exttyignore_path = std::path::Path::new(&repo_path).join(".exttyignore");
 
             let mut rsync_cmd = std::process::Command::new("rsync");
-            rsync_cmd.arg("-az");
+            rsync_cmd.args(["-az", "--info=progress2", "--no-inc-recursive"]);
 
             if exttyignore_path.exists() {
-                let filter_path = exttyignore_path.to_string_lossy();
-                rsync_cmd.args(["--exclude-from", &filter_path]);
+                let filter_arg = format!("merge {}", exttyignore_path.display());
+                rsync_cmd.args(["--filter", &filter_arg]);
             }
 
             rsync_cmd
@@ -607,8 +607,8 @@ impl App {
                     "--exclude",
                     "*.egg-info",
                 ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
 
             if let Some(p) = &port {
                 rsync_cmd.args(["-e", &format!("ssh -o StrictHostKeyChecking=no -p {}", p)]);
@@ -626,7 +626,31 @@ impl App {
                 .arg(&repo_with_slash)
                 .arg(format!("{}@{}:~/project/", ssh_user, host));
 
-            match rsync_cmd.status() {
+            let rsync_result = match rsync_cmd.spawn() {
+                Ok(mut child) => {
+                    if let Some(stdout) = child.stdout.take() {
+                        use std::io::{BufRead, BufReader};
+                        let reader = BufReader::new(stdout);
+                        for line in reader.lines().map_while(Result::ok) {
+                            if let Some(pct_start) = line.find('%')
+                                && let Some(num_start) =
+                                    line[..pct_start].rfind(char::is_whitespace)
+                                && let Ok(pct) =
+                                    line[num_start + 1..pct_start].trim().parse::<u32>()
+                            {
+                                let _ = tx.send(SetupMessage::Status(format!(
+                                    "Syncing code... {}%",
+                                    pct
+                                )));
+                            }
+                        }
+                    }
+                    child.wait()
+                }
+                Err(e) => Err(e),
+            };
+
+            match rsync_result {
                 Ok(status) if status.success() => {
                     let _ = tx.send(SetupMessage::Status(
                         "Code synced, copying config...".to_string(),
@@ -634,7 +658,7 @@ impl App {
                 }
                 Ok(status) => {
                     let _ = tx.send(SetupMessage::Error(format!(
-                        "rsync failed: exit {}",
+                        "rsync failed (exit {})",
                         status
                     )));
                     return;
