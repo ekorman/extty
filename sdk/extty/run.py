@@ -1,6 +1,7 @@
 """Run class - manages single run state."""
 
 from __future__ import annotations
+import subprocess
 import time
 
 import threading
@@ -99,6 +100,26 @@ class FinishableStorage(Protocol):
     def finish(self, finished_at: str, status: str) -> None: ...
 
 
+def _collect_environment() -> dict[str, Any]:
+    from extty import __version__
+
+    env: dict[str, Any] = {"_extty_version": __version__}
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            env["_git_hash"] = result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return env
+
+
 class Run:
     """
     Represents a single experiment run.
@@ -118,7 +139,7 @@ class Run:
     ) -> None:
         self.project = project
         self.name = name or generate_random_name()
-        self.config = config or {}
+        self.config = {**_collect_environment(), **(config or {})}
         self._system_metrics_enabled = system_metrics
 
         self._server_manager: ServerManager | None = None
@@ -164,6 +185,9 @@ class Run:
                 started_at=datetime.now(timezone.utc).isoformat(),
             )
             local_storage.write_meta(self._meta)
+
+        if self._s3_storage and self._meta:
+            self._s3_storage.write_meta(self._meta.to_dict())
 
         self._storage = MultiSink(primary_storage, self._s3_storage)
 

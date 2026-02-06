@@ -787,7 +787,8 @@ class TestExperimentDecorator:
                 tmp_path / "runs" / "test-project" / "conf-kwargs-test" / "meta.json"
             )
             meta = json.loads(meta_path.read_text())
-            assert meta["config"] == {"lr": 0.001, "batch_size": 64}
+            assert meta["config"]["lr"] == 0.001
+            assert meta["config"]["batch_size"] == 64
             assert "data_path" not in meta["config"]
             assert "verbose" not in meta["config"]
 
@@ -816,7 +817,8 @@ class TestExperimentDecorator:
                 / "meta.json"
             )
             meta = json.loads(meta_path.read_text())
-            assert meta["config"] == {"lr": 0.001, "batch_size": 64}
+            assert meta["config"]["lr"] == 0.001
+            assert meta["config"]["batch_size"] == 64
             assert "data_path" not in meta["config"]
             assert "verbose" not in meta["config"]
 
