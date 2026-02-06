@@ -632,19 +632,16 @@ impl App {
                         use std::io::{BufRead, BufReader};
                         let reader = BufReader::new(stdout);
                         for line in reader.lines().map_while(Result::ok) {
-                            if let Some(pct_start) = line.find('%') {
-                                if let Some(num_start) =
+                            if let Some(pct_start) = line.find('%')
+                                && let Some(num_start) =
                                     line[..pct_start].rfind(char::is_whitespace)
-                                {
-                                    if let Ok(pct) =
-                                        line[num_start + 1..pct_start].trim().parse::<u32>()
-                                    {
-                                        let _ = tx.send(SetupMessage::Status(format!(
-                                            "Syncing code... {}%",
-                                            pct
-                                        )));
-                                    }
-                                }
+                                && let Ok(pct) =
+                                    line[num_start + 1..pct_start].trim().parse::<u32>()
+                            {
+                                let _ = tx.send(SetupMessage::Status(format!(
+                                    "Syncing code... {}%",
+                                    pct
+                                )));
                             }
                         }
                     }
