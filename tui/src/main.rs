@@ -594,12 +594,18 @@ impl App {
 
             rsync_cmd
                 .args([
-                    "--exclude", ".git",
-                    "--exclude", "__pycache__",
-                    "--exclude", ".venv",
-                    "--exclude", "*.pyc",
-                    "--exclude", ".mypy_cache",
-                    "--exclude", "*.egg-info",
+                    "--exclude",
+                    ".git",
+                    "--exclude",
+                    "__pycache__",
+                    "--exclude",
+                    ".venv",
+                    "--exclude",
+                    "*.pyc",
+                    "--exclude",
+                    ".mypy_cache",
+                    "--exclude",
+                    "*.egg-info",
                 ])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -627,9 +633,16 @@ impl App {
                         let reader = BufReader::new(stdout);
                         for line in reader.lines().map_while(Result::ok) {
                             if let Some(pct_start) = line.find('%') {
-                                if let Some(num_start) = line[..pct_start].rfind(char::is_whitespace) {
-                                    if let Ok(pct) = line[num_start + 1..pct_start].trim().parse::<u32>() {
-                                        let _ = tx.send(SetupMessage::Status(format!("Syncing code... {}%", pct)));
+                                if let Some(num_start) =
+                                    line[..pct_start].rfind(char::is_whitespace)
+                                {
+                                    if let Ok(pct) =
+                                        line[num_start + 1..pct_start].trim().parse::<u32>()
+                                    {
+                                        let _ = tx.send(SetupMessage::Status(format!(
+                                            "Syncing code... {}%",
+                                            pct
+                                        )));
                                     }
                                 }
                             }
