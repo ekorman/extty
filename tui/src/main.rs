@@ -23,6 +23,19 @@ const NEON_GREEN: Color = Color::Rgb(0, 255, 136);
 const NEON_YELLOW: Color = Color::Rgb(255, 255, 0);
 const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
+type CompareRunData = (String, Color, Vec<(f64, f64)>);
+
+const COMPARE_COLORS: [Color; 8] = [
+    NEON_GREEN,
+    NEON_CYAN,
+    NEON_MAGENTA,
+    NEON_YELLOW,
+    Color::Rgb(255, 128, 0),
+    Color::Rgb(180, 0, 255),
+    Color::Rgb(255, 100, 100),
+    Color::Rgb(0, 200, 255),
+];
+
 mod data;
 mod infra;
 mod remote;
@@ -72,6 +85,7 @@ enum View {
     RunDetail,
     ModelDetail,
     Focused,
+    Compare,
     InfraList,
     InfraConfig,
     S3Config,
@@ -218,6 +232,8 @@ struct App {
     session_skip_tmux: bool,
     session_modal_focus: SessionModalField,
     setup_rx: Option<mpsc::Receiver<SetupMessage>>,
+    compared_runs: Vec<usize>,
+    compare_focused: bool,
 }
 
 impl App {
@@ -289,6 +305,8 @@ impl App {
             session_skip_tmux: false,
             session_modal_focus: SessionModalField::default(),
             setup_rx: None,
+            compared_runs: Vec::new(),
+            compare_focused: false,
         }
     }
 
@@ -358,6 +376,13 @@ impl App {
 
     fn refresh_runs(&mut self) {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
+
+        let compared_paths: Vec<PathBuf> = self
+            .compared_runs
+            .iter()
+            .filter_map(|&idx| self.runs.get(idx).map(|r| r.path.clone()))
+            .collect();
+
         self.runs = load_runs();
 
         if let Some(name) = current_name {
@@ -367,6 +392,11 @@ impl App {
                 self.selected_run = self.selected_run.min(self.runs.len().saturating_sub(1));
             }
         }
+
+        self.compared_runs = compared_paths
+            .iter()
+            .filter_map(|path| self.runs.iter().position(|r| r.path == *path))
+            .collect();
 
         let entries = self.list_entries();
         self.selected_list_item = self.selected_list_item.min(entries.len().saturating_sub(1));
@@ -857,6 +887,22 @@ impl App {
         cards
     }
 
+    fn compare_cards(&self) -> Vec<Card> {
+        let mut metric_names: Vec<String> = self
+            .compared_runs
+            .iter()
+            .filter_map(|&idx| self.runs.get(idx))
+            .flat_map(|run| run.metrics.keys().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        metric_names.sort();
+        metric_names
+            .into_iter()
+            .map(|name| Card::Chart { name })
+            .collect()
+    }
+
     fn get_model_evaluation(&self, name: &str) -> Option<&Evaluation> {
         let model = self.current_model()?;
         self.model_evaluations
@@ -906,6 +952,8 @@ impl App {
         match self.view {
             View::RunDetail | View::List => self.cards(),
             View::ModelDetail => self.model_cards(),
+            View::Compare => self.compare_cards(),
+            View::Focused if self.compare_focused => self.compare_cards(),
             View::Focused => match self.view_mode {
                 ViewMode::Runs => self.cards(),
                 ViewMode::Models => self.model_cards(),
@@ -1019,6 +1067,10 @@ impl App {
                 self.handle_model_detail_key(code, visible_rows, cols);
             }
             View::Focused => self.handle_focused_key(code),
+            View::Compare => {
+                let (visible_rows, cols) = self.grid_layout();
+                self.handle_compare_key(code, visible_rows, cols);
+            }
             View::InfraList => self.handle_infra_list_key(code, modifiers),
             View::InfraConfig => self.handle_infra_config_key(code),
             View::S3Config => self.handle_s3_config_key(code),
@@ -1124,6 +1176,22 @@ impl App {
                 }
                 None => {}
             },
+            KeyCode::Char(' ') => {
+                if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
+                    if let Some(pos) = self.compared_runs.iter().position(|&i| i == *run_index) {
+                        self.compared_runs.remove(pos);
+                    } else {
+                        self.compared_runs.push(*run_index);
+                    }
+                }
+            }
+            KeyCode::Char('v') => {
+                if self.compared_runs.len() >= 2 {
+                    self.view = View::Compare;
+                    self.selected_card = 0;
+                    self.scroll_offset = 0;
+                }
+            }
             KeyCode::Char('d') => {
                 if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
                     self.pending_delete_run = Some(*run_index);
@@ -1307,11 +1375,51 @@ impl App {
         }
     }
 
+    fn handle_compare_key(&mut self, code: KeyCode, visible_rows: usize, cols: usize) {
+        let cards = self.compare_cards();
+        let card_count = cards.len();
+        let total_rows = card_count.div_ceil(cols);
+        let max_scroll = total_rows.saturating_sub(visible_rows);
+
+        let first_visible_row = self.scroll_offset;
+        let last_visible_row = (self.scroll_offset + visible_rows).saturating_sub(1);
+
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.view = View::List;
+            }
+            KeyCode::Left if self.selected_card > 0 => {
+                self.selected_card -= 1;
+                let new_row = self.selected_card / cols;
+                if new_row < first_visible_row {
+                    self.scroll_offset = new_row;
+                }
+            }
+            KeyCode::Right if self.selected_card < card_count.saturating_sub(1) => {
+                self.selected_card += 1;
+                let new_row = self.selected_card / cols;
+                if new_row > last_visible_row {
+                    self.scroll_offset = (new_row + 1).saturating_sub(visible_rows).min(max_scroll);
+                }
+            }
+            KeyCode::Enter if card_count > 0 => {
+                self.compare_focused = true;
+                self.view = View::Focused;
+            }
+            _ => {}
+        }
+    }
+
     fn handle_focused_key(&mut self, code: KeyCode) {
-        let (card_count, cards) = match self.view_mode {
-            ViewMode::Runs => (self.card_count(), self.cards()),
-            ViewMode::Models => (self.model_card_count(), self.model_cards()),
-            ViewMode::Infra => (0, vec![]),
+        let (card_count, cards) = if self.compare_focused {
+            let c = self.compare_cards();
+            (c.len(), c)
+        } else {
+            match self.view_mode {
+                ViewMode::Runs => (self.card_count(), self.cards()),
+                ViewMode::Models => (self.model_card_count(), self.model_cards()),
+                ViewMode::Infra => (0, vec![]),
+            }
         };
         let current_card = cards.get(self.selected_card);
 
@@ -1365,11 +1473,16 @@ impl App {
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                self.view = match self.view_mode {
-                    ViewMode::Runs => View::RunDetail,
-                    ViewMode::Models => View::ModelDetail,
-                    ViewMode::Infra => View::InfraList,
-                };
+                if self.compare_focused {
+                    self.view = View::Compare;
+                    self.compare_focused = false;
+                } else {
+                    self.view = match self.view_mode {
+                        ViewMode::Runs => View::RunDetail,
+                        ViewMode::Models => View::ModelDetail,
+                        ViewMode::Infra => View::InfraList,
+                    };
+                }
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
             }
@@ -2008,7 +2121,16 @@ fn run_tui(options: TuiOptions) -> Result<()> {
         if let Some(rx) = &sync_rx
             && let Ok(SyncMessage::SyncCompleted) = rx.try_recv()
         {
-            if matches!(
+            if app.view == View::Compare || (app.view == View::Focused && app.compare_focused) {
+                for &idx in &app.compared_runs.clone() {
+                    if let Some(run) = app.runs.get(idx) {
+                        let path = run.path.clone();
+                        if let Some(updated) = data::reload_run(&path) {
+                            app.runs[idx] = updated;
+                        }
+                    }
+                }
+            } else if matches!(
                 app.view,
                 View::RunDetail | View::ModelDetail | View::Focused
             ) {
@@ -2389,6 +2511,7 @@ fn render(app: &App, frame: &mut Frame) {
         View::RunDetail => render_run_detail(app, frame),
         View::ModelDetail => render_model_detail(app, frame),
         View::Focused => render_focused(app, frame),
+        View::Compare => render_compare_view(app, frame),
         View::InfraList => render_infra_dashboard(app, frame),
         View::InfraConfig => render_infra_config(app, frame),
         View::S3Config => render_s3_config(app, frame),
@@ -2485,9 +2608,22 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
                         Style::default().fg(Color::DarkGray)
                     };
 
-                    // Indent runs under their project with tree branch
+                    let is_compared = app.compared_runs.contains(run_index);
+                    let check = if is_compared { "✓" } else { " " };
+                    let check_color = if is_compared {
+                        let ci = app
+                            .compared_runs
+                            .iter()
+                            .position(|i| i == run_index)
+                            .unwrap_or(0);
+                        COMPARE_COLORS[ci % COMPARE_COLORS.len()]
+                    } else {
+                        Color::DarkGray
+                    };
+
                     let mut spans = vec![
-                        Span::styled("  └─ ", Style::default().fg(DIM_CYAN)),
+                        Span::styled(check, Style::default().fg(check_color)),
+                        Span::styled(" └─ ", Style::default().fg(DIM_CYAN)),
                         Span::styled(status_icon, Style::default().fg(status_color)),
                         Span::styled(run.name.clone(), name_style),
                         Span::styled("  ", Style::default()),
@@ -2534,7 +2670,7 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
 
     frame.render_stateful_widget(list, area, &mut state);
 
-    let help = Line::from(vec![
+    let mut help_spans = vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("m", Style::default().fg(NEON_YELLOW)),
         Span::styled("] models  ", Style::default().fg(Color::DarkGray)),
@@ -2551,12 +2687,28 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled("Enter", Style::default().fg(NEON_CYAN)),
         Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Space", Style::default().fg(NEON_CYAN)),
+        Span::styled("] compare  ", Style::default().fg(Color::DarkGray)),
+    ];
+    if app.compared_runs.len() >= 2 {
+        help_spans.extend(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("v", Style::default().fg(NEON_YELLOW)),
+            Span::styled(
+                format!("] view {} runs  ", app.compared_runs.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+    help_spans.extend(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
         Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
         Span::styled("] quit", Style::default().fg(Color::DarkGray)),
     ]);
+    let help = Line::from(help_spans);
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
 }
@@ -3057,6 +3209,215 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
     }
 }
 
+fn render_comparison_chart(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    run_data: &[CompareRunData],
+    selected: bool,
+) {
+    use ratatui::symbols::Marker;
+    use ratatui::widgets::{Axis, Chart, Dataset, GraphType, LegendPosition};
+
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    let non_empty: Vec<&CompareRunData> =
+        run_data.iter().filter(|(_, _, d)| !d.is_empty()).collect();
+
+    if non_empty.is_empty() {
+        let block = Block::default()
+            .title(Span::styled(title, title_style))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color));
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "No data",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    let x_min = non_empty
+        .iter()
+        .filter_map(|(_, _, d)| d.first().map(|p| p.0))
+        .fold(f64::INFINITY, f64::min);
+    let x_max = non_empty
+        .iter()
+        .filter_map(|(_, _, d)| d.last().map(|p| p.0))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let y_data_min = non_empty
+        .iter()
+        .flat_map(|(_, _, d)| d.iter().map(|p| p.1))
+        .fold(f64::INFINITY, f64::min);
+    let y_data_max = non_empty
+        .iter()
+        .flat_map(|(_, _, d)| d.iter().map(|p| p.1))
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let y_range = (y_data_max - y_data_min).max(0.001);
+    let y_min = y_data_min - y_range * 0.1;
+    let y_max = y_data_max + y_range * 0.1;
+
+    let datasets: Vec<Dataset> = run_data
+        .iter()
+        .filter(|(_, _, d)| !d.is_empty())
+        .map(|(name, color, data)| {
+            Dataset::default()
+                .name(name.as_str())
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(*color))
+                .data(data)
+        })
+        .collect();
+
+    let axis_style = Style::default().fg(DIM_CYAN);
+    let label_style = Style::default().fg(Color::DarkGray);
+
+    let num_x_ticks = 5;
+    let x_labels: Vec<Span> = (0..num_x_ticks)
+        .map(|i| {
+            let v = x_min + (x_max - x_min) * i as f64 / (num_x_ticks - 1) as f64;
+            Span::styled(format!("{:.0}", v), label_style)
+        })
+        .collect();
+
+    let num_y_ticks = 5;
+    let y_labels: Vec<Span> = (0..num_y_ticks)
+        .map(|i| {
+            let v = y_data_min + (y_data_max - y_data_min) * i as f64 / (num_y_ticks - 1) as f64;
+            Span::styled(format!("{:.2}", v), label_style)
+        })
+        .collect();
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(Span::styled(title, title_style))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border_color)),
+        )
+        .x_axis(
+            Axis::default()
+                .style(axis_style)
+                .bounds([x_min, x_max])
+                .labels(x_labels),
+        )
+        .y_axis(
+            Axis::default()
+                .style(axis_style)
+                .bounds([y_min, y_max])
+                .labels(y_labels),
+        )
+        .legend_position(Some(LegendPosition::TopRight));
+
+    frame.render_widget(chart, area);
+}
+
+fn render_compare_view(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+    let cards = app.compare_cards();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let mut header_spans: Vec<Span> = vec![
+        Span::styled("◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("Compare: ", Style::default().fg(NEON_CYAN).bold()),
+    ];
+    for (i, &run_idx) in app.compared_runs.iter().enumerate() {
+        if let Some(run) = app.runs.get(run_idx) {
+            let color = COMPARE_COLORS[i % COMPARE_COLORS.len()];
+            if i > 0 {
+                header_spans.push(Span::styled("  ", Style::default()));
+            }
+            header_spans.push(Span::styled("●", Style::default().fg(color)));
+            header_spans.push(Span::styled(
+                format!(" {}", run.display_name()),
+                Style::default().fg(color),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
+
+    let grid_area = chunks[1];
+    let card_width = 40u16;
+    let card_height = 12u16;
+    let cols = (grid_area.width / card_width).max(1) as usize;
+    let total_rows = cards.len().div_ceil(cols);
+    let visible_rows = (grid_area.height / card_height) as usize;
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let scroll = app.scroll_offset.min(max_scroll);
+
+    for (i, card) in cards.iter().enumerate() {
+        let col = i % cols;
+        let row = i / cols;
+
+        if row < scroll {
+            continue;
+        }
+
+        let visible_row = row - scroll;
+        let x = grid_area.x + (col as u16) * card_width;
+        let y = grid_area.y + (visible_row as u16) * card_height;
+
+        if y + card_height > grid_area.bottom() {
+            continue;
+        }
+
+        let card_area = Rect::new(x, y, card_width.min(grid_area.right() - x), card_height);
+        let is_selected = i == app.selected_card;
+
+        if let Card::Chart { name } = card {
+            let run_data: Vec<CompareRunData> = app
+                .compared_runs
+                .iter()
+                .enumerate()
+                .filter_map(|(ci, &run_idx)| {
+                    let run = app.runs.get(run_idx)?;
+                    let color = COMPARE_COLORS[ci % COMPARE_COLORS.len()];
+                    let data: Vec<(f64, f64)> = run
+                        .metrics
+                        .get(name)
+                        .map(|pts| pts.iter().map(|p| (p.step as f64, p.value)).collect())
+                        .unwrap_or_default();
+                    Some((run.display_name(), color, data))
+                })
+                .collect();
+            render_comparison_chart(frame, card_area, name, &run_data, is_selected);
+        }
+    }
+
+    let footer = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("←→", Style::default().fg(NEON_CYAN)),
+        Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Enter", Style::default().fg(NEON_CYAN)),
+        Span::styled("] focus", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
 fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value) {
     let mut lines: Vec<Line> = Vec::new();
     render_json_value(config, 0, &mut lines);
@@ -3529,11 +3890,62 @@ fn reward_color(reward: f64) -> Color {
 fn render_focused(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
+    if app.compare_focused {
+        render_focused_compare(app, frame, area);
+        return;
+    }
+
     match app.view_mode {
         ViewMode::Runs => render_focused_run(app, frame, area),
         ViewMode::Models => render_focused_model(app, frame, area),
         ViewMode::Infra => {}
     }
+}
+
+fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
+    let cards = app.compare_cards();
+    let Some(card) = cards.get(app.selected_card) else {
+        frame.render_widget(Paragraph::new("No card selected"), area);
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(area);
+
+    if let Card::Chart { name } = card {
+        let run_data: Vec<CompareRunData> = app
+            .compared_runs
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, &run_idx)| {
+                let run = app.runs.get(run_idx)?;
+                let color = COMPARE_COLORS[ci % COMPARE_COLORS.len()];
+                let data: Vec<(f64, f64)> = run
+                    .metrics
+                    .get(name)
+                    .map(|pts| pts.iter().map(|p| (p.step as f64, p.value)).collect())
+                    .unwrap_or_default();
+                Some((run.display_name(), color, data))
+            })
+            .collect();
+        render_comparison_chart(frame, chunks[0], name, &run_data, true);
+    }
+
+    let footer = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("←→", Style::default().fg(NEON_CYAN)),
+        Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}/{}", app.selected_card + 1, cards.len()),
+            Style::default().fg(NEON_GREEN),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(footer), chunks[1]);
 }
 
 fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
