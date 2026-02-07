@@ -377,10 +377,10 @@ impl App {
     fn refresh_runs(&mut self) {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
 
-        let compared_names: Vec<String> = self
+        let compared_paths: Vec<PathBuf> = self
             .compared_runs
             .iter()
-            .filter_map(|&idx| self.runs.get(idx).map(|r| r.name.clone()))
+            .filter_map(|&idx| self.runs.get(idx).map(|r| r.path.clone()))
             .collect();
 
         self.runs = load_runs();
@@ -393,9 +393,9 @@ impl App {
             }
         }
 
-        self.compared_runs = compared_names
+        self.compared_runs = compared_paths
             .iter()
-            .filter_map(|name| self.runs.iter().position(|r| r.name == *name))
+            .filter_map(|path| self.runs.iter().position(|r| r.path == *path))
             .collect();
 
         let entries = self.list_entries();
