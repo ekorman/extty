@@ -1475,16 +1475,17 @@ impl App {
                 let steps = self.compare_example_steps(name);
                 let target_step = steps.get(self.selected_example).copied();
                 target_step
-                    .and_then(|step| {
+                    .map(|step| {
                         self.compared_runs
                             .iter()
                             .filter_map(|&idx| self.runs.get(idx))
                             .filter_map(|run| {
                                 run.examples.get(name)?.iter().find(|e| e.step == step)
                             })
-                            .next()
+                            .map(|ex| ex.prompts.len())
+                            .max()
+                            .unwrap_or(0)
                     })
-                    .map(|ex| ex.prompts.len())
                     .unwrap_or(0)
             }
             Some(Card::Examples { name }) => self
@@ -1506,17 +1507,18 @@ impl App {
                 let steps = self.compare_example_steps(name);
                 let target_step = steps.get(self.selected_example).copied();
                 target_step
-                    .and_then(|step| {
+                    .map(|step| {
                         self.compared_runs
                             .iter()
                             .filter_map(|&idx| self.runs.get(idx))
                             .filter_map(|run| {
                                 run.examples.get(name)?.iter().find(|e| e.step == step)
                             })
-                            .next()
+                            .filter_map(|ex| ex.responses.get(self.selected_prompt))
+                            .map(|r| r.len())
+                            .max()
+                            .unwrap_or(0)
                     })
-                    .and_then(|ex| ex.responses.get(self.selected_prompt))
-                    .map(|r| r.len())
                     .unwrap_or(0)
             }
             Some(Card::Examples { name }) => self
