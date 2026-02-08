@@ -1,6 +1,7 @@
 """Run class - manages single run state."""
 
 from __future__ import annotations
+import os
 import subprocess
 import time
 
@@ -147,6 +148,11 @@ class Run:
         self._storage: StorageSink
         self._s3_storage: S3Storage | None = None
         self._meta: MetaData | None = None
+
+        self._instance_id: str | None = os.environ.get("EXTTY_INSTANCE_ID")
+        self._instance_provider: str | None = os.environ.get("EXTTY_PROVIDER")
+        delay_str = os.environ.get("EXTTY_AUTO_SHUTDOWN_DELAY")
+        self._auto_shutdown_delay: int | None = int(delay_str) if delay_str else None
 
         if s3_config is None:
             s3_config = S3Config.load()
@@ -304,6 +310,19 @@ class Run:
                 primary.finish(self._meta.finished_at, self._meta.status)
             if self._s3_storage:
                 self._s3_storage.write_meta(self._meta.to_dict())
+                if (
+                    self._instance_id
+                    and self._instance_provider
+                    and self._auto_shutdown_delay is not None
+                ):
+                    self._s3_storage.write_auto_shutdown_signal(
+                        instance_id=self._instance_id,
+                        provider=self._instance_provider,
+                        finished_at=self._meta.finished_at,
+                        delay_minutes=self._auto_shutdown_delay,
+                        project=self.project,
+                        run_name=self.name,
+                    )
 
         if self._server_manager is not None:
             time.sleep(5)

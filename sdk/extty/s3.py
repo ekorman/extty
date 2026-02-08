@@ -509,5 +509,51 @@ class S3Storage:
         except Exception:
             return []
 
+    def write_auto_shutdown_signal(
+        self,
+        instance_id: str,
+        provider: str,
+        finished_at: str,
+        delay_minutes: int,
+        project: str,
+        run_name: str,
+    ) -> None:
+        """
+        Write an auto-shutdown signal file to S3.
+
+        Parameters
+        ----------
+        instance_id : str
+            The cloud instance ID.
+        provider : str
+            The cloud provider name (e.g. "lambda", "vast", "prime").
+        finished_at : str
+            ISO 8601 timestamp of when the run finished.
+        delay_minutes : int
+            Minutes to wait after finish before shutting down.
+        project : str
+            The project name.
+        run_name : str
+            The run name.
+        """
+        signal = {
+            "instance_id": instance_id,
+            "provider": provider,
+            "finished_at": finished_at,
+            "delay_minutes": delay_minutes,
+            "project": project,
+            "run_name": run_name,
+        }
+        parts = ["auto-shutdown", f"{instance_id}.json"]
+        if self.config.prefix:
+            parts.insert(0, self.config.prefix)
+        key = "/".join(parts)
+        self._client.put_object(
+            Bucket=self.config.bucket,
+            Key=key,
+            Body=json.dumps(signal, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+
     def close(self) -> None:
         self.flush()

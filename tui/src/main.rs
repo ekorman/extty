@@ -45,8 +45,8 @@ use data::{
     delete_model, load_all_evaluations, load_models, load_runs,
 };
 use infra::{
-    InfraConfig, Instance, InstanceStatus, InstanceType, Provider, generate_script, get_provider,
-    load_config, save_config,
+    BootstrapOptions, InfraConfig, Instance, InstanceStatus, InstanceType, Provider,
+    generate_script_with_options, get_provider, load_config, save_config,
 };
 use remote::RemoteSync;
 
@@ -139,6 +139,8 @@ enum SessionModalField {
     RepoPath,
     Command,
     SkipTmux,
+    AutoShutdown,
+    AutoShutdownDelay,
 }
 
 // A card in the detail grid - either a chart, example group, or evaluation
@@ -230,6 +232,8 @@ struct App {
     session_repo_path: String,
     session_command: String,
     session_skip_tmux: bool,
+    session_auto_shutdown: bool,
+    session_auto_shutdown_delay: String,
     session_modal_focus: SessionModalField,
     setup_rx: Option<mpsc::Receiver<SetupMessage>>,
     compared_runs: Vec<usize>,
@@ -303,6 +307,8 @@ impl App {
             session_repo_path: String::new(),
             session_command: String::new(),
             session_skip_tmux: false,
+            session_auto_shutdown: false,
+            session_auto_shutdown_delay: "10".to_string(),
             session_modal_focus: SessionModalField::default(),
             setup_rx: None,
             compared_runs: Vec::new(),
@@ -585,6 +591,19 @@ impl App {
         let python_version = self.session_python_version.clone();
         let command = self.session_command.clone();
         let skip_tmux = self.session_skip_tmux;
+        let instance_id = instance.id.clone();
+        let provider_name = match instance.provider {
+            Provider::Lambda => "lambda",
+            Provider::Vast => "vast",
+            Provider::Prime => "prime",
+        }
+        .to_string();
+        let auto_shutdown = self.session_auto_shutdown;
+        let auto_shutdown_delay: Option<u64> = if auto_shutdown {
+            self.session_auto_shutdown_delay.parse().ok()
+        } else {
+            None
+        };
         let (tx, rx) = mpsc::channel();
         self.setup_rx = Some(rx);
         self.infra_error = Some("Syncing code...".to_string());
@@ -731,7 +750,14 @@ impl App {
 
             let _ = tx.send(SetupMessage::Status("Uploading script...".to_string()));
 
-            let script = generate_script(&python_version, &command, skip_tmux);
+            let script = generate_script_with_options(&BootstrapOptions {
+                python_version,
+                command,
+                skip_tmux,
+                instance_id: if auto_shutdown { Some(instance_id) } else { None },
+                provider: if auto_shutdown { Some(provider_name) } else { None },
+                auto_shutdown_delay,
+            });
 
             let upload_status = std::process::Command::new("bash")
                 .arg("-c")
@@ -2035,25 +2061,54 @@ impl App {
                     SessionModalField::PythonVersion => SessionModalField::RepoPath,
                     SessionModalField::RepoPath => SessionModalField::Command,
                     SessionModalField::Command => SessionModalField::SkipTmux,
-                    SessionModalField::SkipTmux => SessionModalField::PythonVersion,
+                    SessionModalField::SkipTmux => SessionModalField::AutoShutdown,
+                    SessionModalField::AutoShutdown => {
+                        if self.session_auto_shutdown {
+                            SessionModalField::AutoShutdownDelay
+                        } else {
+                            SessionModalField::PythonVersion
+                        }
+                    }
+                    SessionModalField::AutoShutdownDelay => SessionModalField::PythonVersion,
                 };
             }
             KeyCode::BackTab => {
                 self.session_modal_focus = match self.session_modal_focus {
-                    SessionModalField::PythonVersion => SessionModalField::SkipTmux,
+                    SessionModalField::PythonVersion => {
+                        if self.session_auto_shutdown {
+                            SessionModalField::AutoShutdownDelay
+                        } else {
+                            SessionModalField::AutoShutdown
+                        }
+                    }
                     SessionModalField::RepoPath => SessionModalField::PythonVersion,
                     SessionModalField::Command => SessionModalField::RepoPath,
                     SessionModalField::SkipTmux => SessionModalField::Command,
+                    SessionModalField::AutoShutdown => SessionModalField::SkipTmux,
+                    SessionModalField::AutoShutdownDelay => SessionModalField::AutoShutdown,
                 };
             }
-            KeyCode::Char(' ') if self.session_modal_focus == SessionModalField::SkipTmux => {
+            KeyCode::Char(' ')
+                if self.session_modal_focus == SessionModalField::SkipTmux =>
+            {
                 self.session_skip_tmux = !self.session_skip_tmux;
+            }
+            KeyCode::Char(' ')
+                if self.session_modal_focus == SessionModalField::AutoShutdown =>
+            {
+                self.session_auto_shutdown = !self.session_auto_shutdown;
             }
             KeyCode::Char(c) => match self.session_modal_focus {
                 SessionModalField::PythonVersion => self.session_python_version.push(c),
                 SessionModalField::RepoPath => self.session_repo_path.push(c),
                 SessionModalField::Command => self.session_command.push(c),
                 SessionModalField::SkipTmux => {}
+                SessionModalField::AutoShutdown => {}
+                SessionModalField::AutoShutdownDelay => {
+                    if c.is_ascii_digit() {
+                        self.session_auto_shutdown_delay.push(c);
+                    }
+                }
             },
             KeyCode::Backspace => match self.session_modal_focus {
                 SessionModalField::PythonVersion => {
@@ -2066,6 +2121,10 @@ impl App {
                     self.session_command.pop();
                 }
                 SessionModalField::SkipTmux => {}
+                SessionModalField::AutoShutdown => {}
+                SessionModalField::AutoShutdownDelay => {
+                    self.session_auto_shutdown_delay.pop();
+                }
             },
             KeyCode::Enter => {
                 if let Some(instance) = self.session_modal_instance.take() {
@@ -2079,6 +2138,8 @@ impl App {
 
     fn open_session_modal(&mut self, instance: &Instance) {
         self.session_skip_tmux = false;
+        self.session_auto_shutdown = false;
+        self.session_auto_shutdown_delay = "10".to_string();
         self.session_modal_instance = Some(instance.clone());
         self.session_modal_focus = SessionModalField::PythonVersion;
         self.session_modal_open = true;
@@ -2148,6 +2209,7 @@ fn main() -> Result<()> {
         Command::Pull(options) => run_s3_command("pull", options),
         Command::Push(options) => run_s3_command("push", options),
         Command::Sync(options) => run_s3_command("sync", options),
+        Command::Watch(options) => run_watch(options),
     }
 }
 
@@ -2379,6 +2441,227 @@ fn run_s3_command(cmd: &str, options: SyncOptions) -> Result<()> {
     })
 }
 
+fn run_watch(options: WatchOptions) -> Result<()> {
+    let s3_config = s3::load_config()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "S3 not configured. Create ~/.extty/s3/config.toml with:\n\n\
+             bucket = \"your-bucket\"\n\
+             region = \"us-west-2\"\n"
+        )
+    })?;
+
+    let infra_config = load_config().unwrap_or_default();
+
+    println!(
+        "Watching for auto-shutdown signals (polling every {}s)...",
+        options.poll_interval_secs
+    );
+
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    loop {
+        if let Err(e) = runtime.block_on(watch_poll_cycle(&s3_config, &infra_config)) {
+            eprintln!("Watch poll error: {}", e);
+        }
+        std::thread::sleep(Duration::from_secs(options.poll_interval_secs));
+    }
+}
+
+async fn watch_poll_cycle(
+    s3_config: &s3::S3Config,
+    infra_config: &InfraConfig,
+) -> Result<()> {
+    let prefix = if s3_config.prefix.is_empty() {
+        "auto-shutdown/".to_string()
+    } else {
+        format!("{}/auto-shutdown/", s3_config.prefix)
+    };
+
+    let aws_client = build_s3_client(s3_config).await?;
+
+    let response = aws_client
+        .list_objects_v2()
+        .bucket(&s3_config.bucket)
+        .prefix(&prefix)
+        .send()
+        .await;
+
+    let response = match response {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to list auto-shutdown signals: {}", e);
+            return Ok(());
+        }
+    };
+
+    let objects = response.contents();
+    if objects.is_empty() {
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now();
+
+    for object in objects {
+        let key = match object.key() {
+            Some(k) => k,
+            None => continue,
+        };
+
+        if !key.ends_with(".json") {
+            continue;
+        }
+
+        let body = match aws_client
+            .get_object()
+            .bucket(&s3_config.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(resp) => resp.body.collect().await?.into_bytes(),
+            Err(e) => {
+                eprintln!("Failed to read signal {}: {}", key, e);
+                continue;
+            }
+        };
+
+        let signal: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Failed to parse signal {}: {}", key, e);
+                continue;
+            }
+        };
+
+        let instance_id = match signal.get("instance_id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let provider_str = match signal.get("provider").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let finished_at_str = match signal.get("finished_at").and_then(|v| v.as_str()) {
+            Some(f) => f,
+            None => continue,
+        };
+        let delay_minutes = signal
+            .get("delay_minutes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let finished_at = match chrono::DateTime::parse_from_rfc3339(finished_at_str)
+            .or_else(|_| chrono::DateTime::parse_from_str(finished_at_str, "%Y-%m-%dT%H:%M:%S%z"))
+        {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(e) => {
+                eprintln!(
+                    "Failed to parse finished_at '{}' for {}: {}",
+                    finished_at_str, instance_id, e
+                );
+                continue;
+            }
+        };
+
+        let shutdown_at = finished_at + chrono::Duration::minutes(delay_minutes as i64);
+        if now < shutdown_at {
+            let remaining = shutdown_at - now;
+            println!(
+                "[{}] {} mins remaining before shutdown",
+                instance_id,
+                remaining.num_minutes()
+            );
+            continue;
+        }
+
+        let provider = match provider_str {
+            "lambda" => Provider::Lambda,
+            "vast" => Provider::Vast,
+            "prime" => Provider::Prime,
+            other => {
+                eprintln!("Unknown provider '{}' for instance {}", other, instance_id);
+                continue;
+            }
+        };
+
+        let provider_config = infra_config.get_provider_config(provider);
+        let api_key = match &provider_config.api_key {
+            Some(k) => k,
+            None => {
+                eprintln!(
+                    "No API key configured for {} - cannot terminate {}",
+                    provider.display_name(),
+                    instance_id
+                );
+                continue;
+            }
+        };
+
+        let cloud = get_provider(provider, api_key);
+        println!("Terminating instance {} ({})...", instance_id, provider.display_name());
+
+        match cloud.terminate(&[instance_id.clone()]) {
+            Ok(()) => {
+                println!("Terminated instance {}", instance_id);
+            }
+            Err(e) => {
+                eprintln!("Failed to terminate {}: {}", instance_id, e);
+            }
+        }
+
+        match aws_client
+            .delete_object()
+            .bucket(&s3_config.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                println!("Cleaned up signal file for {}", instance_id);
+            }
+            Err(e) => {
+                eprintln!("Failed to delete signal {}: {}", key, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn build_s3_client(config: &s3::S3Config) -> Result<aws_sdk_s3::Client> {
+    let mut aws_config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
+
+    let region = config
+        .region
+        .clone()
+        .unwrap_or_else(|| "us-east-1".to_string());
+    aws_config_builder = aws_config_builder.region(aws_config::Region::new(region));
+
+    if let (Some(access_key), Some(secret_key)) =
+        (&config.access_key_id, &config.secret_access_key)
+    {
+        aws_config_builder = aws_config_builder.credentials_provider(
+            aws_sdk_s3::config::Credentials::new(
+                access_key.clone(),
+                secret_key.clone(),
+                None,
+                None,
+                "extty",
+            ),
+        );
+    }
+
+    let aws_config = aws_config_builder.load().await;
+    let mut s3_config_builder =
+        aws_sdk_s3::config::Builder::from(&aws_config).force_path_style(true);
+
+    if let Some(endpoint) = &config.endpoint_url {
+        s3_config_builder = s3_config_builder.endpoint_url(endpoint);
+    }
+
+    Ok(aws_sdk_s3::Client::from_conf(s3_config_builder.build()))
+}
+
 fn parse_target(target: &Option<String>) -> (Option<String>, Option<String>) {
     match target {
         None => (None, None),
@@ -2446,6 +2729,7 @@ enum Command {
     Pull(SyncOptions),
     Push(SyncOptions),
     Sync(SyncOptions),
+    Watch(WatchOptions),
 }
 
 struct TuiOptions {
@@ -2457,6 +2741,10 @@ struct SyncOptions {
     target: Option<String>,
     force: bool,
     dry_run: bool,
+}
+
+struct WatchOptions {
+    poll_interval_secs: u64,
 }
 
 fn parse_command() -> Result<Command> {
@@ -2480,13 +2768,18 @@ fn parse_command() -> Result<Command> {
                 _ => unreachable!(),
             }
         }
+        "watch" => {
+            args.remove(0);
+            let opts = parse_watch_options(&mut args)?;
+            Ok(Command::Watch(opts))
+        }
         "--remote" | "--token" => {
             let opts = parse_tui_options(&mut args)?;
             Ok(Command::Tui(opts))
         }
         other if other.starts_with('-') => Err(anyhow::anyhow!("Unknown option: {}", other)),
         _ => Err(anyhow::anyhow!(
-            "Unknown command: {}. Valid commands: pull, push, sync",
+            "Unknown command: {}. Valid commands: pull, push, sync, watch",
             args[0]
         )),
     }
@@ -2558,6 +2851,29 @@ fn parse_sync_options(args: &mut Vec<String>) -> Result<SyncOptions> {
         force,
         dry_run,
     })
+}
+
+fn parse_watch_options(args: &mut Vec<String>) -> Result<WatchOptions> {
+    let mut poll_interval_secs: u64 = 60;
+
+    while !args.is_empty() {
+        match args[0].as_str() {
+            "--interval" => {
+                args.remove(0);
+                poll_interval_secs = args
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("--interval requires a value in seconds"))?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--interval must be a number"))?;
+                args.remove(0);
+            }
+            other => {
+                return Err(anyhow::anyhow!("Unknown option: {}", other));
+            }
+        }
+    }
+
+    Ok(WatchOptions { poll_interval_secs })
 }
 
 fn remote_runs_dir() -> PathBuf {
@@ -5843,7 +6159,12 @@ fn render_session_modal(app: &App, frame: &mut Frame) {
 
     let area = frame.area();
     let popup_width = 52u16.min(area.width.saturating_sub(4));
-    let popup_height = 14u16;
+    let base_height = 16u16;
+    let popup_height = if app.session_auto_shutdown {
+        base_height + 1
+    } else {
+        base_height
+    };
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -5874,30 +6195,22 @@ fn render_session_modal(app: &App, frame: &mut Frame) {
     let unfocused_style = Style::default().fg(Color::Gray);
     let label_style = Style::default().fg(Color::DarkGray);
 
-    let py_style = if app.session_modal_focus == SessionModalField::PythonVersion {
-        focused_style
-    } else {
-        unfocused_style
-    };
-    let repo_style = if app.session_modal_focus == SessionModalField::RepoPath {
-        focused_style
-    } else {
-        unfocused_style
-    };
-    let cmd_style = if app.session_modal_focus == SessionModalField::Command {
-        focused_style
-    } else {
-        unfocused_style
-    };
-    let tmux_style = if app.session_modal_focus == SessionModalField::SkipTmux {
-        focused_style
-    } else {
-        unfocused_style
+    let style_for = |field: SessionModalField| -> Style {
+        if app.session_modal_focus == field {
+            focused_style
+        } else {
+            unfocused_style
+        }
     };
 
-    let checkbox = if app.session_skip_tmux { "[x]" } else { "[ ]" };
+    let tmux_checkbox = if app.session_skip_tmux { "[x]" } else { "[ ]" };
+    let shutdown_checkbox = if app.session_auto_shutdown {
+        "[x]"
+    } else {
+        "[ ]"
+    };
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("Instance: ", label_style),
             Span::styled(&instance_name, Style::default().fg(NEON_YELLOW)),
@@ -5905,15 +6218,24 @@ fn render_session_modal(app: &App, frame: &mut Frame) {
         Line::from(""),
         Line::from(vec![
             Span::styled("Python version: ", label_style),
-            Span::styled(format!("[{}]", python_display), py_style),
+            Span::styled(
+                format!("[{}]", python_display),
+                style_for(SessionModalField::PythonVersion),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Local repo:     ", label_style),
-            Span::styled(format!("[{}]", repo_display), repo_style),
+            Span::styled(
+                format!("[{}]", repo_display),
+                style_for(SessionModalField::RepoPath),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Command:        ", label_style),
-            Span::styled(format!("[{}]", command_display), cmd_style),
+            Span::styled(
+                format!("[{}]", command_display),
+                style_for(SessionModalField::Command),
+            ),
         ]),
         Line::from(Span::styled(
             "  (runs from ~/project on remote)",
@@ -5921,22 +6243,49 @@ fn render_session_modal(app: &App, frame: &mut Frame) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!("{} ", checkbox), tmux_style),
-            Span::styled("Skip tmux (already running)", tmux_style),
+            Span::styled(
+                format!("{} ", tmux_checkbox),
+                style_for(SessionModalField::SkipTmux),
+            ),
+            Span::styled(
+                "Skip tmux (already running)",
+                style_for(SessionModalField::SkipTmux),
+            ),
         ]),
-        Line::from(""),
         Line::from(vec![
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("Tab", Style::default().fg(NEON_CYAN)),
-            Span::styled("] next  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
-            Span::styled("] Launch  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ", shutdown_checkbox),
+                style_for(SessionModalField::AutoShutdown),
+            ),
+            Span::styled(
+                "Auto-shutdown after command",
+                style_for(SessionModalField::AutoShutdown),
+            ),
         ]),
     ];
+
+    if app.session_auto_shutdown {
+        lines.push(Line::from(vec![
+            Span::styled("  Delay (min):  ", label_style),
+            Span::styled(
+                format!("[{}]", app.session_auto_shutdown_delay),
+                style_for(SessionModalField::AutoShutdownDelay),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+        Span::styled("] next  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+        Span::styled("] Launch  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+    ]));
 
     let block = Block::default()
         .title(Span::styled(
