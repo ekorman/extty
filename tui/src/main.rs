@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -897,10 +897,38 @@ impl App {
             .into_iter()
             .collect();
         metric_names.sort();
-        metric_names
+
+        let mut example_names: Vec<String> = self
+            .compared_runs
+            .iter()
+            .filter_map(|&idx| self.runs.get(idx))
+            .flat_map(|run| run.examples.keys().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        example_names.sort();
+
+        let mut cards: Vec<Card> = metric_names
             .into_iter()
             .map(|name| Card::Chart { name })
-            .collect()
+            .collect();
+        cards.extend(
+            example_names
+                .into_iter()
+                .map(|name| Card::Examples { name }),
+        );
+        cards
+    }
+
+    fn compare_example_steps(&self, name: &str) -> Vec<u64> {
+        let steps: BTreeSet<u64> = self
+            .compared_runs
+            .iter()
+            .filter_map(|&idx| self.runs.get(idx))
+            .flat_map(|run| run.examples.get(name).into_iter().flatten())
+            .map(|e| e.step)
+            .collect();
+        steps.into_iter().collect()
     }
 
     fn get_model_evaluation(&self, name: &str) -> Option<&Evaluation> {
@@ -1424,6 +1452,9 @@ impl App {
         let current_card = cards.get(self.selected_card);
 
         let example_count = match current_card {
+            Some(Card::Examples { name }) if self.compare_focused => {
+                self.compare_example_steps(name).len()
+            }
             Some(Card::Examples { name }) => self
                 .current_run()
                 .and_then(|r| r.examples.get(name))
@@ -1440,6 +1471,23 @@ impl App {
         };
 
         let prompt_count = match current_card {
+            Some(Card::Examples { name }) if self.compare_focused => {
+                let steps = self.compare_example_steps(name);
+                let target_step = steps.get(self.selected_example).copied();
+                target_step
+                    .map(|step| {
+                        self.compared_runs
+                            .iter()
+                            .filter_map(|&idx| self.runs.get(idx))
+                            .filter_map(|run| {
+                                run.examples.get(name)?.iter().find(|e| e.step == step)
+                            })
+                            .map(|ex| ex.prompts.len())
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0)
+            }
             Some(Card::Examples { name }) => self
                 .current_run()
                 .and_then(|r| r.examples.get(name))
@@ -1455,6 +1503,24 @@ impl App {
         };
 
         let response_count = match current_card {
+            Some(Card::Examples { name }) if self.compare_focused => {
+                let steps = self.compare_example_steps(name);
+                let target_step = steps.get(self.selected_example).copied();
+                target_step
+                    .map(|step| {
+                        self.compared_runs
+                            .iter()
+                            .filter_map(|&idx| self.runs.get(idx))
+                            .filter_map(|run| {
+                                run.examples.get(name)?.iter().find(|e| e.step == step)
+                            })
+                            .filter_map(|ex| ex.responses.get(self.selected_prompt))
+                            .map(|r| r.len())
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0)
+            }
             Some(Card::Examples { name }) => self
                 .current_run()
                 .and_then(|r| r.examples.get(name))
@@ -3384,23 +3450,29 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
         let card_area = Rect::new(x, y, card_width.min(grid_area.right() - x), card_height);
         let is_selected = i == app.selected_card;
 
-        if let Card::Chart { name } = card {
-            let run_data: Vec<CompareRunData> = app
-                .compared_runs
-                .iter()
-                .enumerate()
-                .filter_map(|(ci, &run_idx)| {
-                    let run = app.runs.get(run_idx)?;
-                    let color = COMPARE_COLORS[ci % COMPARE_COLORS.len()];
-                    let data: Vec<(f64, f64)> = run
-                        .metrics
-                        .get(name)
-                        .map(|pts| pts.iter().map(|p| (p.step as f64, p.value)).collect())
-                        .unwrap_or_default();
-                    Some((run.display_name(), color, data))
-                })
-                .collect();
-            render_comparison_chart(frame, card_area, name, &run_data, is_selected);
+        match card {
+            Card::Chart { name } => {
+                let run_data: Vec<CompareRunData> = app
+                    .compared_runs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ci, &run_idx)| {
+                        let run = app.runs.get(run_idx)?;
+                        let color = COMPARE_COLORS[ci % COMPARE_COLORS.len()];
+                        let data: Vec<(f64, f64)> = run
+                            .metrics
+                            .get(name)
+                            .map(|pts| pts.iter().map(|p| (p.step as f64, p.value)).collect())
+                            .unwrap_or_default();
+                        Some((run.display_name(), color, data))
+                    })
+                    .collect();
+                render_comparison_chart(frame, card_area, name, &run_data, is_selected);
+            }
+            Card::Examples { name } => {
+                render_compare_examples_card(frame, card_area, name, app, is_selected);
+            }
+            _ => {}
         }
     }
 
@@ -3416,6 +3488,81 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
         Span::styled("] focus", Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
+fn render_compare_examples_card(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    app: &App,
+    selected: bool,
+) {
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    let max_lines = area.height.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (i, &run_idx) in app.compared_runs.iter().enumerate() {
+        if lines.len() >= max_lines {
+            break;
+        }
+        let color = COMPARE_COLORS[i % COMPARE_COLORS.len()];
+        if let Some(run) = app.runs.get(run_idx) {
+            let count = run.examples.get(name).map(|e| e.len()).unwrap_or(0);
+            let label = if count > 0 {
+                format!("{}: {} examples", run.display_name(), count)
+            } else {
+                format!("{}: —", run.display_name())
+            };
+            lines.push(Line::from(vec![
+                Span::styled("● ", Style::default().fg(color)),
+                Span::styled(label, Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+
+    if lines.len() < max_lines
+        && let Some(example) = app
+            .compared_runs
+            .iter()
+            .filter_map(|&idx| app.runs.get(idx))
+            .filter_map(|run| run.examples.get(name))
+            .flat_map(|examples| examples.last())
+            .next()
+    {
+        lines.push(Line::from(""));
+        let preview: String = example
+            .prompts
+            .first()
+            .map(|s| s.chars().take(40).collect::<String>())
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled("Q: ", Style::default().fg(NEON_YELLOW).bold()),
+            Span::styled(format!("{}...", preview), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    let title = Line::from(vec![
+        Span::styled(format!("{} ", name), title_style),
+        Span::styled("(examples)", Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+
+    frame.render_widget(paragraph, area);
 }
 
 fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value) {
@@ -3914,26 +4061,32 @@ fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Min(5), Constraint::Length(1)])
         .split(area);
 
-    if let Card::Chart { name } = card {
-        let run_data: Vec<CompareRunData> = app
-            .compared_runs
-            .iter()
-            .enumerate()
-            .filter_map(|(ci, &run_idx)| {
-                let run = app.runs.get(run_idx)?;
-                let color = COMPARE_COLORS[ci % COMPARE_COLORS.len()];
-                let data: Vec<(f64, f64)> = run
-                    .metrics
-                    .get(name)
-                    .map(|pts| pts.iter().map(|p| (p.step as f64, p.value)).collect())
-                    .unwrap_or_default();
-                Some((run.display_name(), color, data))
-            })
-            .collect();
-        render_comparison_chart(frame, chunks[0], name, &run_data, true);
+    match card {
+        Card::Chart { name } => {
+            let run_data: Vec<CompareRunData> = app
+                .compared_runs
+                .iter()
+                .enumerate()
+                .filter_map(|(ci, &run_idx)| {
+                    let run = app.runs.get(run_idx)?;
+                    let color = COMPARE_COLORS[ci % COMPARE_COLORS.len()];
+                    let data: Vec<(f64, f64)> = run
+                        .metrics
+                        .get(name)
+                        .map(|pts| pts.iter().map(|p| (p.step as f64, p.value)).collect())
+                        .unwrap_or_default();
+                    Some((run.display_name(), color, data))
+                })
+                .collect();
+            render_comparison_chart(frame, chunks[0], name, &run_data, true);
+        }
+        Card::Examples { name } => {
+            render_focused_compare_examples(app, frame, chunks[0], name);
+        }
+        _ => {}
     }
 
-    let footer = Line::from(vec![
+    let mut footer_spans = vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
         Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
@@ -3944,8 +4097,183 @@ fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
             format!("{}/{}", app.selected_card + 1, cards.len()),
             Style::default().fg(NEON_GREEN),
         ),
-    ]);
+    ];
+
+    if let Card::Examples { name } = card {
+        let steps = app.compare_example_steps(name);
+        if !steps.is_empty() {
+            footer_spans.extend(vec![
+                Span::styled("  [", Style::default().fg(DIM_CYAN)),
+                Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                Span::styled("] step ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}/{}", app.selected_example + 1, steps.len()),
+                    Style::default().fg(NEON_GREEN),
+                ),
+            ]);
+        }
+    }
+
+    let footer = Line::from(footer_spans);
     frame.render_widget(Paragraph::new(footer), chunks[1]);
+}
+
+fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, name: &str) {
+    let steps = app.compare_example_steps(name);
+    if steps.is_empty() {
+        frame.render_widget(Paragraph::new("No examples available"), area);
+        return;
+    }
+
+    let step_idx = app.selected_example.min(steps.len().saturating_sub(1));
+    let current_step = steps[step_idx];
+
+    let header_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+
+    let header = Line::from(vec![
+        Span::styled("◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled(name, Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(" │ ", Style::default().fg(DIM_CYAN)),
+        Span::styled("step ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", current_step), Style::default().fg(NEON_CYAN)),
+        Span::styled(
+            format!("  ({}/{})", step_idx + 1, steps.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(header), header_chunks[0]);
+
+    let num_runs = app.compared_runs.len();
+    let constraints: Vec<Constraint> = (0..num_runs)
+        .map(|_| Constraint::Ratio(1, num_runs as u32))
+        .collect();
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(header_chunks[1]);
+
+    for (ci, &run_idx) in app.compared_runs.iter().enumerate() {
+        let Some(run) = app.runs.get(run_idx) else {
+            continue;
+        };
+        let color = COMPARE_COLORS[ci % COMPARE_COLORS.len()];
+        let col_area = columns[ci];
+
+        let example = run
+            .examples
+            .get(name)
+            .and_then(|examples| examples.iter().find(|e| e.step == current_step));
+
+        let col_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(col_area);
+
+        if let Some(ex) = example {
+            let prompt_text = ex
+                .prompts
+                .get(app.selected_prompt)
+                .cloned()
+                .unwrap_or_default();
+
+            let prompt_block = Block::default()
+                .title(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(color)),
+                    Span::styled(
+                        format!("{} ", run.display_name()),
+                        Style::default().fg(color),
+                    ),
+                    Span::styled("PROMPT", Style::default().fg(NEON_YELLOW).bold()),
+                ]))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color));
+
+            let prompt = Paragraph::new(prompt_text)
+                .style(Style::default().fg(Color::White))
+                .block(prompt_block)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((app.prompt_scroll_offset as u16, 0));
+            frame.render_widget(prompt, col_chunks[0]);
+
+            let response_text = ex
+                .responses
+                .get(app.selected_prompt)
+                .and_then(|r| r.get(app.selected_response))
+                .cloned()
+                .unwrap_or_default();
+
+            let mut response_title_spans = vec![Span::styled(
+                "RESPONSE",
+                Style::default().fg(NEON_GREEN).bold(),
+            )];
+
+            let reward = ex
+                .rewards
+                .as_ref()
+                .and_then(|rewards| rewards.get(app.selected_prompt))
+                .and_then(|prompt_rewards| prompt_rewards.get(app.selected_response));
+
+            if let Some(reward) = reward {
+                response_title_spans.push(Span::styled(" │ ", Style::default().fg(DIM_CYAN)));
+                match reward {
+                    Reward::Scalar(v) => {
+                        let rc = reward_color(*v);
+                        response_title_spans.push(Span::styled(
+                            format!("reward: {:.2}", v),
+                            Style::default().fg(rc),
+                        ));
+                    }
+                    Reward::Components(map) => {
+                        let mut parts: Vec<(&String, &f64)> = map.iter().collect();
+                        parts.sort_by_key(|(k, _)| *k);
+                        for (i, (key, value)) in parts.iter().enumerate() {
+                            let rc = reward_color(**value);
+                            if i > 0 {
+                                response_title_spans.push(Span::styled("  ", Style::default()));
+                            }
+                            response_title_spans.push(Span::styled(
+                                format!("{}: {:.1}", key, value),
+                                Style::default().fg(rc),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let response_block = Block::default()
+                .title(Line::from(response_title_spans))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color));
+
+            let response = Paragraph::new(response_text)
+                .style(Style::default().fg(Color::Gray))
+                .block(response_block)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((app.response_scroll_offset as u16, 0));
+            frame.render_widget(response, col_chunks[1]);
+        } else {
+            let block = Block::default()
+                .title(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(color)),
+                    Span::styled(run.display_name(), Style::default().fg(color)),
+                ]))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color));
+
+            let msg = Paragraph::new(Span::styled(
+                format!("No example at step {}", current_step),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .block(block);
+            frame.render_widget(msg, col_area);
+        }
+    }
 }
 
 fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
