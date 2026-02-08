@@ -912,7 +912,11 @@ impl App {
             .into_iter()
             .map(|name| Card::Chart { name })
             .collect();
-        cards.extend(example_names.into_iter().map(|name| Card::Examples { name }));
+        cards.extend(
+            example_names
+                .into_iter()
+                .map(|name| Card::Examples { name }),
+        );
         cards
     }
 
@@ -1476,10 +1480,7 @@ impl App {
                             .iter()
                             .filter_map(|&idx| self.runs.get(idx))
                             .filter_map(|run| {
-                                run.examples
-                                    .get(name)?
-                                    .iter()
-                                    .find(|e| e.step == step)
+                                run.examples.get(name)?.iter().find(|e| e.step == step)
                             })
                             .next()
                     })
@@ -1510,10 +1511,7 @@ impl App {
                             .iter()
                             .filter_map(|&idx| self.runs.get(idx))
                             .filter_map(|run| {
-                                run.examples
-                                    .get(name)?
-                                    .iter()
-                                    .find(|e| e.step == step)
+                                run.examples.get(name)?.iter().find(|e| e.step == step)
                             })
                             .next()
                     })
@@ -3462,9 +3460,7 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
                         let data: Vec<(f64, f64)> = run
                             .metrics
                             .get(name)
-                            .map(|pts| {
-                                pts.iter().map(|p| (p.step as f64, p.value)).collect()
-                            })
+                            .map(|pts| pts.iter().map(|p| (p.step as f64, p.value)).collect())
                             .unwrap_or_default();
                         Some((run.display_name(), color, data))
                     })
@@ -3515,11 +3511,7 @@ fn render_compare_examples_card(
         }
         let color = COMPARE_COLORS[i % COMPARE_COLORS.len()];
         if let Some(run) = app.runs.get(run_idx) {
-            let count = run
-                .examples
-                .get(name)
-                .map(|e| e.len())
-                .unwrap_or(0);
+            let count = run.examples.get(name).map(|e| e.len()).unwrap_or(0);
             let label = if count > 0 {
                 format!("{}: {} examples", run.display_name(), count)
             } else {
@@ -3532,26 +3524,25 @@ fn render_compare_examples_card(
         }
     }
 
-    if lines.len() < max_lines {
-        if let Some(example) = app
+    if lines.len() < max_lines
+        && let Some(example) = app
             .compared_runs
             .iter()
             .filter_map(|&idx| app.runs.get(idx))
             .filter_map(|run| run.examples.get(name))
             .flat_map(|examples| examples.last())
             .next()
-        {
-            lines.push(Line::from(""));
-            let preview: String = example
-                .prompts
-                .first()
-                .map(|s| s.chars().take(40).collect::<String>())
-                .unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::styled("Q: ", Style::default().fg(NEON_YELLOW).bold()),
-                Span::styled(format!("{}...", preview), Style::default().fg(Color::White)),
-            ]));
-        }
+    {
+        lines.push(Line::from(""));
+        let preview: String = example
+            .prompts
+            .first()
+            .map(|s| s.chars().take(40).collect::<String>())
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled("Q: ", Style::default().fg(NEON_YELLOW).bold()),
+            Span::styled(format!("{}...", preview), Style::default().fg(Color::White)),
+        ]));
     }
 
     let title = Line::from(vec![
@@ -4114,11 +4105,7 @@ fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
                 Span::styled("] step ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!(
-                        "{}/{}",
-                        app.selected_example + 1,
-                        steps.len()
-                    ),
+                    format!("{}/{}", app.selected_example + 1, steps.len()),
                     Style::default().fg(NEON_GREEN),
                 ),
             ]);
@@ -4132,10 +4119,7 @@ fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
 fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, name: &str) {
     let steps = app.compare_example_steps(name);
     if steps.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No examples available"),
-            area,
-        );
+        frame.render_widget(Paragraph::new("No examples available"), area);
         return;
     }
 
@@ -4220,9 +4204,10 @@ fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, nam
                 .cloned()
                 .unwrap_or_default();
 
-            let mut response_title_spans = vec![
-                Span::styled("RESPONSE", Style::default().fg(NEON_GREEN).bold()),
-            ];
+            let mut response_title_spans = vec![Span::styled(
+                "RESPONSE",
+                Style::default().fg(NEON_GREEN).bold(),
+            )];
 
             let reward = ex
                 .rewards
@@ -4246,8 +4231,7 @@ fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, nam
                         for (i, (key, value)) in parts.iter().enumerate() {
                             let rc = reward_color(**value);
                             if i > 0 {
-                                response_title_spans
-                                    .push(Span::styled("  ", Style::default()));
+                                response_title_spans.push(Span::styled("  ", Style::default()));
                             }
                             response_title_spans.push(Span::styled(
                                 format!("{}: {:.1}", key, value),
