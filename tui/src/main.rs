@@ -4236,7 +4236,7 @@ fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, nam
                                 response_title_spans.push(Span::styled("  ", Style::default()));
                             }
                             response_title_spans.push(Span::styled(
-                                format!("{}: {:.1}", key, value),
+                                format!("{}: {:.2}", key, value),
                                 Style::default().fg(rc),
                             ));
                         }
@@ -4969,7 +4969,7 @@ fn render_focused_evaluation(
                                 Style::default().fg(Color::DarkGray),
                             ));
                             response_title_spans.push(Span::styled(
-                                format!("{:.1}", value),
+                                format!("{:.2}", value),
                                 Style::default().fg(color),
                             ));
                         }
@@ -5135,7 +5135,7 @@ fn render_focused_example(
                         Style::default().fg(Color::DarkGray),
                     ));
                     response_title_spans.push(Span::styled(
-                        format!("{:.1}", value),
+                        format!("{:.2}", value),
                         Style::default().fg(color),
                     ));
                 }
