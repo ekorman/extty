@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 import subprocess
-import time
-
 import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
@@ -16,14 +13,7 @@ from extty.storage import (
     get_runs_dir,
 )
 from extty.system_monitor import SystemMonitor
-from extty.server import QueueStorage, ServerManager, ServerSettings, ServerInfo
 from extty.s3 import S3Config, S3Storage
-
-
-@dataclass(frozen=True)
-class ServerConfig:
-    enabled: bool
-    settings: ServerSettings | None = None
 
 
 class StorageSink(Protocol):
@@ -134,7 +124,6 @@ class Run:
         name: str | None = None,
         config: dict[str, Any] | None = None,
         system_metrics: bool = True,
-        server: ServerConfig | None = None,
         s3_config: S3Config | None = None,
     ) -> None:
         self.project = project
@@ -142,8 +131,6 @@ class Run:
         self.config = {**_collect_environment(), **(config or {})}
         self._system_metrics_enabled = system_metrics
 
-        self._server_manager: ServerManager | None = None
-        self._server_info: ServerInfo | None = None
         self._storage: StorageSink
         self._s3_storage: S3Storage | None = None
         self._meta: MetaData | None = None
@@ -153,38 +140,17 @@ class Run:
         if s3_config is not None:
             self._s3_storage = S3Storage(s3_config, project, self.name)
 
-        primary_storage: StorageSink
-        if server is not None and server.enabled:
-            settings = server.settings or ServerSettings()
-            self._server_manager = ServerManager(settings)
-            self._server_manager.start()
-            self._server_info = self._server_manager.info
-            started_at = datetime.now(timezone.utc).isoformat()
-            primary_storage = QueueStorage(
-                self._server_manager,
-                run_name=self.name,
-                project=project,
-                config=self.config,
-                started_at=started_at,
-            )
-            self._meta = MetaData(
-                project=project,
-                run_name=self.name,
-                config=self.config,
-                started_at=started_at,
-            )
-        else:
-            project_dir = project if project else "_default"
-            run_dir = get_runs_dir() / project_dir / self.name
-            local_storage = RunStorage(run_dir=run_dir)
-            primary_storage = local_storage
-            self._meta = MetaData(
-                project=project,
-                run_name=self.name,
-                config=self.config,
-                started_at=datetime.now(timezone.utc).isoformat(),
-            )
-            local_storage.write_meta(self._meta)
+        project_dir = project if project else "_default"
+        run_dir = get_runs_dir() / project_dir / self.name
+        local_storage = RunStorage(run_dir=run_dir)
+        primary_storage: StorageSink = local_storage
+        self._meta = MetaData(
+            project=project,
+            run_name=self.name,
+            config=self.config,
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        local_storage.write_meta(self._meta)
 
         if self._s3_storage and self._meta:
             self._s3_storage.write_meta(self._meta.to_dict())
@@ -305,13 +271,7 @@ class Run:
             if self._s3_storage:
                 self._s3_storage.write_meta(self._meta.to_dict())
 
-        if self._server_manager is not None:
-            time.sleep(5)
-            self._storage.close()
-            self._server_manager.stop()
-            self._server_manager = None
-        else:
-            self._storage.close()
+        self._storage.close()
 
     def __enter__(self) -> Run:
         return self
@@ -330,7 +290,3 @@ class Run:
         if isinstance(primary, RunStorage):
             return str(primary.run_dir)
         return ""
-
-    @property
-    def server_info(self) -> ServerInfo | None:
-        return self._server_info

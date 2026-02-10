@@ -4,12 +4,9 @@ import math
 
 if __name__ == "__main__":
     run = extty.init(
-        "demo-project",
-        server=True,
-        config={"lr": 0.001, "batch_size": 32, "model": "bert-base"},
+        "demo-project", config={"lr": 0.001, "batch_size": 32, "model": "bert-base"}
     )
 
-    print(f"server info: {run.server_info}")
     try:
         for i in range(1000):
             loss = 2.0 / (i + 1) + 0.1 * math.sin(i / 10)
