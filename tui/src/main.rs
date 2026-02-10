@@ -691,6 +691,23 @@ impl App {
 
             let remote_dir = project_remote_dir(std::path::Path::new(&repo_path));
 
+            let mkdir_result = std::process::Command::new("ssh")
+                .arg("-o").arg("StrictHostKeyChecking=no")
+                .args(port.as_ref().map(|p| vec!["-p", p.as_str()]).unwrap_or_default())
+                .arg(format!("{}@{}", ssh_user, host))
+                .arg(format!("mkdir -p $HOME/{}", remote_dir))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Ok(status) = mkdir_result
+                && !status.success()
+            {
+                let _ = tx.send(SetupMessage::Error(
+                    "Failed to create remote project directory".to_string(),
+                ));
+                return;
+            }
+
             rsync_cmd
                 .arg(&repo_with_slash)
                 .arg(format!("{}@{}:{}/", ssh_user, host, remote_dir));

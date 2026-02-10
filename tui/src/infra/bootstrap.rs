@@ -39,7 +39,7 @@ echo "Installing Python {python_version}..."
 uv python install {python_version}
 
 # Code already synced via rsync before SSH
-cd ~/{project_dir}
+cd ~/"{project_dir}"
 
 # Run command if specified
 if [ -n "{command}" ]; then
@@ -86,7 +86,7 @@ mod tests {
         let script = generate_script("3.11", "uv run train.py", false, "extty-projects/myproj");
         assert!(script.contains("uv python install 3.11"));
         assert!(script.contains("uv run train.py"));
-        assert!(script.contains("cd ~/extty-projects/myproj"));
+        assert!(script.contains("cd ~/\"extty-projects/myproj\""));
         assert!(script.contains("exec $SHELL"));
         assert!(script.contains("touch ~/.no_auto_tmux"));
     }
