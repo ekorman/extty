@@ -102,7 +102,6 @@ pub struct Run {
     pub end_time: Option<DateTime<Local>>,
     pub status: RunStatus,
     pub config: Option<serde_json::Value>,
-    pub remote_url: Option<String>,
     pub checkpoints: Vec<Checkpoint>,
     pub data_loaded: bool,
 }
@@ -130,7 +129,6 @@ struct RunMeta {
     finished_at: Option<String>,
     status: Option<String>,
     config: Option<serde_json::Value>,
-    remote_url: Option<String>,
 }
 
 // Get the directory where local runs are stored
@@ -149,19 +147,9 @@ fn models_dir() -> PathBuf {
         .join("models")
 }
 
-// Get the directory where remote runs are cached
-fn remote_runs_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("remote_runs")
-}
-
 // Load all runs with only metadata (no metrics/examples/checkpoints)
 pub fn load_runs_lightweight() -> Vec<Run> {
-    let mut runs = Vec::new();
-    runs.extend(load_runs_from_dir_lightweight(&runs_dir()));
-    runs.extend(load_runs_from_dir_lightweight(&remote_runs_dir()));
+    let mut runs = load_runs_from_dir_lightweight(&runs_dir());
     runs.sort_by(|a, b| b.name.cmp(&a.name));
     runs
 }
@@ -202,7 +190,7 @@ fn load_runs_from_dir_lightweight(dir: &Path) -> Vec<Run> {
 
 fn load_run_lightweight(path: &Path) -> Option<Run> {
     let name = path.file_name()?.to_string_lossy().to_string();
-    let (project, start_time, end_time, status, config, remote_url) = load_run_meta(path);
+    let (project, start_time, end_time, status, config) = load_run_meta(path);
     Some(Run {
         name,
         project,
@@ -213,7 +201,6 @@ fn load_run_lightweight(path: &Path) -> Option<Run> {
         end_time,
         status,
         config,
-        remote_url,
         checkpoints: vec![],
         data_loaded: false,
     })
@@ -248,7 +235,7 @@ fn load_run(path: &Path) -> Option<Run> {
     let examples = load_examples(path);
     let checkpoints = load_checkpoints(path);
 
-    let (project, start_time, end_time, status, config, remote_url) = load_run_meta(path);
+    let (project, start_time, end_time, status, config) = load_run_meta(path);
 
     Some(Run {
         name,
@@ -260,7 +247,6 @@ fn load_run(path: &Path) -> Option<Run> {
         end_time,
         status,
         config,
-        remote_url,
         checkpoints,
         data_loaded: true,
     })
@@ -520,17 +506,16 @@ type RunMetadata = (
     Option<DateTime<Local>>,   // end_time
     RunStatus,                 // status
     Option<serde_json::Value>, // config
-    Option<String>,            // remote_url
 );
 
 fn load_run_meta(path: &Path) -> RunMetadata {
     let meta_path = path.join("meta.json");
     let Ok(content) = fs::read_to_string(&meta_path) else {
-        return (None, None, None, RunStatus::Unknown, None, None);
+        return (None, None, None, RunStatus::Unknown, None);
     };
 
     let Ok(meta) = serde_json::from_str::<RunMeta>(&content) else {
-        return (None, None, None, RunStatus::Unknown, None, None);
+        return (None, None, None, RunStatus::Unknown, None);
     };
 
     let start_time = meta
@@ -555,14 +540,7 @@ fn load_run_meta(path: &Path) -> RunMetadata {
         }
     };
 
-    (
-        meta.project,
-        start_time,
-        end_time,
-        status,
-        meta.config,
-        meta.remote_url,
-    )
+    (meta.project, start_time, end_time, status, meta.config)
 }
 
 // Load all metrics from a run directory (recursively)

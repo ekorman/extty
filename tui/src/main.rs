@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,6 @@ const COMPARE_COLORS: [Color; 8] = [
 
 mod data;
 mod infra;
-mod remote;
 mod run;
 mod s3;
 use data::{
@@ -49,26 +48,10 @@ use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, generate_script,
     get_provider, load_config, project_remote_dir, save_config,
 };
-use remote::RemoteSync;
-
-enum SyncMessage {
-    SyncCompleted,
-}
-
 enum SetupMessage {
     Status(String),
     Done(String),
     Error(String),
-}
-
-fn run_sync_loop(mut remote_sync: RemoteSync, tx: mpsc::Sender<SyncMessage>) {
-    loop {
-        thread::sleep(Duration::from_millis(500));
-
-        if remote_sync.sync().is_ok() && tx.send(SyncMessage::SyncCompleted).is_err() {
-            break;
-        }
-    }
 }
 
 // View mode: Runs, Models, or Infra
@@ -440,15 +423,6 @@ impl App {
         self.selected_model_list_item = self
             .selected_model_list_item
             .min(entries.len().saturating_sub(1));
-    }
-
-    fn refresh_current_run(&mut self) {
-        if let Some(run) = self.runs.get(self.selected_run) {
-            let path = run.path.clone();
-            if let Some(updated) = data::reload_run(&path) {
-                self.runs[self.selected_run] = updated;
-            }
-        }
     }
 
     fn ensure_run_loaded(&mut self, idx: usize) {
@@ -2323,21 +2297,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_tui(options: TuiOptions) -> Result<()> {
-    let sync_rx: Option<Receiver<SyncMessage>> = if let Some(remote_url) = options.remote_url {
-        let runs_dir = remote_runs_dir();
-        let token = options
-            .token
-            .or_else(|| std::env::var("EX_REMOTE_TOKEN").ok());
-        let mut remote_sync = RemoteSync::new(remote_url, token, runs_dir)?;
-        remote_sync.sync()?;
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || run_sync_loop(remote_sync, tx));
-        Some(rx)
-    } else {
-        None
-    };
-
+fn run_tui(_options: TuiOptions) -> Result<()> {
     // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2354,30 +2314,6 @@ fn run_tui(options: TuiOptions) -> Result<()> {
         // Update terminal size
         let size = terminal.size()?;
         app.update_size(size.width, size.height);
-
-        // Check for sync messages from background thread (non-blocking)
-        if let Some(rx) = &sync_rx
-            && let Ok(SyncMessage::SyncCompleted) = rx.try_recv()
-        {
-            if app.view == View::Compare || (app.view == View::Focused && app.compare_focused) {
-                for &idx in &app.compared_runs.clone() {
-                    if let Some(run) = app.runs.get(idx) {
-                        let path = run.path.clone();
-                        if let Some(updated) = data::reload_run(&path) {
-                            app.runs[idx] = updated;
-                        }
-                    }
-                }
-            } else if matches!(
-                app.view,
-                View::RunDetail | View::ModelDetail | View::Focused
-            ) {
-                app.refresh_current_run();
-            } else {
-                app.refresh_runs();
-                app.refresh_models();
-            }
-        }
 
         // Periodic refresh of run and model lists (less frequent)
         if last_list_refresh.elapsed() >= list_refresh_interval {
@@ -2630,10 +2566,7 @@ enum Command {
     Run(run::RunOptions),
 }
 
-struct TuiOptions {
-    remote_url: Option<String>,
-    token: Option<String>,
-}
+struct TuiOptions;
 
 struct SyncOptions {
     target: Option<String>,
@@ -2645,10 +2578,7 @@ fn parse_command() -> Result<Command> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.is_empty() {
-        return Ok(Command::Tui(TuiOptions {
-            remote_url: None,
-            token: None,
-        }));
+        return Ok(Command::Tui(TuiOptions));
     }
 
     match args[0].as_str() {
@@ -2667,49 +2597,12 @@ fn parse_command() -> Result<Command> {
             let opts = parse_run_options(&mut args)?;
             Ok(Command::Run(opts))
         }
-        "--remote" | "--token" => {
-            let opts = parse_tui_options(&mut args)?;
-            Ok(Command::Tui(opts))
-        }
         other if other.starts_with('-') => Err(anyhow::anyhow!("Unknown option: {}", other)),
         _ => Err(anyhow::anyhow!(
             "Unknown command: {}. Valid commands: run, pull, push, sync",
             args[0]
         )),
     }
-}
-
-fn parse_tui_options(args: &mut Vec<String>) -> Result<TuiOptions> {
-    let mut remote_url = None;
-    let mut token = None;
-
-    while !args.is_empty() {
-        match args[0].as_str() {
-            "--remote" => {
-                args.remove(0);
-                remote_url = Some(
-                    args.first()
-                        .ok_or_else(|| anyhow::anyhow!("--remote requires a URL"))?
-                        .clone(),
-                );
-                args.remove(0);
-            }
-            "--token" => {
-                args.remove(0);
-                token = Some(
-                    args.first()
-                        .ok_or_else(|| anyhow::anyhow!("--token requires a value"))?
-                        .clone(),
-                );
-                args.remove(0);
-            }
-            other => {
-                return Err(anyhow::anyhow!("Unknown option: {}", other));
-            }
-        }
-    }
-
-    Ok(TuiOptions { remote_url, token })
 }
 
 fn parse_run_options(args: &mut Vec<String>) -> Result<run::RunOptions> {
@@ -2816,13 +2709,6 @@ fn parse_sync_options(args: &mut Vec<String>) -> Result<SyncOptions> {
         force,
         dry_run,
     })
-}
-
-fn remote_runs_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("remote_runs")
 }
 
 fn render(app: &App, frame: &mut Frame) {
@@ -2945,7 +2831,7 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
                         Color::DarkGray
                     };
 
-                    let mut spans = vec![
+                    let spans = vec![
                         Span::styled(check, Style::default().fg(check_color)),
                         Span::styled(" └─ ", Style::default().fg(DIM_CYAN)),
                         Span::styled(status_icon, Style::default().fg(status_color)),
@@ -2955,13 +2841,6 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
                         Span::styled(" → ", Style::default().fg(DIM_CYAN)),
                         Span::styled(end_str, time_style),
                     ];
-                    if let Some(url) = &run.remote_url {
-                        spans.push(Span::styled("  @ ", Style::default().fg(DIM_CYAN)));
-                        spans.push(Span::styled(
-                            url.clone(),
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                    }
                     ListItem::new(Line::from(spans))
                 }
             }
@@ -3258,13 +3137,6 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         ));
         header_spans.push(Span::styled(
             " checkpoints",
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    if let Some(url) = &run.remote_url {
-        header_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
-        header_spans.push(Span::styled(
-            url.clone(),
             Style::default().fg(Color::DarkGray),
         ));
     }

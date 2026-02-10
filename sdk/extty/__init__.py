@@ -9,8 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Callable, ParamSpec, TypeVar
 
 from extty.example import BatchExample, Example
-from extty.run import Run, ServerConfig
-from extty.server import ServerSettings
+from extty.run import Run
 from extty.storage import log_model_evaluation, generate_random_name, get_runs_dir
 from extty.s3 import S3Config
 
@@ -43,13 +42,6 @@ def init(
     name: str | None = None,
     config: dict[str, Any] | None = None,
     system_metrics: bool = True,
-    server: bool = False,
-    server_host: str = "0.0.0.0",
-    server_port: int = 0,
-    server_token: str | None = None,
-    server_max_metric_points: int = 10_000,
-    server_max_example_points: int = 5_000,
-    server_max_system_points: int = 2_000,
 ) -> Run:
     """
     Initialize a new experiment run.
@@ -64,20 +56,6 @@ def init(
         Hyperparameters and configuration to log.
     system_metrics : bool, default True
         Whether to automatically collect system metrics (RAM, GPU).
-    server : bool, default False
-        Whether to start an in-memory HTTP server for remote TUI access.
-    server_host : str, default "0.0.0.0"
-        Host interface for the server.
-    server_port : int, default 0
-        Port for the server (0 chooses a random available port).
-    server_token : str, optional
-        Token for Authorization header; auto-generated if omitted.
-    server_max_metric_points : int, default 10000
-        Maximum points per metric series in memory.
-    server_max_example_points : int, default 5000
-        Maximum examples per series in memory.
-    server_max_system_points : int, default 2000
-        Maximum system metric samples in memory.
 
     Returns
     -------
@@ -87,23 +65,11 @@ def init(
     global _active_run
     if _active_run is not None:
         _active_run.finish()
-    server_config = None
-    if server:
-        settings = ServerSettings(
-            host=server_host,
-            port=server_port,
-            token=server_token,
-            max_metric_points=server_max_metric_points,
-            max_example_points=server_max_example_points,
-            max_system_points=server_max_system_points,
-        )
-        server_config = ServerConfig(enabled=True, settings=settings)
     _active_run = Run(
         project,
         name=name,
         config=config,
         system_metrics=system_metrics,
-        server=server_config,
     )
     print(
         f"extty initialized with run {project}/{_active_run.name}, writing to {_active_run.run_dir}"
@@ -283,13 +249,6 @@ def experiment(
     conf_kwargs: list[str] | None = None,
     non_conf_kwargs: list[str] | None = None,
     system_metrics: bool = True,
-    server: bool | Callable[..., bool] = False,
-    server_host: str = "0.0.0.0",
-    server_port: int = 0,
-    server_token: str | None = None,
-    server_max_metric_points: int = 10_000,
-    server_max_example_points: int = 5_000,
-    server_max_system_points: int = 2_000,
 ) -> Callable[[Callable[P, T]], Callable[P, T]]:
     if conf_kwargs is not None and non_conf_kwargs is not None:
         raise ValueError(
@@ -317,22 +276,11 @@ def experiment(
                 if run_name is None and name_kwarg is not None:
                     run_name = kwargs_copy.pop(name_kwarg)
 
-                if callable(server):
-                    run_server = server()
-                else:
-                    run_server = server
                 init(
                     project=project,
                     name=run_name,
                     config=kwargs_copy,
                     system_metrics=system_metrics,
-                    server=run_server,
-                    server_host=server_host,
-                    server_port=server_port,
-                    server_token=server_token,
-                    server_max_metric_points=server_max_metric_points,
-                    server_max_example_points=server_max_example_points,
-                    server_max_system_points=server_max_system_points,
                 )
                 return fn(*args, **kwargs)
             finally:
