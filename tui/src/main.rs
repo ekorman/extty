@@ -39,14 +39,15 @@ const COMPARE_COLORS: [Color; 8] = [
 mod data;
 mod infra;
 mod remote;
+mod run;
 mod s3;
 use data::{
     Checkpoint, Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation,
     delete_model, load_all_evaluations, load_models, load_runs,
 };
 use infra::{
-    InfraConfig, Instance, InstanceStatus, InstanceType, Provider, generate_script, get_provider,
-    load_config, save_config,
+    InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, generate_script,
+    get_provider, load_config, project_remote_dir, save_config,
 };
 use remote::RemoteSync;
 
@@ -141,6 +142,15 @@ enum SessionModalField {
     SkipTmux,
 }
 
+// Which field is focused in the add machine modal
+#[derive(Clone, Copy, PartialEq, Default)]
+enum AddMachineField {
+    #[default]
+    User,
+    Host,
+    Name,
+}
+
 // A card in the detail grid - either a chart, example group, or evaluation
 #[derive(Clone)]
 enum Card {
@@ -223,6 +233,12 @@ struct App {
     s3_config_editing: bool,
     s3_config_input: String,
     s3_config_message: Option<String>,
+    // Add local machine modal
+    add_machine_open: bool,
+    add_machine_name: String,
+    add_machine_user: String,
+    add_machine_host: String,
+    add_machine_focus: AddMachineField,
     // Session setup modal
     session_modal_open: bool,
     session_modal_instance: Option<Instance>,
@@ -297,6 +313,11 @@ impl App {
             s3_config_editing: false,
             s3_config_input: String::new(),
             s3_config_message: None,
+            add_machine_open: false,
+            add_machine_name: String::new(),
+            add_machine_user: String::new(),
+            add_machine_host: String::new(),
+            add_machine_focus: AddMachineField::default(),
             session_modal_open: false,
             session_modal_instance: None,
             session_python_version: "3.12".to_string(),
@@ -436,15 +457,25 @@ impl App {
         self.infra_instances.clear();
 
         let provider = self.selected_infra_provider;
-        let config = self.infra_config.get_provider_config(provider);
-        if let Some(api_key) = &config.api_key {
-            let client = get_provider(provider, api_key);
-            match client.list_instances() {
-                Ok(instances) => {
-                    self.infra_instances.extend(instances);
-                }
-                Err(e) => {
-                    self.infra_error = Some(format!("{}: {}", provider.display_name(), e));
+
+        if provider == Provider::Local {
+            self.infra_instances = self
+                .infra_config
+                .local
+                .iter()
+                .map(|m| m.to_instance())
+                .collect();
+        } else {
+            let config = self.infra_config.get_provider_config(provider);
+            if let Some(api_key) = &config.api_key {
+                let client = get_provider(provider, api_key);
+                match client.list_instances() {
+                    Ok(instances) => {
+                        self.infra_instances.extend(instances);
+                    }
+                    Err(e) => {
+                        self.infra_error = Some(format!("{}: {}", provider.display_name(), e));
+                    }
                 }
             }
         }
@@ -462,6 +493,12 @@ impl App {
         self.infra_types.clear();
 
         let provider = self.selected_infra_provider;
+
+        if provider == Provider::Local {
+            self.infra_loading = false;
+            return;
+        }
+
         let config = self.infra_config.get_provider_config(provider);
 
         if let Some(api_key) = &config.api_key {
@@ -652,9 +689,33 @@ impl App {
                 format!("{}/", repo_path)
             };
 
+            let remote_dir = project_remote_dir(std::path::Path::new(&repo_path));
+
+            let mkdir_result = std::process::Command::new("ssh")
+                .arg("-o")
+                .arg("StrictHostKeyChecking=no")
+                .args(
+                    port.as_ref()
+                        .map(|p| vec!["-p", p.as_str()])
+                        .unwrap_or_default(),
+                )
+                .arg(format!("{}@{}", ssh_user, host))
+                .arg(format!("mkdir -p $HOME/{}", remote_dir))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Ok(status) = mkdir_result
+                && !status.success()
+            {
+                let _ = tx.send(SetupMessage::Error(
+                    "Failed to create remote project directory".to_string(),
+                ));
+                return;
+            }
+
             rsync_cmd
                 .arg(&repo_with_slash)
-                .arg(format!("{}@{}:~/project/", ssh_user, host));
+                .arg(format!("{}@{}:{}/", ssh_user, host, remote_dir));
 
             let rsync_result = match rsync_cmd.spawn() {
                 Ok(mut child) => {
@@ -731,7 +792,7 @@ impl App {
 
             let _ = tx.send(SetupMessage::Status("Uploading script...".to_string()));
 
-            let script = generate_script(&python_version, &command, skip_tmux);
+            let script = generate_script(&python_version, &command, skip_tmux, &remote_dir);
 
             let upload_status = std::process::Command::new("bash")
                 .arg("-c")
@@ -1686,6 +1747,10 @@ impl App {
     }
 
     fn handle_infra_list_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if self.add_machine_open {
+            self.handle_add_machine_key(code);
+            return;
+        }
         if self.launch_confirming {
             self.handle_infra_launch_confirm_key(code);
             return;
@@ -1756,6 +1821,13 @@ impl App {
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
+            KeyCode::Char('4') => {
+                self.selected_infra_provider = Provider::Local;
+                self.selected_infra_instance = 0;
+                self.selected_infra_type = 0;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
             KeyCode::Enter => match self.infra_active_panel {
                 InfraPanel::Instances => {
                     let instances = self.filtered_infra_instances();
@@ -1797,9 +1869,23 @@ impl App {
             }
             KeyCode::Char('x') if self.infra_active_panel == InfraPanel::Instances => {
                 if instance_count > 0 && self.selected_infra_instance < instance_count {
-                    self.pending_terminate_instance = Some(self.selected_infra_instance);
-                    self.show_terminate_confirm = true;
+                    if self.selected_infra_provider == Provider::Local {
+                        self.remove_local_machine(self.selected_infra_instance);
+                    } else {
+                        self.pending_terminate_instance = Some(self.selected_infra_instance);
+                        self.show_terminate_confirm = true;
+                    }
                 }
+            }
+            KeyCode::Char('a')
+                if self.infra_active_panel == InfraPanel::Instances
+                    && self.selected_infra_provider == Provider::Local =>
+            {
+                self.add_machine_open = true;
+                self.add_machine_name.clear();
+                self.add_machine_user.clear();
+                self.add_machine_host.clear();
+                self.add_machine_focus = AddMachineField::User;
             }
             KeyCode::Char('R') => {
                 self.refresh_infra();
@@ -1878,6 +1964,7 @@ impl App {
                         Provider::Lambda => self.infra_config.lambda_config.api_key = api_key,
                         Provider::Vast => self.infra_config.vast.api_key = api_key,
                         Provider::Prime => self.infra_config.prime.api_key = api_key,
+                        Provider::Local => {}
                     }
 
                     let _ = save_config(&self.infra_config);
@@ -1904,12 +1991,16 @@ impl App {
                     self.config_provider_index += 1;
                 }
                 KeyCode::Enter | KeyCode::Char('e') => {
-                    self.config_editing_key = true;
                     let provider = providers[self.config_provider_index];
+                    if provider == Provider::Local {
+                        return;
+                    }
+                    self.config_editing_key = true;
                     let current_key = match provider {
                         Provider::Lambda => &self.infra_config.lambda_config.api_key,
                         Provider::Vast => &self.infra_config.vast.api_key,
                         Provider::Prime => &self.infra_config.prime.api_key,
+                        Provider::Local => unreachable!(),
                     };
                     self.config_api_key_input = current_key.clone().unwrap_or_default();
                 }
@@ -1919,11 +2010,76 @@ impl App {
                         Provider::Lambda => self.infra_config.lambda_config.api_key = None,
                         Provider::Vast => self.infra_config.vast.api_key = None,
                         Provider::Prime => self.infra_config.prime.api_key = None,
+                        Provider::Local => {}
                     }
                     let _ = save_config(&self.infra_config);
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn handle_add_machine_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.add_machine_open = false;
+            }
+            KeyCode::Tab => {
+                self.add_machine_focus = match self.add_machine_focus {
+                    AddMachineField::User => AddMachineField::Host,
+                    AddMachineField::Host => AddMachineField::Name,
+                    AddMachineField::Name => AddMachineField::User,
+                };
+            }
+            KeyCode::BackTab => {
+                self.add_machine_focus = match self.add_machine_focus {
+                    AddMachineField::User => AddMachineField::Name,
+                    AddMachineField::Host => AddMachineField::User,
+                    AddMachineField::Name => AddMachineField::Host,
+                };
+            }
+            KeyCode::Enter => {
+                if !self.add_machine_user.is_empty() && !self.add_machine_host.is_empty() {
+                    let machine = LocalMachine {
+                        name: if self.add_machine_name.is_empty() {
+                            None
+                        } else {
+                            Some(self.add_machine_name.clone())
+                        },
+                        ssh_user: self.add_machine_user.clone(),
+                        host: self.add_machine_host.clone(),
+                    };
+                    self.infra_config.local.push(machine);
+                    let _ = save_config(&self.infra_config);
+                    self.add_machine_open = false;
+                    self.refresh_infra();
+                }
+            }
+            KeyCode::Backspace => match self.add_machine_focus {
+                AddMachineField::User => {
+                    self.add_machine_user.pop();
+                }
+                AddMachineField::Host => {
+                    self.add_machine_host.pop();
+                }
+                AddMachineField::Name => {
+                    self.add_machine_name.pop();
+                }
+            },
+            KeyCode::Char(c) => match self.add_machine_focus {
+                AddMachineField::User => self.add_machine_user.push(c),
+                AddMachineField::Host => self.add_machine_host.push(c),
+                AddMachineField::Name => self.add_machine_name.push(c),
+            },
+            _ => {}
+        }
+    }
+
+    fn remove_local_machine(&mut self, index: usize) {
+        if index < self.infra_config.local.len() {
+            self.infra_config.local.remove(index);
+            let _ = save_config(&self.infra_config);
+            self.refresh_infra();
         }
     }
 
@@ -2148,6 +2304,7 @@ fn main() -> Result<()> {
         Command::Pull(options) => run_s3_command("pull", options),
         Command::Push(options) => run_s3_command("push", options),
         Command::Sync(options) => run_s3_command("sync", options),
+        Command::Run(options) => run::run(options),
     }
 }
 
@@ -2217,6 +2374,7 @@ fn run_tui(options: TuiOptions) -> Result<()> {
         // Auto-refresh infra instances when viewing infra tab (every 5 seconds)
         if app.view_mode == ViewMode::Infra
             && !app.show_config
+            && app.selected_infra_provider != Provider::Local
             && app.infra_last_refresh.elapsed() >= Duration::from_secs(5)
         {
             app.refresh_infra();
@@ -2446,6 +2604,7 @@ enum Command {
     Pull(SyncOptions),
     Push(SyncOptions),
     Sync(SyncOptions),
+    Run(run::RunOptions),
 }
 
 struct TuiOptions {
@@ -2480,13 +2639,18 @@ fn parse_command() -> Result<Command> {
                 _ => unreachable!(),
             }
         }
+        "run" => {
+            args.remove(0);
+            let opts = parse_run_options(&mut args)?;
+            Ok(Command::Run(opts))
+        }
         "--remote" | "--token" => {
             let opts = parse_tui_options(&mut args)?;
             Ok(Command::Tui(opts))
         }
         other if other.starts_with('-') => Err(anyhow::anyhow!("Unknown option: {}", other)),
         _ => Err(anyhow::anyhow!(
-            "Unknown command: {}. Valid commands: pull, push, sync",
+            "Unknown command: {}. Valid commands: run, pull, push, sync",
             args[0]
         )),
     }
@@ -2523,6 +2687,77 @@ fn parse_tui_options(args: &mut Vec<String>) -> Result<TuiOptions> {
     }
 
     Ok(TuiOptions { remote_url, token })
+}
+
+fn parse_run_options(args: &mut Vec<String>) -> Result<run::RunOptions> {
+    let mut provider = None;
+    let mut instance_id = None;
+    let mut python_version = "3.12".to_string();
+    let mut skip_tmux = false;
+    let mut exclude = Vec::new();
+    let mut command = Vec::new();
+
+    while !args.is_empty() {
+        match args[0].as_str() {
+            "--" => {
+                args.remove(0);
+                command.append(args);
+                break;
+            }
+            "--provider" => {
+                args.remove(0);
+                provider = Some(
+                    args.first()
+                        .ok_or_else(|| anyhow::anyhow!("--provider requires a value"))?
+                        .clone(),
+                );
+                args.remove(0);
+            }
+            "--instance" => {
+                args.remove(0);
+                instance_id = Some(
+                    args.first()
+                        .ok_or_else(|| anyhow::anyhow!("--instance requires a value"))?
+                        .clone(),
+                );
+                args.remove(0);
+            }
+            "--python" => {
+                args.remove(0);
+                python_version = args
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("--python requires a value"))?
+                    .clone();
+                args.remove(0);
+            }
+            "--skip-tmux" => {
+                skip_tmux = true;
+                args.remove(0);
+            }
+            "--exclude" => {
+                args.remove(0);
+                exclude.push(
+                    args.first()
+                        .ok_or_else(|| anyhow::anyhow!("--exclude requires a value"))?
+                        .clone(),
+                );
+                args.remove(0);
+            }
+            _ => {
+                command.append(args);
+                break;
+            }
+        }
+    }
+
+    Ok(run::RunOptions {
+        provider,
+        instance_id,
+        python_version,
+        skip_tmux,
+        exclude,
+        command,
+    })
 }
 
 fn parse_sync_options(args: &mut Vec<String>) -> Result<SyncOptions> {
@@ -5280,16 +5515,21 @@ fn render_infra_dashboard(app: &App, frame: &mut Frame) {
     if app.session_modal_open {
         render_session_modal(app, frame);
     }
+    if app.add_machine_open {
+        render_add_machine_modal(app, frame);
+    }
 }
 
 fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
     let lambda_configured = app.infra_config.lambda_config.api_key.is_some();
     let vast_configured = app.infra_config.vast.api_key.is_some();
     let prime_configured = app.infra_config.prime.api_key.is_some();
+    let local_configured = !app.infra_config.local.is_empty();
 
     let lambda_selected = app.selected_infra_provider == Provider::Lambda;
     let vast_selected = app.selected_infra_provider == Provider::Vast;
     let prime_selected = app.selected_infra_provider == Provider::Prime;
+    let local_selected = app.selected_infra_provider == Provider::Local;
 
     let spans = vec![
         Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
@@ -5375,7 +5615,34 @@ fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
             if prime_selected { "]" } else { "" },
             Style::default().fg(NEON_CYAN).bold(),
         ),
-        Span::styled("          ", Style::default()),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            if local_selected {
+                "[L Local"
+            } else {
+                "L Local"
+            },
+            if local_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if local_configured {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(
+            if local_configured { " ✓" } else { " ✗" },
+            Style::default().fg(if local_configured {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            if local_selected { "]" } else { "" },
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+        Span::styled("     ", Style::default()),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("c", Style::default().fg(NEON_CYAN)),
         Span::styled("] config", Style::default().fg(Color::DarkGray)),
@@ -5413,26 +5680,45 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
     }
 
     if instances.is_empty() {
-        let empty_text = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "No active instances",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press → or Tab to browse",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "available instance types",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "and launch a new instance.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
+        let empty_text = if app.selected_infra_provider == Provider::Local {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "No local machines configured",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press [a] to add a machine",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "by SSH user and address.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "No active instances",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press → or Tab to browse",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "available instance types",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "and launch a new instance.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        };
         let empty = Paragraph::new(empty_text).block(block);
         frame.render_widget(empty, area);
         return;
@@ -5465,6 +5751,7 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
                 Provider::Lambda => "λ",
                 Provider::Vast => "V",
                 Provider::Prime => "P",
+                Provider::Local => "L",
             };
 
             let ip_display = instance.ip.as_deref().unwrap_or("pending...");
@@ -5542,14 +5829,18 @@ fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
 
     if app.infra_types.is_empty() {
         let provider = app.selected_infra_provider;
-        let config = app.infra_config.get_provider_config(provider);
-        let msg = if config.api_key.is_none() {
-            format!(
-                "No API key for {}. Press [c] to configure.",
-                provider.display_name()
-            )
+        let msg = if provider == Provider::Local {
+            "Local machines are managed in the instances panel.".to_string()
         } else {
-            "No instance types available".to_string()
+            let config = app.infra_config.get_provider_config(provider);
+            if config.api_key.is_none() {
+                format!(
+                    "No API key for {}. Press [c] to configure.",
+                    provider.display_name()
+                )
+            } else {
+                "No instance types available".to_string()
+            }
         };
         let empty =
             Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))).block(block);
@@ -5634,8 +5925,37 @@ fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
-    let help = if app.launch_selecting_region || app.launch_confirming || app.session_modal_open {
+    let is_local = app.selected_infra_provider == Provider::Local;
+    let help = if app.add_machine_open
+        || app.launch_selecting_region
+        || app.launch_confirming
+        || app.session_modal_open
+    {
         Line::from(vec![])
+    } else if app.infra_active_panel == InfraPanel::Instances && is_local {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+            Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] ssh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("S", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] setup+ssh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("a", Style::default().fg(NEON_GREEN)),
+            Span::styled("] add  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("x", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] remove  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("1-4", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+        ])
     } else if app.infra_active_panel == InfraPanel::Instances {
         Line::from(vec![
             Span::styled("[", Style::default().fg(DIM_CYAN)),
@@ -5654,7 +5974,7 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("x", Style::default().fg(NEON_MAGENTA)),
             Span::styled("] terminate  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("1-3", Style::default().fg(NEON_YELLOW)),
+            Span::styled("1-4", Style::default().fg(NEON_YELLOW)),
             Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("R", Style::default().fg(NEON_CYAN)),
@@ -5678,7 +5998,7 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("s", Style::default().fg(NEON_CYAN)),
             Span::styled("] sort  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("1-3", Style::default().fg(NEON_YELLOW)),
+            Span::styled("1-4", Style::default().fg(NEON_YELLOW)),
             Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("R", Style::default().fg(NEON_CYAN)),
@@ -5902,7 +6222,7 @@ fn render_session_modal(app: &App, frame: &mut Frame) {
             Span::styled(format!("[{}]", command_display), cmd_style),
         ]),
         Line::from(Span::styled(
-            "  (runs from ~/project on remote)",
+            "  (runs from extty-projects/<name> on remote)",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -5938,6 +6258,94 @@ fn render_session_modal(app: &App, frame: &mut Frame) {
     frame.render_widget(paragraph, popup_area);
 }
 
+fn render_add_machine_modal(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_height = 12u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let fields: [(&str, &str, bool); 3] = [
+        (
+            "SSH User",
+            &app.add_machine_user,
+            app.add_machine_focus == AddMachineField::User,
+        ),
+        (
+            "Host",
+            &app.add_machine_host,
+            app.add_machine_focus == AddMachineField::Host,
+        ),
+        (
+            "Name",
+            &app.add_machine_name,
+            app.add_machine_focus == AddMachineField::Name,
+        ),
+    ];
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+
+    for (label, value, focused) in &fields {
+        let arrow = if *focused { "→ " } else { "  " };
+        let arrow_style = if *focused {
+            Style::default().fg(NEON_MAGENTA)
+        } else {
+            Style::default()
+        };
+        let label_style = if *focused {
+            Style::default().fg(NEON_CYAN).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let mut spans = vec![
+            Span::styled(arrow, arrow_style),
+            Span::styled(format!("{:<10}", label), label_style),
+            Span::styled(*value, Style::default().fg(Color::White)),
+        ];
+        if *focused {
+            spans.push(Span::styled("█", Style::default().fg(NEON_CYAN)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  e.g. Host: 192.168.1.100 or myserver:2222",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  [", Style::default().fg(DIM_CYAN)),
+        Span::styled("Tab", Style::default().fg(NEON_CYAN)),
+        Span::styled("] next  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+        Span::styled("] save  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("] cancel", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let block = Block::default()
+        .title(Span::styled(
+            " ◆ Add Local Machine ",
+            Style::default().fg(NEON_CYAN).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
 fn render_infra_config(app: &App, frame: &mut Frame) {
     let area = frame.area();
     let providers = Provider::all();
@@ -5947,6 +6355,40 @@ fn render_infra_config(app: &App, frame: &mut Frame) {
         .enumerate()
         .map(|(i, provider)| {
             let is_selected = i == app.config_provider_index;
+
+            let name_style = if is_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            if *provider == Provider::Local {
+                let count = app.infra_config.local.len();
+                let (status_icon, status_color) = if count > 0 {
+                    ("✓", NEON_GREEN)
+                } else {
+                    ("✗", Color::DarkGray)
+                };
+                let detail = format!("{} machine(s)", count);
+                let spans = vec![
+                    Span::styled(
+                        format!("{} ", status_icon),
+                        Style::default().fg(status_color),
+                    ),
+                    Span::styled(format!("{:<12}", provider.display_name()), name_style),
+                    Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        detail,
+                        Style::default().fg(if count > 0 {
+                            NEON_YELLOW
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
+                ];
+                return ListItem::new(Line::from(spans));
+            }
+
             let config = app.infra_config.get_provider_config(*provider);
             let has_key = config.api_key.is_some();
 
@@ -5954,12 +6396,6 @@ fn render_infra_config(app: &App, frame: &mut Frame) {
                 ("✓", NEON_GREEN)
             } else {
                 ("✗", Color::DarkGray)
-            };
-
-            let name_style = if is_selected {
-                Style::default().fg(NEON_CYAN).bold()
-            } else {
-                Style::default().fg(Color::Gray)
             };
 
             let key_display = if has_key {

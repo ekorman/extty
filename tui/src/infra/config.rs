@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::Serialize;
 
-use super::models::{InfraConfig, Provider, ProviderConfig};
+use super::models::{InfraConfig, LocalMachine, Provider, ProviderConfig};
 
 fn config_path() -> PathBuf {
     dirs::home_dir()
@@ -36,6 +36,8 @@ struct ConfigToSave {
     vast: ProviderConfigToSave,
     #[serde(skip_serializing_if = "ProviderConfigToSave::is_empty")]
     prime: ProviderConfigToSave,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    local: Vec<LocalMachine>,
 }
 
 fn is_default_provider(s: &str) -> bool {
@@ -84,10 +86,12 @@ pub fn save_config(config: &InfraConfig) -> Result<()> {
             Provider::Lambda => "lambda".to_string(),
             Provider::Vast => "vast".to_string(),
             Provider::Prime => "prime".to_string(),
+            Provider::Local => "local".to_string(),
         },
         lambda: ProviderConfigToSave::from_config(&config.lambda_config),
         vast: ProviderConfigToSave::from_config(&config.vast),
         prime: ProviderConfigToSave::from_config(&config.prime),
+        local: config.local.clone(),
     };
 
     let content = toml::to_string_pretty(&to_save)?;

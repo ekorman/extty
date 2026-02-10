@@ -24,5 +24,6 @@ pub fn get_provider(provider: Provider, api_key: &str) -> Box<dyn CloudProvider>
         Provider::Lambda => Box::new(LambdaProvider::new(api_key)),
         Provider::Vast => Box::new(VastProvider::new(api_key)),
         Provider::Prime => Box::new(PrimeProvider::new(api_key)),
+        Provider::Local => unreachable!("Local provider does not use CloudProvider"),
     }
 }

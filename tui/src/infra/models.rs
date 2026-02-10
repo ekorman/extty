@@ -7,6 +7,7 @@ pub enum Provider {
     Lambda,
     Vast,
     Prime,
+    Local,
 }
 
 impl Provider {
@@ -15,11 +16,17 @@ impl Provider {
             Provider::Lambda => "Lambda",
             Provider::Vast => "Vast.ai",
             Provider::Prime => "Prime",
+            Provider::Local => "Local",
         }
     }
 
     pub fn all() -> &'static [Provider] {
-        &[Provider::Lambda, Provider::Vast, Provider::Prime]
+        &[
+            Provider::Lambda,
+            Provider::Vast,
+            Provider::Prime,
+            Provider::Local,
+        ]
     }
 }
 
@@ -109,6 +116,29 @@ impl InstanceType {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalMachine {
+    pub name: Option<String>,
+    pub ssh_user: String,
+    pub host: String,
+}
+
+impl LocalMachine {
+    pub fn to_instance(&self) -> Instance {
+        Instance {
+            id: format!("local-{}-{}", self.ssh_user, self.host),
+            name: self.name.clone(),
+            ip: Some(self.host.clone()),
+            status: InstanceStatus::Running,
+            instance_type: self.host.clone(),
+            region: "local".to_string(),
+            provider: Provider::Local,
+            ssh_user: self.ssh_user.clone(),
+            raw_status: "running".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
     pub api_key: Option<String>,
@@ -128,6 +158,8 @@ pub struct InfraConfig {
     #[serde(default)]
     pub prime: ProviderConfig,
     #[serde(default)]
+    pub local: Vec<LocalMachine>,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub default_region: Option<String>,
@@ -144,6 +176,7 @@ impl Default for InfraConfig {
             lambda_config: ProviderConfig::default(),
             vast: ProviderConfig::default(),
             prime: ProviderConfig::default(),
+            local: Vec::new(),
             api_key: None,
             default_region: None,
             default_instance_type: None,
@@ -175,6 +208,7 @@ impl InfraConfig {
             }
             Provider::Vast => self.vast.clone(),
             Provider::Prime => self.prime.clone(),
+            Provider::Local => ProviderConfig::default(),
         }
     }
 }
