@@ -2679,7 +2679,7 @@ fn parse_run_options(args: &mut Vec<String>) -> Result<run::RunOptions> {
         match args[0].as_str() {
             "--" => {
                 args.remove(0);
-                command.extend(args.drain(..));
+                command.append(args);
                 break;
             }
             "--provider" => {
@@ -2722,7 +2722,7 @@ fn parse_run_options(args: &mut Vec<String>) -> Result<run::RunOptions> {
                 args.remove(0);
             }
             _ => {
-                command.extend(args.drain(..));
+                command.append(args);
                 break;
             }
         }
