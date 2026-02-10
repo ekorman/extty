@@ -43,7 +43,7 @@ mod run;
 mod s3;
 use data::{
     Checkpoint, Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation,
-    delete_model, load_all_evaluations, load_models, load_runs,
+    delete_model, load_all_evaluations, load_models, load_runs_lightweight,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, generate_script,
@@ -254,7 +254,7 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let runs = load_runs();
+        let runs = load_runs_lightweight();
         let models = load_models();
         let model_evaluations = load_all_evaluations();
         let infra_config = load_config().unwrap_or_default();
@@ -404,7 +404,7 @@ impl App {
             .filter_map(|&idx| self.runs.get(idx).map(|r| r.path.clone()))
             .collect();
 
-        self.runs = load_runs();
+        self.runs = load_runs_lightweight();
 
         if let Some(name) = current_name {
             if let Some(idx) = self.runs.iter().position(|r| r.name == name) {
@@ -447,6 +447,17 @@ impl App {
             let path = run.path.clone();
             if let Some(updated) = data::reload_run(&path) {
                 self.runs[self.selected_run] = updated;
+            }
+        }
+    }
+
+    fn ensure_run_loaded(&mut self, idx: usize) {
+        if let Some(run) = self.runs.get(idx)
+            && !run.data_loaded
+        {
+            let path = run.path.clone();
+            if let Some(updated) = data::reload_run(&path) {
+                self.runs[idx] = updated;
             }
         }
     }
@@ -1262,6 +1273,7 @@ impl App {
                     self.selected_run = *run_index;
                     self.selected_card = 0;
                     self.view = View::RunDetail;
+                    self.ensure_run_loaded(self.selected_run);
                 }
                 None => {}
             },
@@ -1279,6 +1291,9 @@ impl App {
                     self.view = View::Compare;
                     self.selected_card = 0;
                     self.scroll_offset = 0;
+                    for idx in self.compared_runs.clone() {
+                        self.ensure_run_loaded(idx);
+                    }
                 }
             }
             KeyCode::Char('d') => {
@@ -2368,6 +2383,14 @@ fn run_tui(options: TuiOptions) -> Result<()> {
         if last_list_refresh.elapsed() >= list_refresh_interval {
             app.refresh_runs();
             app.refresh_models();
+            if matches!(app.view, View::RunDetail | View::Focused) && !app.compare_focused {
+                app.ensure_run_loaded(app.selected_run);
+            }
+            if app.view == View::Compare || (app.view == View::Focused && app.compare_focused) {
+                for idx in app.compared_runs.clone() {
+                    app.ensure_run_loaded(idx);
+                }
+            }
             last_list_refresh = Instant::now();
         }
 

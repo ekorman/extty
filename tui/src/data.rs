@@ -104,6 +104,7 @@ pub struct Run {
     pub config: Option<serde_json::Value>,
     pub remote_url: Option<String>,
     pub checkpoints: Vec<Checkpoint>,
+    pub data_loaded: bool,
 }
 
 impl Run {
@@ -156,23 +157,16 @@ fn remote_runs_dir() -> PathBuf {
         .join("remote_runs")
 }
 
-// Load all runs from both local and remote directories
-pub fn load_runs() -> Vec<Run> {
+// Load all runs with only metadata (no metrics/examples/checkpoints)
+pub fn load_runs_lightweight() -> Vec<Run> {
     let mut runs = Vec::new();
-
-    // Load from local runs directory
-    runs.extend(load_runs_from_dir(&runs_dir()));
-
-    // Load from remote runs directory
-    runs.extend(load_runs_from_dir(&remote_runs_dir()));
-
-    // Sort by name (which includes timestamp) descending
+    runs.extend(load_runs_from_dir_lightweight(&runs_dir()));
+    runs.extend(load_runs_from_dir_lightweight(&remote_runs_dir()));
     runs.sort_by(|a, b| b.name.cmp(&a.name));
     runs
 }
 
-// Load all runs from a specific directory (supports both flat and nested structures)
-fn load_runs_from_dir(dir: &Path) -> Vec<Run> {
+fn load_runs_from_dir_lightweight(dir: &Path) -> Vec<Run> {
     if !dir.exists() {
         return vec![];
     }
@@ -186,22 +180,17 @@ fn load_runs_from_dir(dir: &Path) -> Vec<Run> {
                 continue;
             }
 
-            // Check if this is a run directory (has meta.json) or project directory
             if path.join("meta.json").exists() {
-                // Old flat structure: runs/<run_name>/
-                if let Some(run) = load_run(&path) {
+                if let Some(run) = load_run_lightweight(&path) {
                     runs.push(run);
                 }
-            } else {
-                // New nested structure: runs/<project>/<run_name>/
-                if let Ok(run_entries) = fs::read_dir(&path) {
-                    for run_entry in run_entries.flatten() {
-                        let run_path = run_entry.path();
-                        if run_path.is_dir()
-                            && let Some(run) = load_run(&run_path)
-                        {
-                            runs.push(run);
-                        }
+            } else if let Ok(run_entries) = fs::read_dir(&path) {
+                for run_entry in run_entries.flatten() {
+                    let run_path = run_entry.path();
+                    if run_path.is_dir()
+                        && let Some(run) = load_run_lightweight(&run_path)
+                    {
+                        runs.push(run);
                     }
                 }
             }
@@ -209,6 +198,25 @@ fn load_runs_from_dir(dir: &Path) -> Vec<Run> {
     }
 
     runs
+}
+
+fn load_run_lightweight(path: &Path) -> Option<Run> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    let (project, start_time, end_time, status, config, remote_url) = load_run_meta(path);
+    Some(Run {
+        name,
+        project,
+        path: path.to_path_buf(),
+        metrics: HashMap::new(),
+        examples: HashMap::new(),
+        start_time,
+        end_time,
+        status,
+        config,
+        remote_url,
+        checkpoints: vec![],
+        data_loaded: false,
+    })
 }
 
 // Reload a single run (public for refreshing)
@@ -254,6 +262,7 @@ fn load_run(path: &Path) -> Option<Run> {
         config,
         remote_url,
         checkpoints,
+        data_loaded: true,
     })
 }
 
