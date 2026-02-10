@@ -21,9 +21,13 @@ impl Provider {
     }
 
     pub fn all() -> &'static [Provider] {
-        &[Provider::Lambda, Provider::Vast, Provider::Prime, Provider::Local]
+        &[
+            Provider::Lambda,
+            Provider::Vast,
+            Provider::Prime,
+            Provider::Local,
+        ]
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -71,11 +71,17 @@ pub fn run(opts: RunOptions) -> Result<()> {
     let (host, port) = parse_host_port(ip);
     let ssh_user = &instance.ssh_user;
 
-    let ssh_port_args = port.as_deref().map(|p| format!("-p {}", p)).unwrap_or_default();
+    let ssh_port_args = port
+        .as_deref()
+        .map(|p| format!("-p {}", p))
+        .unwrap_or_default();
     let ssh_base = if ssh_port_args.is_empty() {
         format!("ssh -o StrictHostKeyChecking=no {}@{}", ssh_user, host)
     } else {
-        format!("ssh -o StrictHostKeyChecking=no {} {}@{}", ssh_port_args, ssh_user, host)
+        format!(
+            "ssh -o StrictHostKeyChecking=no {} {}@{}",
+            ssh_port_args, ssh_user, host
+        )
     };
 
     let cwd = std::env::current_dir()?;
@@ -83,7 +89,8 @@ pub fn run(opts: RunOptions) -> Result<()> {
 
     log.log(&format!("Creating remote directory: {}", remote_dir));
     let mkdir_status = Command::new("ssh")
-        .arg("-o").arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
         .args(port.as_deref().map(|p| vec!["-p", p]).unwrap_or_default())
         .arg(format!("{}@{}", ssh_user, host))
         .arg(format!("mkdir -p $HOME/{}", remote_dir))
@@ -100,7 +107,15 @@ pub fn run(opts: RunOptions) -> Result<()> {
         _ => {}
     }
 
-    rsync_cwd(&cwd, &remote_dir, &host, port.as_deref(), ssh_user, &opts.exclude, &mut log)?;
+    rsync_cwd(
+        &cwd,
+        &remote_dir,
+        &host,
+        port.as_deref(),
+        ssh_user,
+        &opts.exclude,
+        &mut log,
+    )?;
     copy_s3_config(&ssh_base, &host, port.as_deref(), ssh_user, &mut log);
     upload_bootstrap_script(&ssh_base, &opts, &remote_dir, &mut log)?;
 
@@ -135,7 +150,10 @@ fn resolve_provider(name: &str) -> Result<Provider> {
         "vast" => Ok(Provider::Vast),
         "prime" => Ok(Provider::Prime),
         "local" => Ok(Provider::Local),
-        _ => bail!("Unknown provider: {}. Valid: lambda, vast, prime, local", name),
+        _ => bail!(
+            "Unknown provider: {}. Valid: lambda, vast, prime, local",
+            name
+        ),
     }
 }
 
@@ -154,7 +172,10 @@ fn fetch_running_instances(
     let api_key = match provider_config.api_key {
         Some(ref k) => k.as_str(),
         None => {
-            log.log(&format!("No API key for {}, skipping", provider.display_name()));
+            log.log(&format!(
+                "No API key for {}, skipping",
+                provider.display_name()
+            ));
             return vec![];
         }
     };
@@ -174,17 +195,17 @@ fn fetch_running_instances(
             running
         }
         Err(e) => {
-            log.log(&format!("Failed to list {} instances: {}", provider.display_name(), e));
+            log.log(&format!(
+                "Failed to list {} instances: {}",
+                provider.display_name(),
+                e
+            ));
             vec![]
         }
     }
 }
 
-fn select_instance(
-    config: &InfraConfig,
-    opts: &RunOptions,
-    log: &mut LogFile,
-) -> Result<Instance> {
+fn select_instance(config: &InfraConfig, opts: &RunOptions, log: &mut LogFile) -> Result<Instance> {
     if let Some(ref id_or_name) = opts.instance_id {
         return find_instance_by_id_or_name(config, id_or_name, opts, log);
     }
@@ -250,9 +271,10 @@ fn find_instance_by_id_or_name(
 
     for provider in &providers_to_check {
         let instances = fetch_running_instances(config, *provider, log);
-        if let Some(inst) = instances.into_iter().find(|i| {
-            i.id == id_or_name || i.name.as_deref() == Some(id_or_name)
-        }) {
+        if let Some(inst) = instances
+            .into_iter()
+            .find(|i| i.id == id_or_name || i.name.as_deref() == Some(id_or_name))
+        {
             return Ok(inst);
         }
     }
@@ -289,12 +311,18 @@ fn rsync_cwd(
         }
 
         rsync_cmd.args([
-            "--exclude", ".git",
-            "--exclude", "__pycache__",
-            "--exclude", ".venv",
-            "--exclude", "*.pyc",
-            "--exclude", ".mypy_cache",
-            "--exclude", "*.egg-info",
+            "--exclude",
+            ".git",
+            "--exclude",
+            "__pycache__",
+            "--exclude",
+            ".venv",
+            "--exclude",
+            "*.pyc",
+            "--exclude",
+            ".mypy_cache",
+            "--exclude",
+            "*.egg-info",
         ]);
 
         for pattern in extra_excludes {
@@ -407,7 +435,12 @@ fn upload_bootstrap_script(
     println!("Uploading bootstrap script...");
 
     let command_str = opts.command.join(" ");
-    let script = generate_script(&opts.python_version, &command_str, opts.skip_tmux, remote_dir);
+    let script = generate_script(
+        &opts.python_version,
+        &command_str,
+        opts.skip_tmux,
+        remote_dir,
+    );
 
     let mut child = Command::new("bash")
         .arg("-c")

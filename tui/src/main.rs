@@ -38,8 +38,8 @@ const COMPARE_COLORS: [Color; 8] = [
 
 mod data;
 mod infra;
-mod run;
 mod remote;
+mod run;
 mod s3;
 use data::{
     Checkpoint, Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation,
@@ -2034,9 +2034,15 @@ impl App {
                 }
             }
             KeyCode::Backspace => match self.add_machine_focus {
-                AddMachineField::User => { self.add_machine_user.pop(); }
-                AddMachineField::Host => { self.add_machine_host.pop(); }
-                AddMachineField::Name => { self.add_machine_name.pop(); }
+                AddMachineField::User => {
+                    self.add_machine_user.pop();
+                }
+                AddMachineField::Host => {
+                    self.add_machine_host.pop();
+                }
+                AddMachineField::Name => {
+                    self.add_machine_name.pop();
+                }
             },
             KeyCode::Char(c) => match self.add_machine_focus {
                 AddMachineField::User => self.add_machine_user.push(c),
@@ -5898,7 +5904,11 @@ fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
 
 fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
     let is_local = app.selected_infra_provider == Provider::Local;
-    let help = if app.add_machine_open || app.launch_selecting_region || app.launch_confirming || app.session_modal_open {
+    let help = if app.add_machine_open
+        || app.launch_selecting_region
+        || app.launch_confirming
+        || app.session_modal_open
+    {
         Line::from(vec![])
     } else if app.infra_active_panel == InfraPanel::Instances && is_local {
         Line::from(vec![
@@ -6239,9 +6249,21 @@ fn render_add_machine_modal(app: &App, frame: &mut Frame) {
     frame.render_widget(Clear, popup_area);
 
     let fields: [(&str, &str, bool); 3] = [
-        ("SSH User", &app.add_machine_user, app.add_machine_focus == AddMachineField::User),
-        ("Host", &app.add_machine_host, app.add_machine_focus == AddMachineField::Host),
-        ("Name", &app.add_machine_name, app.add_machine_focus == AddMachineField::Name),
+        (
+            "SSH User",
+            &app.add_machine_user,
+            app.add_machine_focus == AddMachineField::User,
+        ),
+        (
+            "Host",
+            &app.add_machine_host,
+            app.add_machine_focus == AddMachineField::Host,
+        ),
+        (
+            "Name",
+            &app.add_machine_name,
+            app.add_machine_focus == AddMachineField::Name,
+        ),
     ];
 
     let mut lines: Vec<Line> = vec![Line::from("")];
