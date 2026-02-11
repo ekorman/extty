@@ -9,7 +9,6 @@ pub fn generate_script(
 
     format!(
         r##"#!/bin/bash
-set -e
 
 # Ensure common paths are available in non-interactive SSH sessions
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
