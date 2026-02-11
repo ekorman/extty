@@ -54,6 +54,12 @@ enum SetupMessage {
     Error(String),
 }
 
+enum S3PullMessage {
+    Pulling(String),
+    Done(String),
+    Error(String),
+}
+
 // View mode: Runs, Models, or Infra
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
@@ -233,6 +239,9 @@ struct App {
     setup_rx: Option<mpsc::Receiver<SetupMessage>>,
     compared_runs: Vec<usize>,
     compare_focused: bool,
+    s3_pull_rx: Option<mpsc::Receiver<S3PullMessage>>,
+    s3_pull_status: Option<String>,
+    s3_pull_time: Option<Instant>,
 }
 
 impl App {
@@ -311,6 +320,9 @@ impl App {
             setup_rx: None,
             compared_runs: Vec::new(),
             compare_focused: false,
+            s3_pull_rx: None,
+            s3_pull_status: None,
+            s3_pull_time: None,
         }
     }
 
@@ -434,6 +446,68 @@ impl App {
                 self.runs[idx] = updated;
             }
         }
+    }
+
+    fn start_s3_pull(&mut self) {
+        if self.s3_pull_rx.is_some() {
+            return;
+        }
+
+        let Some(run) = self.current_run() else {
+            return;
+        };
+
+        let config = match s3::load_config() {
+            Ok(Some(config)) => config,
+            _ => {
+                self.s3_pull_status = Some("S3 not configured".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        let project = run.project.clone().unwrap_or_default();
+        let name = run.name.clone();
+        let display = run.display_name();
+        let (tx, rx) = mpsc::channel();
+        self.s3_pull_rx = Some(rx);
+        self.s3_pull_status = Some(format!("Pulling {}...", display));
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(S3PullMessage::Error(format!("Runtime error: {}", e)));
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                let client = match s3::S3Client::new(config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                        return;
+                    }
+                };
+                let runs_dir = runs_dir();
+                let _ = tx.send(S3PullMessage::Pulling(format!(
+                    "Pulling {}/{}...",
+                    project, name
+                )));
+                match client
+                    .download_run(&project, &name, &runs_dir, false, false)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ =
+                            tx.send(S3PullMessage::Done(format!("Pulled {}/{}", project, name)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
+                    }
+                }
+            });
+        });
     }
 
     fn refresh_infra(&mut self) {
@@ -1391,6 +1465,9 @@ impl App {
             KeyCode::Char('d') if !self.runs.is_empty() => {
                 self.pending_delete_run = Some(self.selected_run);
                 self.show_delete_confirm = true;
+            }
+            KeyCode::Char('p') => {
+                self.start_s3_pull();
             }
             _ => {}
         }
@@ -2372,6 +2449,47 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
             app.infra_message_time = None;
         }
 
+        // Poll S3 pull background task
+        if let Some(rx) = &app.s3_pull_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    S3PullMessage::Pulling(s) => {
+                        app.s3_pull_status = Some(s);
+                    }
+                    S3PullMessage::Done(s) => {
+                        app.s3_pull_status = Some(s);
+                        app.s3_pull_time = Some(Instant::now());
+                        app.s3_pull_rx = None;
+                        app.refresh_runs();
+                        if matches!(app.view, View::RunDetail | View::Focused)
+                            && let Some(run) = app.runs.get(app.selected_run)
+                        {
+                            let path = run.path.clone();
+                            if let Some(updated) = data::reload_run(&path) {
+                                app.runs[app.selected_run] = updated;
+                            }
+                        }
+                        break;
+                    }
+                    S3PullMessage::Error(s) => {
+                        app.s3_pull_status = Some(s);
+                        app.s3_pull_time = Some(Instant::now());
+                        app.s3_pull_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Clear S3 pull status after 3 seconds
+        if let Some(pull_time) = app.s3_pull_time
+            && pull_time.elapsed() >= Duration::from_secs(3)
+            && app.s3_pull_rx.is_none()
+        {
+            app.s3_pull_status = None;
+            app.s3_pull_time = None;
+        }
+
         // Draw the UI
         terminal.draw(|frame| render(&app, frame))?;
 
@@ -3144,6 +3262,17 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         &scroll_indicator,
         Style::default().fg(NEON_MAGENTA),
     ));
+    if let Some(status) = &app.s3_pull_status {
+        let color = if status.starts_with("Pull failed") || status.starts_with("S3 not") {
+            NEON_MAGENTA
+        } else if status.starts_with("Pulled") {
+            NEON_GREEN
+        } else {
+            NEON_YELLOW
+        };
+        header_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        header_spans.push(Span::styled(status.clone(), Style::default().fg(color)));
+    }
     let header_text = Line::from(header_spans);
     let header = Paragraph::new(header_text).block(
         Block::default()
@@ -3184,6 +3313,9 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
             format!("] {}  ", config_hint),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("p", Style::default().fg(NEON_CYAN)),
+        Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("[]", Style::default().fg(NEON_YELLOW)),
         Span::styled("] run ", Style::default().fg(Color::DarkGray)),
