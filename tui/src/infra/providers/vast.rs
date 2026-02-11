@@ -24,12 +24,12 @@ fn normalize_status(raw: &str) -> InstanceStatus {
     match raw.to_lowercase().as_str() {
         "running" => InstanceStatus::Running,
         "loading" => InstanceStatus::Booting,
-        "created" => InstanceStatus::Pending,
+        "created" | "scheduling" => InstanceStatus::Pending,
         "exited" => InstanceStatus::Stopped,
         "destroying" => InstanceStatus::Stopping,
         "destroyed" => InstanceStatus::Terminated,
-        "offline" => InstanceStatus::Error,
-        _ => InstanceStatus::Error,
+        "offline" | "error" => InstanceStatus::Error,
+        _ => InstanceStatus::Pending,
     }
 }
 

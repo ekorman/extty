@@ -2348,8 +2348,8 @@ impl App {
         match client.launch(&opts) {
             Ok(ids) => {
                 self.infra_error = None;
-                self.refresh_infra();
                 self.infra_active_panel = InfraPanel::Instances;
+                self.infra_last_refresh = Instant::now() - Duration::from_secs(2);
                 if !ids.is_empty() {
                     self.infra_error = Some(format!("Launched: {}", ids.join(", ")));
                     self.infra_message_time = Some(Instant::now());

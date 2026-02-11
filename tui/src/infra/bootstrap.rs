@@ -23,6 +23,22 @@ if [ -z "$TMUX" ] && [ "{skip_tmux}" != "true" ]; then
     fi
 fi
 
+# Install build tools (needed for torch.compile)
+if ! command -v gcc &> /dev/null; then
+    echo "Installing build-essential..."
+    sudo apt update && sudo apt install -y build-essential
+fi
+
+# Fix missing libcuda.so symlink (needed for torch.compile on GPU VMs)
+for dir in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
+    if [ -f "$dir/libcuda.so.1" ] && [ ! -e "$dir/libcuda.so" ]; then
+        sudo ln -sf "$dir/libcuda.so.1" "$dir/libcuda.so"
+    fi
+done
+if [ -f /lib/x86_64-linux-gnu/libcuda.so ] || [ -f /usr/lib/x86_64-linux-gnu/libcuda.so ]; then
+    sudo ldconfig
+fi
+
 # Install uv if not present
 if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
@@ -88,6 +104,8 @@ mod tests {
         assert!(script.contains("cd ~/\"extty-projects/myproj\""));
         assert!(script.contains("exec $SHELL"));
         assert!(script.contains("touch ~/.no_auto_tmux"));
+        assert!(script.contains("sudo apt install -y build-essential"));
+        assert!(script.contains("libcuda.so"));
     }
 
     #[test]
