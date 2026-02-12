@@ -13,7 +13,6 @@ from extty.storage import (
     generate_random_name,
     get_runs_dir,
 )
-from extty import __version__
 from extty.system_monitor import SystemMonitor
 from extty.s3 import S3Config, S3Storage
 
@@ -93,6 +92,8 @@ class FinishableStorage(Protocol):
 
 
 def _collect_environment() -> dict[str, Any]:
+    from extty import __version__
+
     env: dict[str, Any] = {"_extty_version": __version__}
     git_hash = os.environ.get("EXTTY_GIT_HASH")
     if git_hash:
