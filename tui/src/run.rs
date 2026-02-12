@@ -87,6 +87,24 @@ pub fn run(opts: RunOptions) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let remote_dir = project_remote_dir(&cwd);
 
+    let git_hash = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        });
+    let run_command: String = std::env::args().collect::<Vec<_>>().join(" ");
+
     log.log(&format!("Creating remote directory: {}", remote_dir));
     let mkdir_status = Command::new("ssh")
         .arg("-o")
@@ -117,7 +135,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
         &mut log,
     )?;
     copy_s3_config(&ssh_base, &host, port.as_deref(), ssh_user, &mut log);
-    upload_bootstrap_script(&ssh_base, &opts, &remote_dir, &mut log)?;
+    upload_bootstrap_script(&ssh_base, &opts, &remote_dir, git_hash.as_deref(), &run_command, &mut log)?;
 
     log.log("Exec into SSH session");
     println!("Connecting to {}...", instance.display_name());
@@ -429,6 +447,8 @@ fn upload_bootstrap_script(
     ssh_base: &str,
     opts: &RunOptions,
     remote_dir: &str,
+    git_hash: Option<&str>,
+    run_command: &str,
     log: &mut LogFile,
 ) -> Result<()> {
     log.log("Uploading bootstrap script...");
@@ -440,6 +460,8 @@ fn upload_bootstrap_script(
         &command_str,
         opts.skip_tmux,
         remote_dir,
+        git_hash,
+        run_command,
     );
 
     let mut child = Command::new("bash")

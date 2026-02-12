@@ -3,15 +3,30 @@ pub fn generate_script(
     command: &str,
     skip_tmux: bool,
     project_dir: &str,
+    git_hash: Option<&str>,
+    run_command: &str,
 ) -> String {
     let skip_tmux_str = if skip_tmux { "true" } else { "false" };
     let command_escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
+
+    let mut env_exports = String::new();
+    if let Some(hash) = git_hash {
+        env_exports.push_str(&format!("export EXTTY_GIT_HASH=\"{}\"\n", hash));
+    }
+    let run_command_escaped = run_command.replace('\\', "\\\\").replace('"', "\\\"");
+    env_exports.push_str(&format!(
+        "export EXTTY_RUN_COMMAND=\"{}\"",
+        run_command_escaped
+    ));
 
     format!(
         r##"#!/bin/bash
 
 # Ensure common paths are available in non-interactive SSH sessions
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# Forwarded from host by extty run
+{env_exports}
 
 # Disable provider auto-tmux (Vast.ai)
 touch ~/.no_auto_tmux
@@ -68,7 +83,8 @@ exec $SHELL
         skip_tmux = skip_tmux_str,
         python_version = python_version,
         command = command_escaped,
-        project_dir = project_dir
+        project_dir = project_dir,
+        env_exports = env_exports
     )
 }
 
@@ -98,7 +114,14 @@ mod tests {
 
     #[test]
     fn test_generate_script_basic() {
-        let script = generate_script("3.11", "uv run train.py", false, "extty-projects/myproj");
+        let script = generate_script(
+            "3.11",
+            "uv run train.py",
+            false,
+            "extty-projects/myproj",
+            Some("abc123def456"),
+            "extty run uv run train.py",
+        );
         assert!(script.contains("uv python install 3.11"));
         assert!(script.contains("uv run train.py"));
         assert!(script.contains("cd ~/\"extty-projects/myproj\""));
@@ -106,12 +129,16 @@ mod tests {
         assert!(script.contains("touch ~/.no_auto_tmux"));
         assert!(script.contains("sudo apt install -y build-essential"));
         assert!(script.contains("libcuda.so"));
+        assert!(script.contains("export EXTTY_GIT_HASH=\"abc123def456\""));
+        assert!(script.contains("export EXTTY_RUN_COMMAND=\"extty run uv run train.py\""));
     }
 
     #[test]
     fn test_generate_script_skip_tmux() {
-        let script = generate_script("3.11", "", true, "extty-projects/test");
+        let script = generate_script("3.11", "", true, "extty-projects/test", None, "extty run");
         assert!(script.contains(r#"[ "true" != "true" ]"#));
+        assert!(!script.contains("EXTTY_GIT_HASH"));
+        assert!(script.contains("export EXTTY_RUN_COMMAND=\"extty run\""));
     }
 
     #[test]
