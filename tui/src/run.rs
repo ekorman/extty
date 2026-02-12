@@ -135,7 +135,14 @@ pub fn run(opts: RunOptions) -> Result<()> {
         &mut log,
     )?;
     copy_s3_config(&ssh_base, &host, port.as_deref(), ssh_user, &mut log);
-    upload_bootstrap_script(&ssh_base, &opts, &remote_dir, git_hash.as_deref(), &run_command, &mut log)?;
+    upload_bootstrap_script(
+        &ssh_base,
+        &opts,
+        &remote_dir,
+        git_hash.as_deref(),
+        &run_command,
+        &mut log,
+    )?;
 
     log.log("Exec into SSH session");
     println!("Connecting to {}...", instance.display_name());

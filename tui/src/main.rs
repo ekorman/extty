@@ -3791,7 +3791,10 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
         }
     }
     if let Some(status) = &app.s3_pull_status {
-        let color = if status.contains("failed") || status.contains("error") || status.contains("not configured") {
+        let color = if status.contains("failed")
+            || status.contains("error")
+            || status.contains("not configured")
+        {
             NEON_MAGENTA
         } else if status.contains("Pulled") {
             NEON_GREEN
