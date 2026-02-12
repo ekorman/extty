@@ -1255,6 +1255,11 @@ impl App {
         let code = key.code;
         let modifiers = key.modifiers;
 
+        if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return;
+        }
+
         if self.session_modal_open {
             self.handle_session_modal_key(code);
             return;
