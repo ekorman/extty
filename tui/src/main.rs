@@ -510,6 +510,74 @@ impl App {
         });
     }
 
+    fn start_s3_pull_compared(&mut self) {
+        if self.s3_pull_rx.is_some() {
+            return;
+        }
+
+        let config = match s3::load_config() {
+            Ok(Some(config)) => config,
+            _ => {
+                self.s3_pull_status = Some("S3 not configured".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        let runs: Vec<(String, String)> = self
+            .compared_runs
+            .iter()
+            .filter_map(|&idx| self.runs.get(idx))
+            .map(|r| (r.project.clone().unwrap_or_default(), r.name.clone()))
+            .collect();
+
+        if runs.is_empty() {
+            return;
+        }
+
+        let count = runs.len();
+        let (tx, rx) = mpsc::channel();
+        self.s3_pull_rx = Some(rx);
+        self.s3_pull_status = Some(format!("Pulling {} runs...", count));
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(S3PullMessage::Error(format!("Runtime error: {}", e)));
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                let client = match s3::S3Client::new(config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                        return;
+                    }
+                };
+                let runs_dir = runs_dir();
+                for (i, (project, name)) in runs.iter().enumerate() {
+                    let _ = tx.send(S3PullMessage::Pulling(format!(
+                        "Pulling {}/{} ({}/{})...",
+                        project,
+                        name,
+                        i + 1,
+                        count
+                    )));
+                    if let Err(e) = client
+                        .download_run(project, name, &runs_dir, false, false)
+                        .await
+                    {
+                        let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
+                        return;
+                    }
+                }
+                let _ = tx.send(S3PullMessage::Done(format!("Pulled {} runs", count)));
+            });
+        });
+    }
+
     fn refresh_infra(&mut self) {
         self.infra_loading = true;
         self.infra_error = None;
@@ -1561,6 +1629,9 @@ impl App {
                 self.compare_focused = true;
                 self.view = View::Focused;
             }
+            KeyCode::Char('p') => {
+                self.start_s3_pull_compared();
+            }
             _ => {}
         }
     }
@@ -2462,11 +2533,19 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
                         app.s3_pull_rx = None;
                         app.refresh_runs();
                         if matches!(app.view, View::RunDetail | View::Focused)
+                            && !app.compare_focused
                             && let Some(run) = app.runs.get(app.selected_run)
                         {
                             let path = run.path.clone();
                             if let Some(updated) = data::reload_run(&path) {
                                 app.runs[app.selected_run] = updated;
+                            }
+                        }
+                        if app.view == View::Compare
+                            || (app.view == View::Focused && app.compare_focused)
+                        {
+                            for idx in app.compared_runs.clone() {
+                                app.ensure_run_loaded(idx);
                             }
                         }
                         break;
@@ -3682,6 +3761,17 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
             ));
         }
     }
+    if let Some(status) = &app.s3_pull_status {
+        let color = if status.contains("failed") || status.contains("error") || status.contains("not configured") {
+            NEON_MAGENTA
+        } else if status.contains("Pulled") {
+            NEON_GREEN
+        } else {
+            NEON_YELLOW
+        };
+        header_spans.push(Span::styled("  ", Style::default()));
+        header_spans.push(Span::styled(status.as_str(), Style::default().fg(color)));
+    }
     frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
 
     let grid_area = chunks[1];
@@ -3747,7 +3837,10 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
         Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_CYAN)),
-        Span::styled("] focus", Style::default().fg(Color::DarkGray)),
+        Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("p", Style::default().fg(NEON_CYAN)),
+        Span::styled("] pull", Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
