@@ -1327,7 +1327,9 @@ impl App {
         if let Some(ref mut input) = self.goto_step_input {
             match code {
                 KeyCode::Char(c) if c.is_ascii_digit() => input.push(c),
-                KeyCode::Backspace => { input.pop(); }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
                 KeyCode::Esc => self.goto_step_input = None,
                 KeyCode::Enter => {
                     let target: u64 = input.parse().unwrap_or(0);
@@ -3820,7 +3822,7 @@ fn render_comparison_chart(
     let y_max = y_data_max + y_range * 0.1;
 
     let max_points = (area.width as usize) * 2;
-    let downsampled: Vec<(String, Color, Vec<(f64, f64)>)> = run_data
+    let downsampled: Vec<CompareRunData> = run_data
         .iter()
         .filter(|(_, _, d)| !d.is_empty())
         .map(|(name, color, data)| (name.clone(), *color, lttb_downsample(data, max_points)))
@@ -4181,8 +4183,13 @@ fn lttb_downsample(data: &[(f64, f64)], threshold: usize) -> Vec<(f64, f64)> {
         let mut max_area = -1.0f64;
         let mut max_idx = range_start;
 
-        for j in range_start..range_end.min(data.len()) {
-            let area = ((data[j].0 - ax) * (avg_y - ay) - (avg_x - ax) * (data[j].1 - ay)).abs();
+        for (j, point) in data
+            .iter()
+            .enumerate()
+            .take(range_end.min(data.len()))
+            .skip(range_start)
+        {
+            let area = ((point.0 - ax) * (avg_y - ay) - (avg_x - ax) * (point.1 - ay)).abs();
             if area > max_area {
                 max_area = area;
                 max_idx = j;
@@ -4238,7 +4245,10 @@ fn render_chart(
     let x_min = raw_data.first().map(|p| p.0).unwrap_or(0.0);
     let x_max = raw_data.last().map(|p| p.0).unwrap_or(1.0);
     let y_data_min = raw_data.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-    let y_data_max = raw_data.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    let y_data_max = raw_data
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::NEG_INFINITY, f64::max);
 
     // Pad chart bounds so data doesn't clip at edges, but use actual data range for labels
     let y_range = (y_data_max - y_data_min).max(0.001);
