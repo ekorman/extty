@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use chrono::{DateTime, Local};
 use serde::Deserialize;
@@ -104,6 +105,7 @@ pub struct Run {
     pub config: Option<serde_json::Value>,
     pub checkpoints: Vec<Checkpoint>,
     pub data_loaded: bool,
+    pub data_loaded_at: Option<Instant>,
 }
 
 impl Run {
@@ -203,6 +205,7 @@ fn load_run_lightweight(path: &Path) -> Option<Run> {
         config,
         checkpoints: vec![],
         data_loaded: false,
+        data_loaded_at: None,
     })
 }
 
@@ -249,6 +252,7 @@ fn load_run(path: &Path) -> Option<Run> {
         config,
         checkpoints,
         data_loaded: true,
+        data_loaded_at: Some(Instant::now()),
     })
 }
 
@@ -947,7 +951,8 @@ struct ExampleData {
     reward: Option<Vec<Vec<Reward>>>,
 }
 
-// Load examples from a JSONL file
+const MAX_EXAMPLES: usize = 200;
+
 fn load_examples_jsonl(path: &PathBuf) -> Result<Vec<Example>, std::io::Error> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -963,6 +968,10 @@ fn load_examples_jsonl(path: &PathBuf) -> Result<Vec<Example>, std::io::Error> {
                 rewards: row.data.reward,
             });
         }
+    }
+
+    if examples.len() > MAX_EXAMPLES {
+        examples.drain(..examples.len() - MAX_EXAMPLES);
     }
 
     Ok(examples)

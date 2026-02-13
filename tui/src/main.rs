@@ -242,6 +242,7 @@ struct App {
     s3_pull_rx: Option<mpsc::Receiver<S3PullMessage>>,
     s3_pull_status: Option<String>,
     s3_pull_time: Option<Instant>,
+    goto_step_input: Option<String>,
 }
 
 impl App {
@@ -323,6 +324,7 @@ impl App {
             s3_pull_rx: None,
             s3_pull_status: None,
             s3_pull_time: None,
+            goto_step_input: None,
         }
     }
 
@@ -399,7 +401,21 @@ impl App {
             .filter_map(|&idx| self.runs.get(idx).map(|r| r.path.clone()))
             .collect();
 
+        let mut old_runs = std::mem::take(&mut self.runs);
         self.runs = load_runs_lightweight();
+
+        for new_run in &mut self.runs {
+            if let Some(old_idx) = old_runs.iter().position(|r| r.path == new_run.path) {
+                let old_run = old_runs.swap_remove(old_idx);
+                if old_run.data_loaded {
+                    new_run.metrics = old_run.metrics;
+                    new_run.examples = old_run.examples;
+                    new_run.checkpoints = old_run.checkpoints;
+                    new_run.data_loaded = true;
+                    new_run.data_loaded_at = old_run.data_loaded_at;
+                }
+            }
+        }
 
         if let Some(name) = current_name {
             if let Some(idx) = self.runs.iter().position(|r| r.name == name) {
@@ -438,10 +454,21 @@ impl App {
     }
 
     fn ensure_run_loaded(&mut self, idx: usize) {
-        if let Some(run) = self.runs.get(idx)
-            && !run.data_loaded
-        {
-            let path = run.path.clone();
+        let needs_load = if let Some(run) = self.runs.get(idx) {
+            if !run.data_loaded {
+                true
+            } else if run.is_running() {
+                run.data_loaded_at
+                    .map(|t| t.elapsed() > Duration::from_secs(30))
+                    .unwrap_or(true)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if needs_load {
+            let path = self.runs[idx].path.clone();
             if let Some(updated) = data::reload_run(&path) {
                 self.runs[idx] = updated;
             }
@@ -1297,6 +1324,58 @@ impl App {
             return;
         }
 
+        if let Some(ref mut input) = self.goto_step_input {
+            match code {
+                KeyCode::Char(c) if c.is_ascii_digit() => input.push(c),
+                KeyCode::Backspace => { input.pop(); }
+                KeyCode::Esc => self.goto_step_input = None,
+                KeyCode::Enter => {
+                    let target: u64 = input.parse().unwrap_or(0);
+                    self.goto_step_input = None;
+
+                    let steps: Vec<u64> = if self.compare_focused {
+                        let cards = self.compare_cards();
+                        match cards.get(self.selected_card) {
+                            Some(Card::Examples { name }) => self.compare_example_steps(name),
+                            _ => vec![],
+                        }
+                    } else {
+                        match self.view_mode {
+                            ViewMode::Runs => {
+                                let cards = self.cards();
+                                match cards.get(self.selected_card) {
+                                    Some(Card::Examples { name }) => self
+                                        .current_run()
+                                        .and_then(|r| r.examples.get(name))
+                                        .map(|exs| exs.iter().map(|e| e.step).collect())
+                                        .unwrap_or_default(),
+                                    _ => vec![],
+                                }
+                            }
+                            ViewMode::Models => vec![],
+                            ViewMode::Infra => vec![],
+                        }
+                    };
+
+                    if !steps.is_empty() {
+                        let best_idx = steps
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, s)| (**s as i64 - target as i64).unsigned_abs())
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        self.selected_example = best_idx;
+                        self.selected_prompt = 0;
+                        self.selected_response = 0;
+                        self.prompt_scroll_offset = 0;
+                        self.response_scroll_offset = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match self.view {
             View::List => match self.view_mode {
                 ViewMode::Runs => self.handle_list_key(code),
@@ -1311,7 +1390,7 @@ impl App {
                 let (visible_rows, cols) = self.grid_layout();
                 self.handle_model_detail_key(code, visible_rows, cols);
             }
-            View::Focused => self.handle_focused_key(code),
+            View::Focused => self.handle_focused_key(key),
             View::Compare => {
                 let (visible_rows, cols) = self.grid_layout();
                 self.handle_compare_key(code, visible_rows, cols);
@@ -1665,7 +1744,9 @@ impl App {
         }
     }
 
-    fn handle_focused_key(&mut self, code: KeyCode) {
+    fn handle_focused_key(&mut self, key: KeyEvent) {
+        let code = key.code;
+        let modifiers = key.modifiers;
         let (card_count, cards) = if self.compare_focused {
             let c = self.compare_cards();
             (c.len(), c)
@@ -1843,6 +1924,22 @@ impl App {
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
             }
+            // Shift+Up/Down jump 10 examples at a time
+            KeyCode::Up if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_example = self.selected_example.saturating_sub(10);
+                self.selected_prompt = 0;
+                self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
+            }
+            KeyCode::Down if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
+                self.selected_example =
+                    (self.selected_example + 10).min(example_count.saturating_sub(1));
+                self.selected_prompt = 0;
+                self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
+            }
             // Up/Down navigate within example groups
             KeyCode::Up if example_count > 0 && self.selected_example > 0 => {
                 self.selected_example -= 1;
@@ -1886,6 +1983,25 @@ impl App {
             {
                 self.selected_response += 1;
                 self.response_scroll_offset = 0;
+            }
+            // Home/End jump to first/last example
+            KeyCode::Home if example_count > 0 => {
+                self.selected_example = 0;
+                self.selected_prompt = 0;
+                self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
+            }
+            KeyCode::End if example_count > 0 => {
+                self.selected_example = example_count.saturating_sub(1);
+                self.selected_prompt = 0;
+                self.selected_response = 0;
+                self.prompt_scroll_offset = 0;
+                self.response_scroll_offset = 0;
+            }
+            // g opens goto step input
+            KeyCode::Char('g') if example_count > 0 => {
+                self.goto_step_input = Some(String::new());
             }
             // c toggles model config panel (Models view only)
             KeyCode::Char('c') if self.view_mode == ViewMode::Models => {
@@ -3703,9 +3819,15 @@ fn render_comparison_chart(
     let y_min = y_data_min - y_range * 0.1;
     let y_max = y_data_max + y_range * 0.1;
 
-    let datasets: Vec<Dataset> = run_data
+    let max_points = (area.width as usize) * 2;
+    let downsampled: Vec<(String, Color, Vec<(f64, f64)>)> = run_data
         .iter()
         .filter(|(_, _, d)| !d.is_empty())
+        .map(|(name, color, data)| (name.clone(), *color, lttb_downsample(data, max_points)))
+        .collect();
+
+    let datasets: Vec<Dataset> = downsampled
+        .iter()
         .map(|(name, color, data)| {
             Dataset::default()
                 .name(name.as_str())
@@ -4027,6 +4149,54 @@ fn format_json_primitive(value: &serde_json::Value) -> String {
     }
 }
 
+fn lttb_downsample(data: &[(f64, f64)], threshold: usize) -> Vec<(f64, f64)> {
+    if data.len() <= threshold || threshold < 3 {
+        return data.to_vec();
+    }
+
+    let mut sampled = Vec::with_capacity(threshold);
+    sampled.push(data[0]);
+
+    let bucket_size = (data.len() - 2) as f64 / (threshold - 2) as f64;
+
+    let mut a_idx = 0usize;
+
+    for i in 0..(threshold - 2) {
+        let avg_start = ((i + 1) as f64 * bucket_size).floor() as usize + 1;
+        let avg_end = (((i + 2) as f64 * bucket_size).floor() as usize + 1).min(data.len());
+
+        let (avg_x, avg_y) = if avg_end > avg_start {
+            let count = (avg_end - avg_start) as f64;
+            let sum_x: f64 = data[avg_start..avg_end].iter().map(|p| p.0).sum();
+            let sum_y: f64 = data[avg_start..avg_end].iter().map(|p| p.1).sum();
+            (sum_x / count, sum_y / count)
+        } else {
+            data[avg_start.min(data.len() - 1)]
+        };
+
+        let range_start = (i as f64 * bucket_size).floor() as usize + 1;
+        let range_end = ((i + 1) as f64 * bucket_size).floor() as usize + 1;
+
+        let (ax, ay) = data[a_idx];
+        let mut max_area = -1.0f64;
+        let mut max_idx = range_start;
+
+        for j in range_start..range_end.min(data.len()) {
+            let area = ((data[j].0 - ax) * (avg_y - ay) - (avg_x - ax) * (data[j].1 - ay)).abs();
+            if area > max_area {
+                max_area = area;
+                max_idx = j;
+            }
+        }
+
+        sampled.push(data[max_idx]);
+        a_idx = max_idx;
+    }
+
+    sampled.push(data[data.len() - 1]);
+    sampled
+}
+
 fn render_chart(
     frame: &mut Frame,
     area: Rect,
@@ -4061,14 +4231,14 @@ fn render_chart(
         return;
     }
 
-    // Convert points to (x, y) tuples for ratatui
-    let data: Vec<(f64, f64)> = points.iter().map(|p| (p.step as f64, p.value)).collect();
+    let raw_data: Vec<(f64, f64)> = points.iter().map(|p| (p.step as f64, p.value)).collect();
+    let max_points = (area.width as usize) * 2;
+    let data = lttb_downsample(&raw_data, max_points);
 
-    // Find bounds
-    let x_min = data.first().map(|p| p.0).unwrap_or(0.0);
-    let x_max = data.last().map(|p| p.0).unwrap_or(1.0);
-    let y_data_min = data.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-    let y_data_max = data.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    let x_min = raw_data.first().map(|p| p.0).unwrap_or(0.0);
+    let x_max = raw_data.last().map(|p| p.0).unwrap_or(1.0);
+    let y_data_min = raw_data.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let y_data_max = raw_data.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
 
     // Pad chart bounds so data doesn't clip at edges, but use actual data range for labels
     let y_range = (y_data_max - y_data_min).max(0.001);
@@ -4426,13 +4596,33 @@ fn render_focused(app: &App, frame: &mut Frame) {
 
     if app.compare_focused {
         render_focused_compare(app, frame, area);
-        return;
+    } else {
+        match app.view_mode {
+            ViewMode::Runs => render_focused_run(app, frame, area),
+            ViewMode::Models => render_focused_model(app, frame, area),
+            ViewMode::Infra => {}
+        }
     }
 
-    match app.view_mode {
-        ViewMode::Runs => render_focused_run(app, frame, area),
-        ViewMode::Models => render_focused_model(app, frame, area),
-        ViewMode::Infra => {}
+    if let Some(ref input) = app.goto_step_input {
+        use ratatui::widgets::Clear;
+        let popup_width = 28u16.min(area.width.saturating_sub(4));
+        let popup_height = 3;
+        let x = (area.width.saturating_sub(popup_width)) / 2;
+        let y = (area.height.saturating_sub(popup_height)) / 2;
+        let popup_area = Rect::new(x, y, popup_width, popup_height);
+        frame.render_widget(Clear, popup_area);
+        let text = format!("Go to step: {}_", input);
+        let popup = Paragraph::new(text)
+            .style(Style::default().fg(NEON_CYAN))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(NEON_MAGENTA))
+                    .border_type(BorderType::Rounded)
+                    .title("goto"),
+            );
+        frame.render_widget(popup, popup_area);
     }
 }
 
@@ -4491,12 +4681,18 @@ fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
         if !steps.is_empty() {
             footer_spans.extend(vec![
                 Span::styled("  [", Style::default().fg(DIM_CYAN)),
-                Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                Span::styled("↑↓/⇧", Style::default().fg(NEON_CYAN)),
                 Span::styled("] step ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{}/{}", app.selected_example + 1, steps.len()),
                     Style::default().fg(NEON_GREEN),
                 ),
+                Span::styled("  [", Style::default().fg(DIM_CYAN)),
+                Span::styled("g", Style::default().fg(NEON_CYAN)),
+                Span::styled("] goto  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("End", Style::default().fg(NEON_CYAN)),
+                Span::styled("] latest", Style::default().fg(Color::DarkGray)),
             ]);
         }
     }
@@ -4750,12 +4946,18 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                     Span::styled(focus_label, Style::default().fg(NEON_GREEN)),
                     Span::styled("  ", Style::default()),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                    Span::styled("↑↓/⇧", Style::default().fg(NEON_CYAN)),
                     Span::styled("] example ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!("{}/{}", app.selected_example + 1, examples.len()),
                         Style::default().fg(NEON_YELLOW),
                     ),
+                    Span::styled("  [", Style::default().fg(DIM_CYAN)),
+                    Span::styled("g", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] goto  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("End", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] latest", Style::default().fg(Color::DarkGray)),
                 ];
                 if prompt_count > 1 {
                     footer_spans.extend(vec![
@@ -4901,12 +5103,18 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled(focus_label, Style::default().fg(NEON_GREEN)),
                 Span::styled("  ", Style::default()),
                 Span::styled("[", Style::default().fg(DIM_CYAN)),
-                Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                Span::styled("↑↓/⇧", Style::default().fg(NEON_CYAN)),
                 Span::styled("] example ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{}/{}", app.selected_example + 1, example_count),
                     Style::default().fg(NEON_YELLOW),
                 ),
+                Span::styled("  [", Style::default().fg(DIM_CYAN)),
+                Span::styled("g", Style::default().fg(NEON_CYAN)),
+                Span::styled("] goto  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("End", Style::default().fg(NEON_CYAN)),
+                Span::styled("] latest", Style::default().fg(Color::DarkGray)),
             ]);
             if prompt_count > 1 {
                 footer_spans.extend(vec![
