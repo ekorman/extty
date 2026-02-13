@@ -917,9 +917,33 @@ impl App {
                 }
             }
 
+            let git_hash = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .and_then(|output| {
+                    if output.status.success() {
+                        String::from_utf8(output.stdout)
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    }
+                });
+
             let _ = tx.send(SetupMessage::Status("Uploading script...".to_string()));
 
-            let script = generate_script(&python_version, &command, skip_tmux, &remote_dir);
+            let script = generate_script(
+                &python_version,
+                &command,
+                skip_tmux,
+                &remote_dir,
+                git_hash.as_deref(),
+                &command,
+            );
 
             let upload_status = std::process::Command::new("bash")
                 .arg("-c")
@@ -3767,7 +3791,10 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
         }
     }
     if let Some(status) = &app.s3_pull_status {
-        let color = if status.contains("failed") || status.contains("error") || status.contains("not configured") {
+        let color = if status.contains("failed")
+            || status.contains("error")
+            || status.contains("not configured")
+        {
             NEON_MAGENTA
         } else if status.contains("Pulled") {
             NEON_GREEN

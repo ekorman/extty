@@ -1,6 +1,7 @@
 """Run class - manages single run state."""
 
 from __future__ import annotations
+import os
 import subprocess
 import threading
 from datetime import datetime, timezone
@@ -94,18 +95,25 @@ def _collect_environment() -> dict[str, Any]:
     from extty import __version__
 
     env: dict[str, Any] = {"_extty_version": __version__}
+    git_hash = os.environ.get("EXTTY_GIT_HASH")
+    if git_hash:
+        env["_git_hash"] = git_hash
+    else:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                env["_git_hash"] = result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
 
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            env["_git_hash"] = result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    run_command = os.environ.get("EXTTY_RUN_COMMAND")
+    if run_command:
+        env["_run_command"] = run_command
 
     return env
 
