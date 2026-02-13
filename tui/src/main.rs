@@ -605,6 +605,81 @@ impl App {
         });
     }
 
+    fn start_s3_pull_project(&mut self, project: &str) {
+        if self.s3_pull_rx.is_some() {
+            return;
+        }
+
+        let config = match s3::load_config() {
+            Ok(Some(config)) => config,
+            _ => {
+                self.s3_pull_status = Some("S3 not configured".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        let project = project.to_string();
+        let (tx, rx) = mpsc::channel();
+        self.s3_pull_rx = Some(rx);
+        self.s3_pull_status = Some(format!("Listing runs for {}...", project));
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(S3PullMessage::Error(format!("Runtime error: {}", e)));
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                let client = match s3::S3Client::new(config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                        return;
+                    }
+                };
+                let remote_runs = match client.list_runs(Some(&project)).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("List failed: {}", e)));
+                        return;
+                    }
+                };
+                if remote_runs.is_empty() {
+                    let _ = tx.send(S3PullMessage::Done(format!(
+                        "No remote runs for {}",
+                        project
+                    )));
+                    return;
+                }
+                let count = remote_runs.len();
+                let runs_dir = runs_dir();
+                for (i, rr) in remote_runs.iter().enumerate() {
+                    let _ = tx.send(S3PullMessage::Pulling(format!(
+                        "Pulling {}/{} ({}/{})...",
+                        project,
+                        rr.name,
+                        i + 1,
+                        count
+                    )));
+                    if let Err(e) = client
+                        .download_run(&project, &rr.name, &runs_dir, false, false)
+                        .await
+                    {
+                        let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
+                        return;
+                    }
+                }
+                let _ = tx.send(S3PullMessage::Done(format!(
+                    "Pulled {} runs for {}",
+                    count, project
+                )));
+            });
+        });
+    }
+
     fn refresh_infra(&mut self) {
         self.infra_loading = true;
         self.infra_error = None;
@@ -1522,6 +1597,16 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('p') => match entries.get(self.selected_list_item) {
+                Some(ListEntry::Project { name }) => {
+                    self.start_s3_pull_project(name);
+                }
+                Some(ListEntry::Run { run_index }) => {
+                    self.selected_run = *run_index;
+                    self.start_s3_pull();
+                }
+                None => {}
+            },
             KeyCode::Char('d') => {
                 if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
                     self.pending_delete_run = Some(*run_index);
@@ -3194,7 +3279,7 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
     let mut state = ListState::default();
     state.select(Some(app.selected_list_item));
 
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
         Span::styled("[Runs]", Style::default().fg(NEON_CYAN).bold()),
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
@@ -3202,12 +3287,26 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("Infra", Style::default().fg(Color::DarkGray)),
         Span::styled(" ", Style::default()),
-    ]);
+    ];
+    if let Some(status) = &app.s3_pull_status {
+        let color = if status.starts_with("Pull failed")
+            || status.starts_with("S3 not")
+            || status.starts_with("List failed")
+        {
+            NEON_MAGENTA
+        } else if status.starts_with("Pulled") || status.starts_with("No remote") {
+            NEON_GREEN
+        } else {
+            NEON_YELLOW
+        };
+        title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        title_spans.push(Span::styled(status.clone(), Style::default().fg(color)));
+    }
 
     let list = List::new(items)
         .block(
             Block::default()
-                .title(title)
+                .title(Line::from(title_spans))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(DIM_CYAN)),
@@ -3248,6 +3347,9 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         ]);
     }
     help_spans.extend(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("p", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
         Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
