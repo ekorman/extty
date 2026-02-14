@@ -41,7 +41,7 @@ struct ConfigToSave {
 }
 
 fn is_default_provider(s: &str) -> bool {
-    s == "lambda"
+    s == "vast"
 }
 
 #[derive(Serialize, Default)]

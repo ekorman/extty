@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -975,4 +975,33 @@ fn load_examples_jsonl(path: &PathBuf) -> Result<Vec<Example>, std::io::Error> {
     }
 
     Ok(examples)
+}
+
+fn starred_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".extty")
+        .join("starred.json")
+}
+
+pub fn load_starred_runs() -> HashSet<String> {
+    let path = starred_path();
+    let Ok(content) = fs::read_to_string(&path) else {
+        return HashSet::new();
+    };
+    let Ok(names) = serde_json::from_str::<Vec<String>>(&content) else {
+        return HashSet::new();
+    };
+    names.into_iter().collect()
+}
+
+pub fn save_starred_runs(starred: &HashSet<String>) {
+    let path = starred_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let names: Vec<&String> = starred.iter().collect();
+    if let Ok(json) = serde_json::to_string(&names) {
+        let _ = fs::write(&path, json);
+    }
 }

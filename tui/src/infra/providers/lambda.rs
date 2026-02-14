@@ -209,6 +209,7 @@ impl CloudProvider for LambdaProvider {
                         .into_iter()
                         .map(|r| r.name)
                         .collect(),
+                    metadata: Default::default(),
                 }
             })
             .collect())

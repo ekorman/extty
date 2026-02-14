@@ -252,6 +252,7 @@ impl CloudProvider for VastProvider {
                 storage_gib: offer.disk_space.unwrap_or(0.0) as u32,
                 price_cents_per_hour: (total_price * 100.0) as u32,
                 regions: vec![offer.geolocation.unwrap_or_else(|| "unknown".to_string())],
+                metadata: Default::default(),
             });
         }
 

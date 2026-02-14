@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -8,11 +10,28 @@ use crate::infra::providers::CloudProvider;
 
 const BASE_URL: &str = "https://api.primeintellect.ai/api/v1";
 
+/// Parses "root@193.183.22.53 -p 1530" into ("root", Some("193.183.22.53:1530"))
+fn parse_ssh_connection(conn: &Option<String>) -> Option<(String, Option<String>)> {
+    let conn = conn.as_ref()?;
+    let (user_host, port) = if let Some(idx) = conn.find(" -p ") {
+        (&conn[..idx], conn[idx + 4..].trim())
+    } else {
+        (conn.as_str(), "")
+    };
+    let (user, host) = user_host.split_once('@')?;
+    let ip = if port.is_empty() {
+        Some(host.to_string())
+    } else {
+        Some(format!("{}:{}", host, port))
+    };
+    Some((user.to_string(), ip))
+}
+
 fn normalize_status(raw: &str) -> InstanceStatus {
     match raw.to_lowercase().as_str() {
-        "pending" => InstanceStatus::Pending,
+        "pending" | "provisioning" => InstanceStatus::Pending,
         "starting" => InstanceStatus::Booting,
-        "running" => InstanceStatus::Running,
+        "running" | "active" => InstanceStatus::Running,
         "stopping" => InstanceStatus::Stopping,
         "stopped" => InstanceStatus::Stopped,
         "terminated" => InstanceStatus::Terminated,
@@ -112,12 +131,11 @@ struct PodsResponse {
 struct PrimePod {
     id: serde_json::Value,
     name: Option<String>,
-    #[serde(alias = "ip_address")]
-    ip_address: Option<String>,
-    ssh_host: Option<String>,
+    ip: Option<String>,
+    ssh_connection: Option<String>,
     status: Option<String>,
-    gpu_type: Option<String>,
-    region: Option<String>,
+    gpu_name: Option<String>,
+    provider_type: Option<String>,
 }
 
 impl PrimePod {
@@ -154,6 +172,8 @@ struct PrimeGpu {
     region: Option<String>,
     #[allow(dead_code)]
     data_center: Option<String>,
+    socket: Option<String>,
+    provider: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -177,7 +197,7 @@ enum CreatePodResponse {
 
 impl CloudProvider for PrimeProvider {
     fn ssh_user(&self) -> &str {
-        "ubuntu"
+        "root"
     }
 
     fn list_instances(&self) -> Result<Vec<Instance>> {
@@ -189,17 +209,19 @@ impl CloudProvider for PrimeProvider {
             .map(|p| {
                 let id = p.id_string();
                 let raw_status = p.status.unwrap_or_else(|| "unknown".to_string());
-                let ip = p.ip_address.or(p.ssh_host);
+
+                let (ssh_user, ip) = parse_ssh_connection(&p.ssh_connection)
+                    .unwrap_or_else(|| ("root".to_string(), p.ip.clone()));
 
                 Instance {
                     id,
                     name: p.name,
                     ip,
                     status: normalize_status(&raw_status),
-                    instance_type: p.gpu_type.unwrap_or_else(|| "unknown".to_string()),
-                    region: p.region.unwrap_or_else(|| "unknown".to_string()),
+                    instance_type: p.gpu_name.unwrap_or_else(|| "unknown".to_string()),
+                    region: p.provider_type.unwrap_or_else(|| "unknown".to_string()),
                     provider: Provider::Prime,
-                    ssh_user: "ubuntu".to_string(),
+                    ssh_user,
                     raw_status,
                 }
             })
@@ -218,6 +240,19 @@ impl CloudProvider for PrimeProvider {
                 let price_per_hour = g.prices.and_then(|p| p.on_demand).unwrap_or(0.0);
                 let region = g.region.unwrap_or_else(|| "unknown".to_string());
 
+                let mut metadata = HashMap::new();
+                if let Some(cloud_id) = &g.cloud_id {
+                    metadata.insert("cloud_id".to_string(), cloud_id.clone());
+                }
+                if let Some(socket) = &g.socket {
+                    metadata.insert("socket".to_string(), socket.clone());
+                }
+                if let Some(provider) = &g.provider {
+                    metadata.insert("provider".to_string(), provider.clone());
+                }
+                metadata.insert("gpu_type".to_string(), gpu_type.clone());
+                metadata.insert("gpu_count".to_string(), gpu_count.to_string());
+
                 InstanceType {
                     name: format!("{}x{}", gpu_type, gpu_count),
                     description: g.cloud_id,
@@ -230,25 +265,56 @@ impl CloudProvider for PrimeProvider {
                     storage_gib: g.disk.and_then(|r| r.default_count).unwrap_or(0),
                     price_cents_per_hour: (price_per_hour * 100.0) as u32,
                     regions: vec![region],
+                    metadata,
                 }
             })
             .collect())
     }
 
     fn launch(&self, opts: &LaunchOptions) -> Result<Vec<String>> {
-        let mut body = serde_json::json!({
-            "gpu_type": opts.instance_type,
+        let gpu_type = opts
+            .metadata
+            .get("gpu_type")
+            .ok_or_else(|| anyhow!("Missing gpu_type in metadata"))?;
+        let gpu_count: u32 = opts
+            .metadata
+            .get("gpu_count")
+            .ok_or_else(|| anyhow!("Missing gpu_count in metadata"))?
+            .parse()
+            .context("Invalid gpu_count")?;
+        let cloud_id = opts
+            .metadata
+            .get("cloud_id")
+            .ok_or_else(|| anyhow!("Missing cloud_id in metadata"))?;
+        let socket = opts
+            .metadata
+            .get("socket")
+            .ok_or_else(|| anyhow!("Missing socket in metadata"))?;
+        let provider_type = opts
+            .metadata
+            .get("provider")
+            .ok_or_else(|| anyhow!("Missing provider in metadata"))?;
+
+        let mut pod = serde_json::json!({
+            "cloudId": cloud_id,
+            "gpuType": gpu_type,
+            "socket": socket,
+            "gpuCount": gpu_count,
         });
 
-        if let Some(region) = &opts.region {
-            body["region"] = serde_json::json!(region);
-        }
         if let Some(name) = &opts.name {
-            body["name"] = serde_json::json!(name);
+            pod["name"] = serde_json::json!(name);
         }
-        if let Some(ssh_keys) = &opts.ssh_key_names {
-            body["ssh_key_names"] = serde_json::json!(ssh_keys);
+        if let Some(ssh_keys) = &opts.ssh_key_names
+            && let Some(key) = ssh_keys.first()
+        {
+            pod["sshKeyId"] = serde_json::json!(key);
         }
+
+        let body = serde_json::json!({
+            "pod": pod,
+            "provider": { "type": provider_type },
+        });
 
         let response: CreatePodResponse = self.post("/pods/", &body)?;
 

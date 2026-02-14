@@ -1,12 +1,14 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     #[default]
-    Lambda,
     Vast,
     Prime,
+    Lambda,
     Local,
 }
 
@@ -22,9 +24,9 @@ impl Provider {
 
     pub fn all() -> &'static [Provider] {
         &[
-            Provider::Lambda,
             Provider::Vast,
             Provider::Prime,
+            Provider::Lambda,
             Provider::Local,
         ]
     }
@@ -107,6 +109,8 @@ pub struct InstanceType {
     pub storage_gib: u32,
     pub price_cents_per_hour: u32,
     pub regions: Vec<String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 impl InstanceType {
@@ -219,4 +223,5 @@ pub struct LaunchOptions {
     pub region: Option<String>,
     pub ssh_key_names: Option<Vec<String>>,
     pub name: Option<String>,
+    pub metadata: HashMap<String, String>,
 }

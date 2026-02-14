@@ -42,7 +42,8 @@ mod run;
 mod s3;
 use data::{
     Checkpoint, Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation,
-    delete_model, load_all_evaluations, load_models, load_runs_lightweight,
+    delete_model, load_all_evaluations, load_models, load_runs_lightweight, load_starred_runs,
+    save_starred_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, generate_script,
@@ -76,6 +77,7 @@ enum View {
     ModelDetail,
     Focused,
     Compare,
+    ConfigFull,
     InfraList,
     InfraConfig,
     S3Config,
@@ -238,11 +240,16 @@ struct App {
     session_modal_focus: SessionModalField,
     setup_rx: Option<mpsc::Receiver<SetupMessage>>,
     compared_runs: Vec<usize>,
+    starred_runs: HashSet<String>,
     compare_focused: bool,
     s3_pull_rx: Option<mpsc::Receiver<S3PullMessage>>,
     s3_pull_status: Option<String>,
     s3_pull_time: Option<Instant>,
     goto_step_input: Option<String>,
+    pull_run_modal_open: bool,
+    pull_run_input: String,
+    config_cursor: usize,
+    config_copied_at: Option<Instant>,
 }
 
 impl App {
@@ -320,11 +327,16 @@ impl App {
             session_modal_focus: SessionModalField::default(),
             setup_rx: None,
             compared_runs: Vec::new(),
+            starred_runs: load_starred_runs(),
             compare_focused: false,
             s3_pull_rx: None,
             s3_pull_status: None,
             s3_pull_time: None,
             goto_step_input: None,
+            pull_run_modal_open: false,
+            pull_run_input: String::new(),
+            config_cursor: 0,
+            config_copied_at: None,
         }
     }
 
@@ -356,7 +368,19 @@ impl App {
             });
 
             if self.expanded_projects.contains(&project_name) {
+                let mut starred: Vec<usize> = Vec::new();
+                let mut unstarred: Vec<usize> = Vec::new();
                 for run_index in run_indices {
+                    if self
+                        .starred_runs
+                        .contains(&self.runs[run_index].display_name())
+                    {
+                        starred.push(run_index);
+                    } else {
+                        unstarred.push(run_index);
+                    }
+                }
+                for run_index in starred.into_iter().chain(unstarred) {
                     entries.push(ListEntry::Run { run_index });
                 }
             }
@@ -676,6 +700,78 @@ impl App {
                     "Pulled {} runs for {}",
                     count, project
                 )));
+            });
+        });
+    }
+
+    fn start_s3_pull_by_name(&mut self, input: &str) {
+        if self.s3_pull_rx.is_some() {
+            return;
+        }
+
+        let parts: Vec<&str> = input.splitn(2, '/').collect();
+        let (project, name) = match parts.as_slice() {
+            [project, name] => (project.trim().to_string(), name.trim().to_string()),
+            _ => {
+                self.s3_pull_status = Some("Format: project/run".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        if project.is_empty() || name.is_empty() {
+            self.s3_pull_status = Some("Format: project/run".to_string());
+            self.s3_pull_time = Some(Instant::now());
+            return;
+        }
+
+        let config = match s3::load_config() {
+            Ok(Some(config)) => config,
+            _ => {
+                self.s3_pull_status = Some("S3 not configured".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        let display = format!("{}/{}", project, name);
+        let (tx, rx) = mpsc::channel();
+        self.s3_pull_rx = Some(rx);
+        self.s3_pull_status = Some(format!("Pulling {}...", display));
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(S3PullMessage::Error(format!("Runtime error: {}", e)));
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                let client = match s3::S3Client::new(config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                        return;
+                    }
+                };
+                let runs_dir = runs_dir();
+                let _ = tx.send(S3PullMessage::Pulling(format!(
+                    "Pulling {}/{}...",
+                    project, name
+                )));
+                match client
+                    .download_run(&project, &name, &runs_dir, false, false)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ =
+                            tx.send(S3PullMessage::Done(format!("Pulled {}/{}", project, name)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
+                    }
+                }
             });
         });
     }
@@ -1301,7 +1397,7 @@ impl App {
                 ViewMode::Models => self.model_cards(),
                 ViewMode::Infra => vec![],
             },
-            View::InfraList | View::InfraConfig | View::S3Config => vec![],
+            View::ConfigFull | View::InfraList | View::InfraConfig | View::S3Config => vec![],
         }
     }
 
@@ -1386,6 +1482,10 @@ impl App {
             return;
         }
 
+        if self.pull_run_modal_open {
+            self.handle_pull_run_modal_key(code);
+            return;
+        }
         if self.session_modal_open {
             self.handle_session_modal_key(code);
             return;
@@ -1468,6 +1568,7 @@ impl App {
                 self.handle_model_detail_key(code, visible_rows, cols);
             }
             View::Focused => self.handle_focused_key(key),
+            View::ConfigFull => self.handle_config_full_key(code),
             View::Compare => {
                 let (visible_rows, cols) = self.grid_layout();
                 self.handle_compare_key(code, visible_rows, cols);
@@ -1475,6 +1576,28 @@ impl App {
             View::InfraList => self.handle_infra_list_key(code, modifiers),
             View::InfraConfig => self.handle_infra_config_key(code),
             View::S3Config => self.handle_s3_config_key(code),
+        }
+    }
+
+    fn handle_pull_run_modal_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.pull_run_modal_open = false;
+                self.pull_run_input.clear();
+            }
+            KeyCode::Enter => {
+                let input = self.pull_run_input.clone();
+                self.pull_run_modal_open = false;
+                self.pull_run_input.clear();
+                self.start_s3_pull_by_name(&input);
+            }
+            KeyCode::Char(c) => {
+                self.pull_run_input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.pull_run_input.pop();
+            }
+            _ => {}
         }
     }
 
@@ -1607,6 +1730,19 @@ impl App {
                 }
                 None => {}
             },
+            KeyCode::Char('P') => {
+                self.pull_run_modal_open = true;
+                self.pull_run_input.clear();
+            }
+            KeyCode::Char('s') => {
+                if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
+                    let name = self.runs[*run_index].display_name();
+                    if !self.starred_runs.remove(&name) {
+                        self.starred_runs.insert(name);
+                    }
+                    save_starred_runs(&self.starred_runs);
+                }
+            }
             KeyCode::Char('d') => {
                 if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
                     self.pending_delete_run = Some(*run_index);
@@ -1725,12 +1861,76 @@ impl App {
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
             }
+            KeyCode::Char('C') if !self.runs.is_empty() => {
+                if self.runs[self.selected_run].config.is_some() {
+                    self.config_cursor = 0;
+                    self.config_copied_at = None;
+                    self.view = View::ConfigFull;
+                }
+            }
             KeyCode::Char('d') if !self.runs.is_empty() => {
                 self.pending_delete_run = Some(self.selected_run);
                 self.show_delete_confirm = true;
             }
             KeyCode::Char('p') => {
                 self.start_s3_pull();
+            }
+            KeyCode::Char('s') if !self.runs.is_empty() => {
+                let name = self.runs[self.selected_run].display_name();
+                if !self.starred_runs.remove(&name) {
+                    self.starred_runs.insert(name);
+                }
+                save_starred_runs(&self.starred_runs);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_config_full_key(&mut self, code: KeyCode) {
+        let line_count = self
+            .current_run()
+            .and_then(|r| r.config.as_ref())
+            .map(|c| {
+                let mut vals = Vec::new();
+                flatten_config_values(c, &mut vals);
+                vals.len()
+            })
+            .unwrap_or(0);
+
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => self.view = View::RunDetail,
+            KeyCode::Up => self.config_cursor = self.config_cursor.saturating_sub(1),
+            KeyCode::Down => {
+                if line_count > 0 {
+                    self.config_cursor = (self.config_cursor + 1).min(line_count - 1);
+                }
+            }
+            KeyCode::PageUp => self.config_cursor = self.config_cursor.saturating_sub(20),
+            KeyCode::PageDown => {
+                if line_count > 0 {
+                    self.config_cursor = (self.config_cursor + 20).min(line_count - 1);
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let Some(run) = self.current_run()
+                    && let Some(config) = &run.config
+                {
+                    let mut vals = Vec::new();
+                    flatten_config_values(config, &mut vals);
+                    if let Some(val) = vals.get(self.config_cursor) {
+                        copy_to_clipboard(val);
+                        self.config_copied_at = Some(Instant::now());
+                    }
+                }
+            }
+            KeyCode::Char('Y') => {
+                if let Some(run) = self.current_run()
+                    && let Some(config) = &run.config
+                    && let Ok(json) = serde_json::to_string_pretty(config)
+                {
+                    copy_to_clipboard(&json);
+                    self.config_copied_at = Some(Instant::now());
+                }
             }
             _ => {}
         }
@@ -1826,6 +2026,9 @@ impl App {
             }
             KeyCode::Char('p') => {
                 self.start_s3_pull_compared();
+            }
+            KeyCode::Char('c') => {
+                self.show_config = !self.show_config;
             }
             _ => {}
         }
@@ -2170,21 +2373,21 @@ impl App {
                 _ => {}
             },
             KeyCode::Char('1') => {
-                self.selected_infra_provider = Provider::Lambda;
-                self.selected_infra_instance = 0;
-                self.selected_infra_type = 0;
-                self.refresh_infra();
-                self.refresh_infra_types();
-            }
-            KeyCode::Char('2') => {
                 self.selected_infra_provider = Provider::Vast;
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
-            KeyCode::Char('3') => {
+            KeyCode::Char('2') => {
                 self.selected_infra_provider = Provider::Prime;
+                self.selected_infra_instance = 0;
+                self.selected_infra_type = 0;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Char('3') => {
+                self.selected_infra_provider = Provider::Lambda;
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
                 self.refresh_infra();
@@ -2645,6 +2848,7 @@ impl App {
             region,
             ssh_key_names,
             name,
+            metadata: instance_type.metadata.clone(),
         };
 
         let client = get_provider(provider, api_key);
@@ -2714,7 +2918,7 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
         if app.view_mode == ViewMode::Infra
             && !app.show_config
             && app.selected_infra_provider != Provider::Local
-            && app.infra_last_refresh.elapsed() >= Duration::from_secs(5)
+            && app.infra_last_refresh.elapsed() >= Duration::from_secs(30)
         {
             app.refresh_infra();
         }
@@ -3150,6 +3354,7 @@ fn render(app: &App, frame: &mut Frame) {
         View::RunDetail => render_run_detail(app, frame),
         View::ModelDetail => render_model_detail(app, frame),
         View::Focused => render_focused(app, frame),
+        View::ConfigFull => render_config_full(app, frame),
         View::Compare => render_compare_view(app, frame),
         View::InfraList => render_infra_dashboard(app, frame),
         View::InfraConfig => render_infra_config(app, frame),
@@ -3161,6 +3366,9 @@ fn render(app: &App, frame: &mut Frame) {
     }
     if app.show_terminate_confirm {
         render_terminate_confirm(app, frame);
+    }
+    if app.pull_run_modal_open {
+        render_pull_run_modal(app, frame);
     }
 }
 
@@ -3260,8 +3468,18 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
                         Color::DarkGray
                     };
 
+                    let is_starred = app.starred_runs.contains(&run.display_name());
+                    let star = if is_starred { "★" } else { " " };
+                    let star_color = if is_starred {
+                        NEON_YELLOW
+                    } else {
+                        Color::DarkGray
+                    };
+
                     let spans = vec![
                         Span::styled(check, Style::default().fg(check_color)),
+                        Span::styled(" ", Style::default()),
+                        Span::styled(star, Style::default().fg(star_color)),
                         Span::styled(" └─ ", Style::default().fg(DIM_CYAN)),
                         Span::styled(status_icon, Style::default().fg(status_color)),
                         Span::styled(run.name.clone(), name_style),
@@ -3335,6 +3553,9 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Space", Style::default().fg(NEON_CYAN)),
         Span::styled("] compare  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("s", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] star  ", Style::default().fg(Color::DarkGray)),
     ];
     if app.compared_runs.len() >= 2 {
         help_spans.extend(vec![
@@ -3350,6 +3571,9 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("p", Style::default().fg(NEON_YELLOW)),
         Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("P", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] pull by name  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
         Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
@@ -3641,6 +3865,9 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
             format!("] {}  ", config_hint),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("C", Style::default().fg(NEON_CYAN)),
+        Span::styled("] full config  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("p", Style::default().fg(NEON_CYAN)),
         Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
@@ -4032,7 +4259,24 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
     }
     frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
 
-    let grid_area = chunks[1];
+    let has_any_config = app
+        .compared_runs
+        .iter()
+        .any(|&ri| app.runs.get(ri).and_then(|r| r.config.as_ref()).is_some());
+    let config_width = 35u16;
+    let (grid_area, config_area) = if app.show_config && has_any_config {
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(40),
+                Constraint::Length(config_width * app.compared_runs.len() as u16),
+            ])
+            .split(chunks[1]);
+        (h_chunks[0], Some(h_chunks[1]))
+    } else {
+        (chunks[1], None)
+    };
+
     let card_width = 40u16;
     let card_height = 12u16;
     let cols = (grid_area.width / card_width).max(1) as usize;
@@ -4086,6 +4330,55 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
         }
     }
 
+    if let Some(config_area) = config_area {
+        let col_constraints: Vec<Constraint> = app
+            .compared_runs
+            .iter()
+            .map(|_| Constraint::Ratio(1, app.compared_runs.len() as u32))
+            .collect();
+        let col_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(col_constraints)
+            .split(config_area);
+        for (i, &run_idx) in app.compared_runs.iter().enumerate() {
+            let color = COMPARE_COLORS[i % COMPARE_COLORS.len()];
+            if let Some(run) = app.runs.get(run_idx) {
+                if let Some(config) = &run.config {
+                    let mut lines: Vec<Line> = Vec::new();
+                    render_json_value(config, 0, &mut lines);
+                    let block = Block::default()
+                        .title(Span::styled(
+                            format!(" {} ", run.display_name()),
+                            Style::default().fg(color).bold(),
+                        ))
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(DIM_CYAN));
+                    let paragraph = Paragraph::new(lines)
+                        .block(block)
+                        .wrap(ratatui::widgets::Wrap { trim: false });
+                    frame.render_widget(paragraph, col_chunks[i]);
+                } else {
+                    let block = Block::default()
+                        .title(Span::styled(
+                            format!(" {} ", run.display_name()),
+                            Style::default().fg(color).bold(),
+                        ))
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(DIM_CYAN));
+                    let paragraph = Paragraph::new(Span::styled(
+                        "No config",
+                        Style::default().fg(Color::DarkGray),
+                    ))
+                    .block(block);
+                    frame.render_widget(paragraph, col_chunks[i]);
+                }
+            }
+        }
+    }
+
+    let config_hint = if app.show_config { "hide" } else { "config" };
     let footer = Line::from(vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
@@ -4096,6 +4389,12 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_CYAN)),
         Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("c", Style::default().fg(NEON_CYAN)),
+        Span::styled(
+            format!("] {}  ", config_hint),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("p", Style::default().fg(NEON_CYAN)),
         Span::styled("] pull", Style::default().fg(Color::DarkGray)),
@@ -4196,6 +4495,191 @@ fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value
         .wrap(ratatui::widgets::Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+}
+
+fn render_config_full(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+
+    let Some(run) = app.current_run() else {
+        frame.render_widget(Paragraph::new("No run selected"), area);
+        return;
+    };
+
+    let Some(config) = &run.config else {
+        frame.render_widget(Paragraph::new("No config available"), area);
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    render_json_value_full(config, 0, &mut lines);
+
+    let total_lines = lines.len();
+    let visible = chunks[0].height.saturating_sub(2) as usize;
+    let cursor = app.config_cursor.min(total_lines.saturating_sub(1));
+
+    // Highlight the cursor line
+    if let Some(line) = lines.get_mut(cursor) {
+        let mut spans = vec![Span::styled("▶ ", Style::default().fg(NEON_CYAN))];
+        spans.extend(line.spans.clone());
+        *line = Line::from(spans).patch_style(Style::default().bg(Color::Rgb(40, 55, 70)));
+    }
+
+    // Auto-scroll to keep cursor visible
+    let scroll = if cursor < visible / 2 {
+        0
+    } else {
+        (cursor - visible / 2).min(total_lines.saturating_sub(visible))
+    } as u16;
+
+    let mut title_spans = vec![
+        Span::styled(" CONFIG ", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled("— ", Style::default().fg(DIM_CYAN)),
+        Span::styled(run.display_name(), Style::default().fg(NEON_MAGENTA)),
+        Span::styled(" ", Style::default()),
+    ];
+
+    if let Some(t) = app.config_copied_at
+        && t.elapsed() < Duration::from_secs(2)
+    {
+        title_spans.push(Span::styled(
+            " Copied! ",
+            Style::default().fg(NEON_GREEN).bold(),
+        ));
+    }
+
+    let block = Block::default()
+        .title(Line::from(title_spans))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN));
+
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
+
+    frame.render_widget(paragraph, chunks[0]);
+
+    let footer = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+        Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("y", Style::default().fg(NEON_GREEN)),
+        Span::styled("] copy value  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Y", Style::default().fg(NEON_GREEN)),
+        Span::styled("] copy all  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("PgUp/PgDn", Style::default().fg(NEON_CYAN)),
+        Span::styled("] page", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(footer), chunks[1]);
+}
+
+fn render_json_value_full(value: &serde_json::Value, indent: usize, lines: &mut Vec<Line>) {
+    let pad = "  ".repeat(indent);
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                match val {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        lines.push(Line::from(vec![
+                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(format!("{}:", key), Style::default().fg(NEON_MAGENTA)),
+                        ]));
+                        render_json_value_full(val, indent + 1, lines);
+                    }
+                    _ => {
+                        let val_str = format_json_primitive(val);
+                        lines.push(Line::from(vec![
+                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
+                            Span::styled(val_str, Style::default().fg(Color::White)),
+                        ]));
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, val) in arr.iter().enumerate() {
+                match val {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        lines.push(Line::from(vec![
+                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(format!("[{}]:", i), Style::default().fg(NEON_YELLOW)),
+                        ]));
+                        render_json_value_full(val, indent + 1, lines);
+                    }
+                    _ => {
+                        let val_str = format_json_primitive(val);
+                        lines.push(Line::from(vec![
+                            Span::styled(pad.clone(), Style::default()),
+                            Span::styled(format!("[{}]: ", i), Style::default().fg(NEON_YELLOW)),
+                            Span::styled(val_str, Style::default().fg(Color::White)),
+                        ]));
+                    }
+                }
+            }
+        }
+        _ => {
+            let val_str = format_json_primitive(value);
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", pad, val_str),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+}
+
+fn flatten_config_values(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (_, val) in map {
+                match val {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        out.push(serde_json::to_string_pretty(val).unwrap_or_default());
+                        flatten_config_values(val, out);
+                    }
+                    _ => {
+                        out.push(format_json_primitive(val));
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for val in arr {
+                match val {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        out.push(serde_json::to_string_pretty(val).unwrap_or_default());
+                        flatten_config_values(val, out);
+                    }
+                    _ => {
+                        out.push(format_json_primitive(val));
+                    }
+                }
+            }
+        }
+        _ => {
+            out.push(format_json_primitive(value));
+        }
+    }
+}
+
+fn copy_to_clipboard(text: &str) {
+    use std::process::{Command, Stdio};
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
 }
 
 fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<Line>) {
@@ -5955,6 +6439,52 @@ fn render_delete_confirm(app: &App, frame: &mut Frame) {
     frame.render_widget(paragraph, popup_area);
 }
 
+fn render_pull_run_modal(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_height = 5u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let inner_width = popup_width.saturating_sub(2) as usize;
+    let input = &app.pull_run_input;
+    let display = if input.len() >= inner_width {
+        &input[input.len() - inner_width + 1..]
+    } else {
+        input.as_str()
+    };
+    let cursor = "_";
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(display, Style::default().fg(NEON_CYAN)),
+            Span::styled(cursor, Style::default().fg(NEON_CYAN)),
+        ]),
+        Line::from(""),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Pull Run (project/run) ",
+            Style::default().fg(NEON_YELLOW).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_YELLOW))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(paragraph, popup_area);
+}
+
 fn render_infra_dashboard(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
@@ -6012,33 +6542,6 @@ fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled("[Infra]", Style::default().fg(NEON_CYAN).bold()),
         Span::styled("   Provider: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            if lambda_selected {
-                "[λ Lambda"
-            } else {
-                "λ Lambda"
-            },
-            if lambda_selected {
-                Style::default().fg(NEON_CYAN).bold()
-            } else if lambda_configured {
-                Style::default().fg(NEON_GREEN)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        ),
-        Span::styled(
-            if lambda_configured { " ✓" } else { " ✗" },
-            Style::default().fg(if lambda_configured {
-                NEON_GREEN
-            } else {
-                Color::DarkGray
-            }),
-        ),
-        Span::styled(
-            if lambda_selected { "]" } else { "" },
-            Style::default().fg(NEON_CYAN).bold(),
-        ),
-        Span::styled(" ", Style::default()),
-        Span::styled(
             if vast_selected { "[V Vast" } else { "V Vast" },
             if vast_selected {
                 Style::default().fg(NEON_CYAN).bold()
@@ -6085,6 +6588,33 @@ fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
         ),
         Span::styled(
             if prime_selected { "]" } else { "" },
+            Style::default().fg(NEON_CYAN).bold(),
+        ),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            if lambda_selected {
+                "[λ Lambda"
+            } else {
+                "λ Lambda"
+            },
+            if lambda_selected {
+                Style::default().fg(NEON_CYAN).bold()
+            } else if lambda_configured {
+                Style::default().fg(NEON_GREEN)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(
+            if lambda_configured { " ✓" } else { " ✗" },
+            Style::default().fg(if lambda_configured {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            if lambda_selected { "]" } else { "" },
             Style::default().fg(NEON_CYAN).bold(),
         ),
         Span::styled(" ", Style::default()),
