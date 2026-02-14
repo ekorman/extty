@@ -238,22 +238,13 @@ fn select_instance(config: &InfraConfig, opts: &RunOptions, log: &mut LogFile) -
     let providers_to_check: Vec<Provider> = if let Some(ref name) = opts.provider {
         vec![resolve_provider(name)?]
     } else {
-        vec![config.default_provider]
+        Provider::all().to_vec()
     };
 
     let mut instances: Vec<Instance> = providers_to_check
         .iter()
         .flat_map(|p| fetch_running_instances(config, *p, log))
         .collect();
-
-    if instances.is_empty() && opts.provider.is_none() {
-        log.log("No running instances on default provider, trying all providers");
-        instances = Provider::all()
-            .iter()
-            .filter(|p| **p != config.default_provider)
-            .flat_map(|p| fetch_running_instances(config, *p, log))
-            .collect();
-    }
 
     if instances.is_empty() {
         bail!("No running instances found");
