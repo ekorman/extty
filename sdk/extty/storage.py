@@ -22,6 +22,36 @@ def get_models_dir() -> Path:
     return Path.home() / ".extty" / "models"
 
 
+@dataclass(frozen=True)
+class MetricPoint:
+    """A single metric data point."""
+
+    step: int
+    timestamp: float
+    value: float
+
+
+@dataclass(frozen=True)
+class SystemMetricPoint:
+    """A single system metric sample."""
+
+    timestamp: float
+    ram_used_gb: float
+    ram_total_gb: float
+    gpu_mem_used_gb: float | None
+    gpu_mem_total_gb: float | None
+    gpu_util_pct: float | None
+
+
+@dataclass(frozen=True)
+class ExampleRecord:
+    """A single logged example record."""
+
+    step: int
+    timestamp: float
+    data: dict[str, Any]
+
+
 def sanitize_metric_name(name: str) -> str:
     """
     Sanitize a metric name for use as a file path.
@@ -204,6 +234,19 @@ class RunStorage:
         (self.run_dir / "metrics").mkdir(exist_ok=True)
         (self.run_dir / "examples").mkdir(exist_ok=True)
 
+    @classmethod
+    def open_readonly(cls, run_dir: Path) -> RunStorage:
+        """Open an existing run directory for reading without creating directories."""
+        obj = cls.__new__(cls)
+        obj.run_dir = run_dir
+        obj._metric_files = {}
+        obj._system_file = None
+        obj._buffer = []
+        obj._buffer_size = 10
+        obj._last_flush = 0.0
+        obj._flush_interval = 1.0
+        return obj
+
     def write_meta(self, meta: MetaData) -> None:
         """Write or update the meta.json file."""
         meta_path = self.run_dir / "meta.json"
@@ -315,3 +358,95 @@ class RunStorage:
             if hasattr(f, "close"):
                 f.close()
         self._metric_files.clear()
+
+    def list_metric_names(self) -> list[str]:
+        """List all metric names by scanning the metrics/ directory."""
+        metrics_dir = self.run_dir / "metrics"
+        if not metrics_dir.exists():
+            return []
+        names = []
+        for csv_file in sorted(metrics_dir.rglob("*.csv")):
+            relative = csv_file.relative_to(metrics_dir)
+            names.append(relative.with_suffix("").as_posix())
+        return names
+
+    def read_metric(self, name: str) -> list[MetricPoint]:
+        """Read all data points for a named metric from its CSV file."""
+        relative_path = sanitize_metric_name(name) + ".csv"
+        filepath = self.run_dir / "metrics" / relative_path
+        if not filepath.exists():
+            raise FileNotFoundError(f"Metric '{name}' not found at {filepath}")
+        points = []
+        with open(filepath) as f:
+            f.readline()  # skip header
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                points.append(
+                    MetricPoint(
+                        step=int(parts[0]),
+                        timestamp=float(parts[1]),
+                        value=float(parts[2]),
+                    )
+                )
+        return points
+
+    def read_system_metrics(self) -> list[SystemMetricPoint]:
+        """Read system metrics from system.csv."""
+        filepath = self.run_dir / "system.csv"
+        if not filepath.exists():
+            return []
+        points = []
+        with open(filepath) as f:
+            f.readline()  # skip header
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                points.append(
+                    SystemMetricPoint(
+                        timestamp=float(parts[0]),
+                        ram_used_gb=float(parts[1]),
+                        ram_total_gb=float(parts[2]),
+                        gpu_mem_used_gb=float(parts[3]) if parts[3] else None,
+                        gpu_mem_total_gb=float(parts[4]) if parts[4] else None,
+                        gpu_util_pct=float(parts[5]) if parts[5] else None,
+                    )
+                )
+        return points
+
+    def list_example_names(self) -> list[str]:
+        """List all example names by scanning the examples/ directory."""
+        examples_dir = self.run_dir / "examples"
+        if not examples_dir.exists():
+            return []
+        names = []
+        for jsonl_file in sorted(examples_dir.rglob("*.jsonl")):
+            relative = jsonl_file.relative_to(examples_dir)
+            names.append(relative.with_suffix("").as_posix())
+        return names
+
+    def read_examples(self, name: str) -> list[ExampleRecord]:
+        """Read all examples for a named example stream from its JSONL file."""
+        relative_path = sanitize_metric_name(name) + ".jsonl"
+        filepath = self.run_dir / "examples" / relative_path
+        if not filepath.exists():
+            raise FileNotFoundError(f"Examples '{name}' not found at {filepath}")
+        records = []
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                records.append(
+                    ExampleRecord(
+                        step=obj["step"],
+                        timestamp=obj["timestamp"],
+                        data=obj["data"],
+                    )
+                )
+        return records
