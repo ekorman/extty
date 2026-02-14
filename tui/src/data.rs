@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -36,6 +36,65 @@ pub struct Example {
     pub prompts: Vec<String>,
     pub responses: Vec<Vec<String>>,
     pub rewards: Option<Vec<Vec<Reward>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExampleMeta {
+    pub step: u64,
+    file_idx: usize,
+    byte_offset: u64,
+}
+
+#[derive(Debug)]
+pub struct ExampleGroup {
+    files: Vec<PathBuf>,
+    pub entries: Vec<ExampleMeta>,
+    avg_reward: Option<f64>,
+    last: Option<Example>,
+}
+
+impl ExampleGroup {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn avg_reward(&self) -> Option<f64> {
+        self.avg_reward
+    }
+
+    pub fn last(&self) -> Option<&Example> {
+        self.last.as_ref()
+    }
+
+    pub fn steps(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.iter().map(|e| e.step)
+    }
+
+    pub fn find_step(&self, step: u64) -> Option<usize> {
+        self.entries.binary_search_by_key(&step, |e| e.step).ok()
+    }
+
+    pub fn load(&self, idx: usize) -> Option<Example> {
+        let entry = self.entries.get(idx)?;
+        let path = self.files.get(entry.file_idx)?;
+        let mut file = File::open(path).ok()?;
+        file.seek(SeekFrom::Start(entry.byte_offset)).ok()?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let row: ExampleRow = serde_json::from_str(&line).ok()?;
+        Some(Example {
+            step: row.step,
+            prompts: row.data.prompt,
+            responses: row.data.response,
+            rewards: row.data.reward,
+        })
+    }
 }
 
 // An evaluation example (supports batched prompts and grouped responses like training examples)
@@ -99,7 +158,7 @@ pub struct Run {
     #[allow(dead_code)]
     pub path: PathBuf,
     pub metrics: HashMap<String, Vec<MetricPoint>>,
-    pub examples: HashMap<String, Vec<Example>>,
+    pub examples: HashMap<String, ExampleGroup>,
     pub start_time: Option<DateTime<Local>>,
     pub end_time: Option<DateTime<Local>>,
     pub status: RunStatus,
@@ -616,30 +675,61 @@ fn load_metric_csv(path: &PathBuf) -> Result<Vec<MetricPoint>, csv::Error> {
     Ok(points)
 }
 
-// Load all examples from a run directory (recursively)
-fn load_examples(run_path: &Path) -> HashMap<String, Vec<Example>> {
-    let mut examples = HashMap::new();
+type ExampleGroupBuilder = (Vec<PathBuf>, Vec<ExampleMeta>, f64, usize, Option<Example>);
+
+fn load_examples(run_path: &Path) -> HashMap<String, ExampleGroup> {
+    let mut groups: HashMap<String, ExampleGroupBuilder> = HashMap::new();
     let examples_dir = run_path.join("examples");
 
     if !examples_dir.exists() {
-        return examples;
+        return HashMap::new();
     }
 
-    load_examples_recursive(&examples_dir, &examples_dir, &mut examples);
+    load_examples_recursive(&examples_dir, &examples_dir, &mut groups);
 
-    // Sort each group by step
-    for group in examples.values_mut() {
-        group.sort_by_key(|e| e.step);
-    }
-
-    examples
+    groups
+        .into_iter()
+        .map(
+            |(name, (files, mut entries, reward_total, reward_count, last))| {
+                entries.sort_by_key(|e| e.step);
+                let avg_reward = if reward_count > 0 {
+                    Some(reward_total / reward_count as f64)
+                } else {
+                    None
+                };
+                let last = if let Some(max_entry) = entries.last() {
+                    if last.as_ref().map(|l| l.step) == Some(max_entry.step) {
+                        last
+                    } else {
+                        let group = ExampleGroup {
+                            files: files.clone(),
+                            entries: vec![max_entry.clone()],
+                            avg_reward: None,
+                            last: None,
+                        };
+                        group.load(0)
+                    }
+                } else {
+                    None
+                };
+                (
+                    name,
+                    ExampleGroup {
+                        files,
+                        entries,
+                        avg_reward,
+                        last,
+                    },
+                )
+            },
+        )
+        .collect()
 }
 
-// Recursively find and load JSONL files
 fn load_examples_recursive(
     base_dir: &PathBuf,
     current_dir: &PathBuf,
-    examples: &mut HashMap<String, Vec<Example>>,
+    groups: &mut HashMap<String, ExampleGroupBuilder>,
 ) {
     let Ok(entries) = fs::read_dir(current_dir) else {
         return;
@@ -649,22 +739,31 @@ fn load_examples_recursive(
         let path = entry.path();
 
         if path.is_dir() {
-            load_examples_recursive(base_dir, &path, examples);
-        } else if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-            // Build name from relative path (e.g., "val/example" -> "val")
-            if let Ok(relative) = path.strip_prefix(base_dir) {
-                let name = relative
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| relative.with_extension("").to_string_lossy().to_string());
-                let name = if name.is_empty() {
-                    relative.with_extension("").to_string_lossy().to_string()
-                } else {
-                    name
-                };
-                if let Ok(file_examples) = load_examples_jsonl(&path) {
-                    examples.entry(name).or_default().extend(file_examples);
-                }
+            load_examples_recursive(base_dir, &path, groups);
+        } else if path.extension().map(|e| e == "jsonl").unwrap_or(false)
+            && let Ok(relative) = path.strip_prefix(base_dir)
+        {
+            let name = relative
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| relative.with_extension("").to_string_lossy().to_string());
+            let name = if name.is_empty() {
+                relative.with_extension("").to_string_lossy().to_string()
+            } else {
+                name
+            };
+            let group = groups
+                .entry(name)
+                .or_insert_with(|| (vec![], vec![], 0.0, 0, None));
+            let file_idx = group.0.len();
+            group.0.push(path.clone());
+            if let Ok((metas, reward_total, reward_count, last_example)) =
+                build_example_index(&path, file_idx)
+            {
+                group.1.extend(metas);
+                group.2 += reward_total;
+                group.3 += reward_count;
+                group.4 = last_example;
             }
         }
     }
@@ -955,17 +1054,40 @@ struct ExampleData {
     reward: Option<Vec<Vec<Reward>>>,
 }
 
-const MAX_EXAMPLES: usize = 200;
-
-fn load_examples_jsonl(path: &PathBuf) -> Result<Vec<Example>, std::io::Error> {
+fn build_example_index(
+    path: &PathBuf,
+    file_idx: usize,
+) -> Result<(Vec<ExampleMeta>, f64, usize, Option<Example>), std::io::Error> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut examples = Vec::new();
+    let mut reader = BufReader::new(file);
+    let mut metas = Vec::new();
+    let mut reward_total = 0.0;
+    let mut reward_count = 0;
+    let mut last_example = None;
+    let mut line = String::new();
 
-    for line in reader.lines() {
-        let line = line?;
+    loop {
+        let byte_offset = reader.stream_position()?;
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
         if let Ok(row) = serde_json::from_str::<ExampleRow>(&line) {
-            examples.push(Example {
+            metas.push(ExampleMeta {
+                step: row.step,
+                file_idx,
+                byte_offset,
+            });
+            if let Some(ref rewards) = row.data.reward {
+                for prompt_rewards in rewards {
+                    for reward in prompt_rewards {
+                        reward_total += reward.total();
+                        reward_count += 1;
+                    }
+                }
+            }
+            last_example = Some(Example {
                 step: row.step,
                 prompts: row.data.prompt,
                 responses: row.data.response,
@@ -974,11 +1096,7 @@ fn load_examples_jsonl(path: &PathBuf) -> Result<Vec<Example>, std::io::Error> {
         }
     }
 
-    if examples.len() > MAX_EXAMPLES {
-        examples.drain(..examples.len() - MAX_EXAMPLES);
-    }
-
-    Ok(examples)
+    Ok((metas, reward_total, reward_count, last_example))
 }
 
 fn starred_path() -> PathBuf {

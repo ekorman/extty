@@ -41,9 +41,9 @@ mod infra;
 mod run;
 mod s3;
 use data::{
-    Checkpoint, Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation,
-    delete_model, load_all_evaluations, load_models, load_runs_lightweight, load_starred_runs,
-    save_starred_runs,
+    Checkpoint, Evaluation, Example, ExampleGroup, MetricPoint, Model, Reward, Run,
+    delete_evaluation, delete_model, load_all_evaluations, load_models, load_runs_lightweight,
+    load_starred_runs, save_starred_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, generate_script,
@@ -245,6 +245,7 @@ struct App {
     s3_pull_rx: Option<mpsc::Receiver<S3PullMessage>>,
     s3_pull_status: Option<String>,
     s3_pull_time: Option<Instant>,
+    cached_example: Option<(String, usize, Example)>,
     goto_step_input: Option<String>,
     pull_run_modal_open: bool,
     pull_run_input: String,
@@ -333,6 +334,7 @@ impl App {
             s3_pull_rx: None,
             s3_pull_status: None,
             s3_pull_time: None,
+            cached_example: None,
             goto_step_input: None,
             pull_run_modal_open: false,
             pull_run_input: String::new(),
@@ -1403,8 +1405,8 @@ impl App {
             .compared_runs
             .iter()
             .filter_map(|&idx| self.runs.get(idx))
-            .flat_map(|run| run.examples.get(name).into_iter().flatten())
-            .map(|e| e.step)
+            .filter_map(|run| run.examples.get(name))
+            .flat_map(|g| g.steps())
             .collect();
         steps.into_iter().collect()
     }
@@ -1431,6 +1433,25 @@ impl App {
             .iter()
             .filter(|e| e.model_name == model.name && e.project == model.project)
             .count()
+    }
+
+    fn get_or_load_example(&mut self, name: &str, idx: usize) -> Option<&Example> {
+        if self
+            .cached_example
+            .as_ref()
+            .is_none_or(|(n, i, _)| n != name || *i != idx)
+        {
+            let example = self
+                .current_run()
+                .and_then(|r| r.examples.get(name))
+                .and_then(|g| g.load(idx));
+            if let Some(ex) = example {
+                self.cached_example = Some((name.to_string(), idx, ex));
+            } else {
+                return None;
+            }
+        }
+        self.cached_example.as_ref().map(|(_, _, ex)| ex)
     }
 
     // Calculate wrapped line count for text given a width
@@ -1485,17 +1506,15 @@ impl App {
 
         let text = match current_card {
             Some(Card::Examples { name }) => {
-                if let Some(examples) = self.current_run().and_then(|r| r.examples.get(name)) {
-                    if let Some(example) = examples.get(self.selected_example) {
+                if let Some((ref cn, ci, ref ex)) = self.cached_example {
+                    if cn == name && ci == self.selected_example {
                         if is_prompt {
-                            example
-                                .prompts
+                            ex.prompts
                                 .get(self.selected_prompt)
                                 .cloned()
                                 .unwrap_or_default()
                         } else {
-                            example
-                                .responses
+                            ex.responses
                                 .get(self.selected_prompt)
                                 .and_then(|r| r.get(self.selected_response))
                                 .cloned()
@@ -1592,7 +1611,7 @@ impl App {
                                     Some(Card::Examples { name }) => self
                                         .current_run()
                                         .and_then(|r| r.examples.get(name))
-                                        .map(|exs| exs.iter().map(|e| e.step).collect())
+                                        .map(|g| g.steps().collect())
                                         .unwrap_or_default(),
                                     _ => vec![],
                                 }
@@ -1610,6 +1629,7 @@ impl App {
                             .map(|(i, _)| i)
                             .unwrap_or(0);
                         self.selected_example = best_idx;
+                        self.cached_example = None;
                         self.selected_prompt = 0;
                         self.selected_response = 0;
                         self.prompt_scroll_offset = 0;
@@ -1914,17 +1934,20 @@ impl App {
             }
             KeyCode::Enter if card_count > 0 => {
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.view = View::Focused;
             }
             KeyCode::Char('[') if self.selected_run > 0 => {
                 self.selected_run -= 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.cached_example = None;
             }
             KeyCode::Char(']') if self.selected_run < self.runs.len().saturating_sub(1) => {
                 self.selected_run += 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.cached_example = None;
             }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
@@ -2030,6 +2053,7 @@ impl App {
             }
             KeyCode::Enter if card_count > 0 => {
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.view = View::Focused;
             }
             KeyCode::Char('[') if self.selected_model > 0 => {
@@ -2151,7 +2175,9 @@ impl App {
                             .iter()
                             .filter_map(|&idx| self.runs.get(idx))
                             .filter_map(|run| {
-                                run.examples.get(name)?.iter().find(|e| e.step == step)
+                                let g = run.examples.get(name)?;
+                                let idx = g.find_step(step)?;
+                                g.load(idx)
                             })
                             .map(|ex| ex.prompts.len())
                             .max()
@@ -2160,10 +2186,10 @@ impl App {
                     .unwrap_or(0)
             }
             Some(Card::Examples { name }) => self
-                .current_run()
-                .and_then(|r| r.examples.get(name))
-                .and_then(|e| e.get(self.selected_example))
-                .map(|ex| ex.prompts.len())
+                .cached_example
+                .as_ref()
+                .filter(|(n, i, _)| n == name && *i == self.selected_example)
+                .map(|(_, _, ex)| ex.prompts.len())
                 .unwrap_or(0),
             Some(Card::Evaluation { name }) => self
                 .get_model_evaluation(name)
@@ -2183,9 +2209,11 @@ impl App {
                             .iter()
                             .filter_map(|&idx| self.runs.get(idx))
                             .filter_map(|run| {
-                                run.examples.get(name)?.iter().find(|e| e.step == step)
+                                let g = run.examples.get(name)?;
+                                let idx = g.find_step(step)?;
+                                g.load(idx)
                             })
-                            .filter_map(|ex| ex.responses.get(self.selected_prompt))
+                            .filter_map(|ex| ex.responses.get(self.selected_prompt).cloned())
                             .map(|r| r.len())
                             .max()
                             .unwrap_or(0)
@@ -2193,16 +2221,10 @@ impl App {
                     .unwrap_or(0)
             }
             Some(Card::Examples { name }) => self
-                .current_run()
-                .and_then(|r| r.examples.get(name))
-                .and_then(|e| e.get(self.selected_example))
-                .and_then(|ex| ex.responses.get(self.selected_prompt))
-                .map(|r| r.len())
-                .unwrap_or(0),
-            Some(Card::Evaluation { name }) => self
-                .get_model_evaluation(name)
-                .and_then(|e| e.examples.get(self.selected_example))
-                .and_then(|ex| ex.responses.get(self.selected_prompt))
+                .cached_example
+                .as_ref()
+                .filter(|(n, i, _)| n == name && *i == self.selected_example)
+                .and_then(|(_, _, ex)| ex.responses.get(self.selected_prompt))
                 .map(|r| r.len())
                 .unwrap_or(0),
             _ => 0,
@@ -2272,6 +2294,7 @@ impl App {
             KeyCode::Left if card_count > 1 && self.selected_card > 0 => {
                 self.selected_card -= 1;
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.selected_checkpoint = 0;
@@ -2283,6 +2306,7 @@ impl App {
             {
                 self.selected_card += 1;
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.selected_checkpoint = 0;
@@ -2311,6 +2335,7 @@ impl App {
             // Shift+Up/Down jump 10 examples at a time
             KeyCode::Up if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
                 self.selected_example = self.selected_example.saturating_sub(10);
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2319,6 +2344,7 @@ impl App {
             KeyCode::Down if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
                 self.selected_example =
                     (self.selected_example + 10).min(example_count.saturating_sub(1));
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2327,6 +2353,7 @@ impl App {
             // Up/Down navigate within example groups
             KeyCode::Up if example_count > 0 && self.selected_example > 0 => {
                 self.selected_example -= 1;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2336,6 +2363,7 @@ impl App {
                 if example_count > 0 && self.selected_example < example_count.saturating_sub(1) =>
             {
                 self.selected_example += 1;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2371,6 +2399,7 @@ impl App {
             // Home/End jump to first/last example
             KeyCode::Home if example_count > 0 => {
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2378,6 +2407,7 @@ impl App {
             }
             KeyCode::End if example_count > 0 => {
                 self.selected_example = example_count.saturating_sub(1);
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -3097,6 +3127,15 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
         {
             app.s3_pull_status = None;
             app.s3_pull_time = None;
+        }
+
+        if app.view == View::Focused && !app.compare_focused {
+            let cards = app.active_cards();
+            if let Some(Card::Examples { name }) = cards.get(app.selected_card) {
+                let name = name.clone();
+                let idx = app.selected_example;
+                app.get_or_load_example(&name, idx);
+            }
         }
 
         // Draw the UI
@@ -3865,7 +3904,7 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         String::new()
     };
 
-    let total_examples: usize = run.examples.values().map(|v| v.len()).sum();
+    let total_examples: usize = run.examples.values().map(|g| g.len()).sum();
     let latest_step = run
         .metrics
         .values()
@@ -4519,7 +4558,7 @@ fn render_compare_examples_card(
         }
         let color = COMPARE_COLORS[i % COMPARE_COLORS.len()];
         if let Some(run) = app.runs.get(run_idx) {
-            let count = run.examples.get(name).map(|e| e.len()).unwrap_or(0);
+            let count = run.examples.get(name).map(|g| g.len()).unwrap_or(0);
             let label = if count > 0 {
                 format!("{}: {} examples", run.display_name(), count)
             } else {
@@ -4538,7 +4577,7 @@ fn render_compare_examples_card(
             .iter()
             .filter_map(|&idx| app.runs.get(idx))
             .filter_map(|run| run.examples.get(name))
-            .flat_map(|examples| examples.last())
+            .filter_map(|g| g.last())
             .next()
     {
         lines.push(Line::from(""));
@@ -4988,7 +5027,7 @@ fn render_examples_card(
     frame: &mut Frame,
     area: Rect,
     name: &str,
-    examples: &[Example],
+    group: &ExampleGroup,
     selected: bool,
 ) {
     let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
@@ -4998,13 +5037,10 @@ fn render_examples_card(
         Style::default().fg(NEON_GREEN)
     };
 
-    // Show the latest example as preview
-    let content: Vec<Line> = if let Some(example) = examples.last() {
+    let content: Vec<Line> = if let Some(example) = group.last() {
         let max_lines = area.height.saturating_sub(4) as usize;
-        // Use the first prompt for preview
         let first_prompt = example.prompts.first().map(|s| s.as_str()).unwrap_or("");
         let prompt_preview: String = first_prompt.chars().take(50).collect();
-        // Use the first response of first prompt for preview
         let first_response = example
             .responses
             .first()
@@ -5041,21 +5077,19 @@ fn render_examples_card(
         ))]
     };
 
-    // Calculate average reward if rewards exist
-    let avg_reward = compute_average_reward(examples);
+    let avg_reward = group.avg_reward();
 
-    // Build title with batch info if applicable
-    let batch_size = examples.last().map(|e| e.prompts.len()).unwrap_or(0);
+    let batch_size = group.last().map(|e| e.prompts.len()).unwrap_or(0);
     let mut title_spans = vec![Span::styled(format!("{} ", name), title_style)];
 
     if batch_size > 1 {
         title_spans.push(Span::styled(
-            format!("({} total, batch={})", examples.len(), batch_size),
+            format!("({} total, batch={})", group.len(), batch_size),
             Style::default().fg(Color::DarkGray),
         ));
     } else {
         title_spans.push(Span::styled(
-            format!("({} total)", examples.len()),
+            format!("({} total)", group.len()),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -5341,26 +5375,6 @@ fn render_evaluation_card(frame: &mut Frame, area: Rect, eval: &Evaluation, sele
     frame.render_widget(paragraph, area);
 }
 
-fn compute_average_reward(examples: &[Example]) -> Option<f64> {
-    let mut total = 0.0;
-    let mut count = 0;
-    for example in examples {
-        if let Some(rewards) = &example.rewards {
-            for prompt_rewards in rewards {
-                for reward in prompt_rewards {
-                    total += reward.total();
-                    count += 1;
-                }
-            }
-        }
-    }
-    if count > 0 {
-        Some(total / count as f64)
-    } else {
-        None
-    }
-}
-
 fn reward_color(reward: f64) -> Color {
     if reward >= 0.7 {
         NEON_GREEN
@@ -5528,7 +5542,8 @@ fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, nam
         let example = run
             .examples
             .get(name)
-            .and_then(|examples| examples.iter().find(|e| e.step == current_step));
+            .and_then(|g| g.find_step(current_step))
+            .and_then(|idx| run.examples.get(name).unwrap().load(idx));
 
         let col_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -5676,14 +5691,19 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
         Card::Examples { name } => {
-            if let Some(examples) = run.examples.get(name) {
-                if let Some(example) = examples.get(app.selected_example) {
+            if let Some(group) = run.examples.get(name) {
+                let example = app
+                    .cached_example
+                    .as_ref()
+                    .filter(|(n, i, _)| n == name && *i == app.selected_example)
+                    .map(|(_, _, ex)| ex);
+                if let Some(example) = example {
                     render_focused_example(
                         frame,
                         chunks[0],
                         name,
                         app.selected_example,
-                        examples.len(),
+                        group.len(),
                         example,
                         app.selected_prompt,
                         app.selected_response,
@@ -5692,12 +5712,8 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                         app.response_scroll_offset,
                     );
                 }
-                let prompt_count = examples
-                    .get(app.selected_example)
-                    .map(|e| e.prompts.len())
-                    .unwrap_or(0);
-                let response_count = examples
-                    .get(app.selected_example)
+                let prompt_count = example.map(|e| e.prompts.len()).unwrap_or(0);
+                let response_count = example
                     .and_then(|e| e.responses.get(app.selected_prompt))
                     .map(|r| r.len())
                     .unwrap_or(0);
@@ -5729,7 +5745,7 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                     Span::styled("↑↓/⇧", Style::default().fg(NEON_CYAN)),
                     Span::styled("] example ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        format!("{}/{}", app.selected_example + 1, examples.len()),
+                        format!("{}/{}", app.selected_example + 1, group.len()),
                         Style::default().fg(NEON_YELLOW),
                     ),
                     Span::styled("  [", Style::default().fg(DIM_CYAN)),
@@ -6428,14 +6444,12 @@ fn render_focused_example(
     prompt_title_spans.extend(vec![
         Span::styled("│ ", Style::default().fg(DIM_CYAN)),
         Span::styled(group_name, Style::default().fg(NEON_MAGENTA)),
-        Span::styled(
-            format!(" #{}", index + 1),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(format!("/{}", total), Style::default().fg(Color::DarkGray)),
-        Span::styled(" │ ", Style::default().fg(DIM_CYAN)),
-        Span::styled("step ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" step ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", example.step), Style::default().fg(NEON_CYAN)),
+        Span::styled(
+            format!("  ({}/{})", index + 1, total),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     let prompt_title = Line::from(prompt_title_spans);
 
