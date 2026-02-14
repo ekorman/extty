@@ -250,6 +250,7 @@ struct App {
     pull_run_input: String,
     config_cursor: usize,
     config_copied_at: Option<Instant>,
+    selected_checkpoint: usize,
 }
 
 impl App {
@@ -337,6 +338,7 @@ impl App {
             pull_run_input: String::new(),
             config_cursor: 0,
             config_copied_at: None,
+            selected_checkpoint: 0,
         }
     }
 
@@ -555,6 +557,72 @@ impl App {
                     }
                     Err(e) => {
                         let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
+                    }
+                }
+            });
+        });
+    }
+
+    fn start_s3_pull_checkpoint(&mut self, step: u64) {
+        if self.s3_pull_rx.is_some() {
+            return;
+        }
+
+        let Some(run) = self.current_run() else {
+            return;
+        };
+
+        let config = match s3::load_config() {
+            Ok(Some(config)) => config,
+            _ => {
+                self.s3_pull_status = Some("S3 not configured".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        let project = run.project.clone().unwrap_or_default();
+        let name = run.name.clone();
+        let (tx, rx) = mpsc::channel();
+        self.s3_pull_rx = Some(rx);
+        self.s3_pull_status = Some(format!("Downloading checkpoint step {}...", step));
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(S3PullMessage::Error(format!("Runtime error: {}", e)));
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                let client = match s3::S3Client::new(config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                        return;
+                    }
+                };
+                let runs_dir = runs_dir();
+                let _ = tx.send(S3PullMessage::Pulling(format!(
+                    "Downloading checkpoint step {}...",
+                    step
+                )));
+                match client
+                    .download_checkpoint(&project, &name, step, &runs_dir)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = tx.send(S3PullMessage::Done(format!(
+                            "Downloaded checkpoint step {}",
+                            step
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!(
+                            "Checkpoint download failed: {}",
+                            e
+                        )));
                     }
                 }
             });
@@ -1352,7 +1420,7 @@ impl App {
         let Some(run) = self.current_run() else {
             return 0;
         };
-        run.metrics.len() + run.examples.len()
+        run.metrics.len() + run.examples.len() + if run.checkpoints.is_empty() { 0 } else { 1 }
     }
 
     fn model_card_count(&self) -> usize {
@@ -2049,6 +2117,11 @@ impl App {
         };
         let current_card = cards.get(self.selected_card);
 
+        let checkpoint_count = match current_card {
+            Some(Card::Checkpoints) => self.current_run().map(|r| r.checkpoints.len()).unwrap_or(0),
+            _ => 0,
+        };
+
         let example_count = match current_card {
             Some(Card::Examples { name }) if self.compare_focused => {
                 self.compare_example_steps(name).len()
@@ -2201,6 +2274,7 @@ impl App {
                 self.selected_example = 0;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
+                self.selected_checkpoint = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
             }
@@ -2211,8 +2285,28 @@ impl App {
                 self.selected_example = 0;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
+                self.selected_checkpoint = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+            }
+            // Checkpoint navigation
+            KeyCode::Up if checkpoint_count > 0 && self.selected_checkpoint > 0 => {
+                self.selected_checkpoint -= 1;
+            }
+            KeyCode::Down
+                if checkpoint_count > 0
+                    && self.selected_checkpoint < checkpoint_count.saturating_sub(1) =>
+            {
+                self.selected_checkpoint += 1;
+            }
+            KeyCode::Char('p') if checkpoint_count > 0 => {
+                if let Some(run) = self.current_run()
+                    && let Some(ckpt) = run.checkpoints.get(self.selected_checkpoint)
+                    && !ckpt.downloaded
+                {
+                    let step = ckpt.step;
+                    self.start_s3_pull_checkpoint(step);
+                }
             }
             // Shift+Up/Down jump 10 examples at a time
             KeyCode::Up if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
@@ -5008,7 +5102,14 @@ fn render_checkpoints_card(
         .iter()
         .take(max_lines)
         .map(|ckpt| {
+            let status_icon = if ckpt.downloaded { "● " } else { "○ " };
+            let status_color = if ckpt.downloaded {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            };
             let mut spans = vec![
+                Span::styled(status_icon, Style::default().fg(status_color)),
                 Span::styled("step ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{}", ckpt.step),
@@ -5053,6 +5154,89 @@ fn render_checkpoints_card(
         .border_style(Style::default().fg(border_color));
 
     let paragraph = Paragraph::new(content).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_focused_checkpoints(
+    frame: &mut Frame,
+    area: Rect,
+    checkpoints: &[Checkpoint],
+    selected_index: usize,
+) {
+    let visible_height = area.height as usize;
+    let scroll_offset = if selected_index >= visible_height {
+        selected_index - visible_height + 1
+    } else {
+        0
+    };
+
+    let lines: Vec<Line> = checkpoints
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .map(|(i, ckpt)| {
+            let is_selected = i == selected_index;
+            let cursor = if is_selected { "▶ " } else { "  " };
+            let status_icon = if ckpt.downloaded { "● " } else { "○ " };
+            let status_color = if ckpt.downloaded {
+                NEON_GREEN
+            } else {
+                Color::DarkGray
+            };
+
+            let mut spans = vec![
+                Span::styled(
+                    cursor,
+                    Style::default().fg(if is_selected {
+                        NEON_CYAN
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(status_icon, Style::default().fg(status_color)),
+                Span::styled("step ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", ckpt.step),
+                    Style::default().fg(NEON_YELLOW).bold(),
+                ),
+            ];
+            if let Some(ts) = ckpt.timestamp {
+                spans.push(Span::styled(
+                    format!("  {}", ts.format("%Y-%m-%d %H:%M")),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(size) = ckpt.size_bytes {
+                let size_str = if size >= 1_073_741_824 {
+                    format!("{:.1} GB", size as f64 / 1_073_741_824.0)
+                } else if size >= 1_048_576 {
+                    format!("{:.1} MB", size as f64 / 1_048_576.0)
+                } else {
+                    format!("{:.1} KB", size as f64 / 1024.0)
+                };
+                spans.push(Span::styled(
+                    format!("  {}", size_str),
+                    Style::default().fg(NEON_GREEN),
+                ));
+            }
+            if ckpt.downloaded {
+                spans.push(Span::styled(
+                    "  downloaded",
+                    Style::default().fg(NEON_GREEN).dim(),
+                ));
+            }
+
+            let bg = if is_selected {
+                Color::Rgb(30, 30, 50)
+            } else {
+                Color::Reset
+            };
+            Line::from(spans).style(Style::default().bg(bg))
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
 }
 
@@ -5585,7 +5769,12 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
         }
         Card::Checkpoints => {
             if let Some(run) = app.current_run() {
-                render_checkpoints_card(frame, chunks[0], &run.checkpoints, true);
+                render_focused_checkpoints(
+                    frame,
+                    chunks[0],
+                    &run.checkpoints,
+                    app.selected_checkpoint,
+                );
             }
             let footer = Line::from(vec![
                 Span::styled("[", Style::default().fg(DIM_CYAN)),
@@ -5598,6 +5787,13 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                     format!("{}/{}", app.selected_card + 1, cards.len()),
                     Style::default().fg(NEON_GREEN),
                 ),
+                Span::styled("  ", Style::default()),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("p", Style::default().fg(NEON_CYAN)),
+                Span::styled("] download", Style::default().fg(Color::DarkGray)),
             ]);
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }

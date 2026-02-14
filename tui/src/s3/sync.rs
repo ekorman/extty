@@ -204,6 +204,10 @@ impl S3Client {
                         continue;
                     }
 
+                    if relative_path.starts_with("checkpoints/") {
+                        continue;
+                    }
+
                     let local_path = run_dir.join(relative_path);
                     if let Some(parent) = local_path.parent() {
                         fs::create_dir_all(parent)?;
@@ -346,6 +350,59 @@ impl S3Client {
                 }
             }
         }
+    }
+
+    pub async fn download_checkpoint(
+        &self,
+        project: &str,
+        run: &str,
+        step: u64,
+        dest: &Path,
+    ) -> Result<()> {
+        let prefix = self.s3_prefix(&format!("runs/{}/{}/checkpoints/{}/", project, run, step));
+        let run_dir = dest.join(project).join(run);
+
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.config.bucket)
+                .prefix(&prefix);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request.send().await?;
+
+            for object in response.contents() {
+                if let Some(key) = object.key() {
+                    let relative_path = key
+                        .strip_prefix(&self.s3_prefix(&format!("runs/{}/{}/", project, run)))
+                        .unwrap_or(key);
+                    if relative_path.is_empty() {
+                        continue;
+                    }
+
+                    let local_path = run_dir.join(relative_path);
+                    if let Some(parent) = local_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+
+                    self.download_file(key, &local_path, true).await?;
+                }
+            }
+
+            if response.is_truncated() == Some(true) {
+                continuation_token = response.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn sync_run(

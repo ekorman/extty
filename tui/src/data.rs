@@ -80,6 +80,7 @@ pub struct Checkpoint {
     pub step: u64,
     pub timestamp: Option<DateTime<Local>>,
     pub size_bytes: Option<u64>,
+    pub downloaded: bool,
 }
 
 // Run status
@@ -482,6 +483,7 @@ fn load_checkpoints(run_path: &Path) -> Vec<Checkpoint> {
         return vec![];
     };
 
+    let checkpoints_dir = run_path.join("checkpoints");
     let mut checkpoints: Vec<Checkpoint> = entries
         .iter()
         .filter_map(|entry| {
@@ -491,10 +493,12 @@ fn load_checkpoints(run_path: &Path) -> Vec<Checkpoint> {
                 .and_then(|v| v.as_str())
                 .and_then(parse_datetime);
             let size_bytes = entry.get("size_bytes").and_then(|v| v.as_u64());
+            let downloaded = checkpoints_dir.join(step.to_string()).is_dir();
             Some(Checkpoint {
                 step,
                 timestamp,
                 size_bytes,
+                downloaded,
             })
         })
         .collect();
