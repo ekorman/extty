@@ -7010,7 +7010,7 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled(&instance.instance_type, Style::default().fg(NEON_YELLOW)),
             ]);
 
-            let line2 = Line::from(vec![
+            let mut line2_spans = vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     instance.status.as_str().to_string(),
@@ -7020,7 +7020,12 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled(&instance.region, Style::default().fg(Color::DarkGray)),
                 Span::styled("  ", Style::default()),
                 Span::styled(ip_display, Style::default().fg(NEON_CYAN)),
-            ]);
+            ];
+            if let Some(price) = instance.price_display() {
+                line2_spans.push(Span::styled("  ", Style::default()));
+                line2_spans.push(Span::styled(price, Style::default().fg(NEON_GREEN)));
+            }
+            let line2 = Line::from(line2_spans);
 
             ListItem::new(vec![line1, line2])
         })
@@ -7273,7 +7278,7 @@ fn render_infra_region_popup(app: &App, frame: &mut Frame) {
     let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
 
     let area = frame.area();
-    let popup_width = 40u16.min(area.width.saturating_sub(4));
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
     let popup_height = (regions.len() as u16 + 5).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -7301,10 +7306,18 @@ fn render_infra_region_popup(app: &App, frame: &mut Frame) {
         } else {
             Style::default().fg(Color::Gray)
         };
-        lines.push(Line::from(Span::styled(
-            format!("{}{}", prefix, region),
-            style,
-        )));
+
+        let price_suffix = selected_type
+            .and_then(|t| t.metadata.get(&format!("price:{}", region)))
+            .and_then(|c| c.parse::<u32>().ok())
+            .map(|cents| format!("  ${:.2}/hr", cents as f64 / 100.0))
+            .unwrap_or_default();
+
+        let mut spans = vec![Span::styled(format!("{}{}", prefix, region), style)];
+        if !price_suffix.is_empty() {
+            spans.push(Span::styled(price_suffix, Style::default().fg(NEON_GREEN)));
+        }
+        lines.push(Line::from(spans));
     }
 
     let block = Block::default()
@@ -7326,13 +7339,22 @@ fn render_infra_launch_confirm(app: &App, frame: &mut Frame) {
 
     let selected_type = app.infra_types.get(app.selected_infra_type);
     let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
-    let type_price = selected_type
-        .map(|t| t.price_display())
-        .unwrap_or_else(|| "?".to_string());
     let region = selected_type
         .and_then(|t| t.regions.get(app.launch_selected_region))
         .map(|s| s.as_str())
         .unwrap_or("default");
+    let type_price = selected_type
+        .and_then(|t| {
+            t.metadata
+                .get(&format!("price:{}", region))
+                .and_then(|c| c.parse::<u32>().ok())
+                .map(|cents| format!("${:.2}/hr", cents as f64 / 100.0))
+        })
+        .unwrap_or_else(|| {
+            selected_type
+                .map(|t| t.price_display())
+                .unwrap_or_else(|| "?".to_string())
+        });
 
     let area = frame.area();
     let popup_width = 50u16.min(area.width.saturating_sub(4));

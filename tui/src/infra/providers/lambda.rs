@@ -180,6 +180,7 @@ impl CloudProvider for LambdaProvider {
                 provider: Provider::Lambda,
                 ssh_user: "ubuntu".to_string(),
                 raw_status: i.status,
+                price_cents_per_hour: None,
             })
             .collect())
     }

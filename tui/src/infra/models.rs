@@ -76,11 +76,19 @@ pub struct Instance {
     pub provider: Provider,
     pub ssh_user: String,
     pub raw_status: String,
+    pub price_cents_per_hour: Option<u32>,
 }
 
 impl Instance {
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
+    }
+
+    pub fn price_display(&self) -> Option<String> {
+        self.price_cents_per_hour.map(|cents| {
+            let dollars = cents as f64 / 100.0;
+            format!("${:.2}/hr", dollars)
+        })
     }
 
     #[allow(dead_code)]
@@ -139,6 +147,7 @@ impl LocalMachine {
             provider: Provider::Local,
             ssh_user: self.ssh_user.clone(),
             raw_status: "running".to_string(),
+            price_cents_per_hour: None,
         }
     }
 }

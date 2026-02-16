@@ -223,6 +223,7 @@ impl CloudProvider for PrimeProvider {
                     provider: Provider::Prime,
                     ssh_user,
                     raw_status,
+                    price_cents_per_hour: None,
                 }
             })
             .collect())
