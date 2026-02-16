@@ -71,6 +71,12 @@ uv python install {python_version}
 # Code already synced via rsync before SSH
 cd ~/"{project_dir}"
 
+# Install extty GPU dependencies if NVIDIA GPU is present
+if command -v nvidia-smi &> /dev/null && [ -f pyproject.toml ]; then
+    echo "NVIDIA GPU detected — installing extty[gpu]..."
+    uv pip install --quiet extty[gpu]
+fi
+
 # Run command if specified
 if [ -n "{command}" ]; then
     echo "Running: {command}"
@@ -129,6 +135,7 @@ mod tests {
         assert!(script.contains("touch ~/.no_auto_tmux"));
         assert!(script.contains("sudo apt install -y build-essential"));
         assert!(script.contains("libcuda.so"));
+        assert!(script.contains("uv pip install --quiet extty[gpu]"));
         assert!(script.contains("export EXTTY_GIT_HASH=\"abc123def456\""));
         assert!(script.contains("export EXTTY_RUN_COMMAND=\"extty run uv run train.py\""));
     }

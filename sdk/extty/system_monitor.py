@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Protocol
 
 import psutil
+
+logger = logging.getLogger(__name__)
 
 
 class SystemMetricSink(Protocol):
@@ -54,6 +57,7 @@ class SystemMonitor:
         self._thread: threading.Thread | None = None
         self._gpu_initialized = False
         self._gpu_handle = None
+        self._gpu_sample_error_logged = False
 
     def start(self) -> None:
         """Start the monitoring thread."""
@@ -81,6 +85,10 @@ class SystemMonitor:
     def _init_gpu(self) -> None:
         """Initialize pynvml if available."""
         if not PYNVML_AVAILABLE or _pynvml is None:
+            logger.warning(
+                "pynvml not installed — GPU metrics disabled. "
+                "Install with: pip install extty[gpu]"
+            )
             return
 
         try:
@@ -89,7 +97,12 @@ class SystemMonitor:
             if device_count > 0:
                 self._gpu_handle = _pynvml.nvmlDeviceGetHandleByIndex(0)
                 self._gpu_initialized = True
+            else:
+                logger.warning("No NVIDIA GPUs detected — GPU metrics disabled")
         except Exception:
+            logger.warning(
+                "Failed to initialize pynvml — GPU metrics disabled", exc_info=True
+            )
             self._gpu_initialized = False
 
     def _run(self) -> None:
@@ -121,7 +134,9 @@ class SystemMonitor:
                 util = _pynvml.nvmlDeviceGetUtilizationRates(self._gpu_handle)
                 gpu_util_pct = float(util.gpu)
             except Exception:
-                pass
+                if not self._gpu_sample_error_logged:
+                    logger.warning("Error reading GPU metrics", exc_info=True)
+                    self._gpu_sample_error_logged = True
 
         self._storage.log_system(
             ram_used_gb=ram_used_gb,
