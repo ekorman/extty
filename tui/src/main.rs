@@ -4710,7 +4710,10 @@ fn render_config_full(app: &App, frame: &mut Frame) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(DIM_CYAN));
 
-    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((scroll, 0));
 
     frame.render_widget(paragraph, chunks[0]);
 
@@ -4834,6 +4837,14 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(max).collect::<String>())
+    }
+}
+
 fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<Line>) {
     let pad = "  ".repeat(indent);
     match value {
@@ -4858,7 +4869,7 @@ fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<L
                         ]));
                     }
                     _ => {
-                        let val_str = format_json_primitive(val);
+                        let val_str = truncate_str(&format_json_primitive(val), 28);
                         lines.push(Line::from(vec![
                             Span::styled(pad.clone(), Style::default()),
                             Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
@@ -4869,7 +4880,7 @@ fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<L
             }
         }
         _ => {
-            let val_str = format_json_primitive(value);
+            let val_str = truncate_str(&format_json_primitive(value), 28);
             lines.push(Line::from(Span::styled(
                 format!("{}{}", pad, val_str),
                 Style::default().fg(Color::White),
