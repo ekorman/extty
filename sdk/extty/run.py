@@ -115,6 +115,11 @@ def _collect_environment() -> dict[str, Any]:
     if run_command:
         env["_run_command"] = run_command
 
+    instance_id = os.environ.get("EXTTY_INSTANCE_ID")
+    instance_provider = os.environ.get("EXTTY_INSTANCE_PROVIDER")
+    if instance_id and instance_provider:
+        env["_instance_id"] = f"{instance_provider}:{instance_id}"
+
     return env
 
 

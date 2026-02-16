@@ -1,22 +1,46 @@
-pub fn generate_script(
-    python_version: &str,
-    command: &str,
-    skip_tmux: bool,
-    project_dir: &str,
-    git_hash: Option<&str>,
-    run_command: &str,
-) -> String {
-    let skip_tmux_str = if skip_tmux { "true" } else { "false" };
+pub struct ScriptOptions<'a> {
+    pub python_version: &'a str,
+    pub command: &'a str,
+    pub skip_tmux: bool,
+    pub project_dir: &'a str,
+    pub git_hash: Option<&'a str>,
+    pub run_command: &'a str,
+    pub instance_id: &'a str,
+    pub provider: &'a str,
+}
+
+pub fn generate_script(opts: &ScriptOptions) -> String {
+    let ScriptOptions {
+        python_version,
+        command,
+        skip_tmux,
+        project_dir,
+        git_hash,
+        run_command,
+        instance_id,
+        provider,
+    } = opts;
+    let skip_tmux_str = if *skip_tmux { "true" } else { "false" };
     let command_escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
 
     let mut env_exports = String::new();
-    if let Some(hash) = git_hash {
+    if let Some(hash) = *git_hash {
         env_exports.push_str(&format!("export EXTTY_GIT_HASH=\"{}\"\n", hash));
     }
     let run_command_escaped = run_command.replace('\\', "\\\\").replace('"', "\\\"");
     env_exports.push_str(&format!(
-        "export EXTTY_RUN_COMMAND=\"{}\"",
+        "export EXTTY_RUN_COMMAND=\"{}\"\n",
         run_command_escaped
+    ));
+    let instance_id_escaped = instance_id.replace('\\', "\\\\").replace('"', "\\\"");
+    env_exports.push_str(&format!(
+        "export EXTTY_INSTANCE_ID=\"{}\"\n",
+        instance_id_escaped
+    ));
+    let provider_escaped = provider.replace('\\', "\\\\").replace('"', "\\\"");
+    env_exports.push_str(&format!(
+        "export EXTTY_INSTANCE_PROVIDER=\"{}\"",
+        provider_escaped
     ));
 
     format!(
@@ -115,14 +139,16 @@ mod tests {
 
     #[test]
     fn test_generate_script_basic() {
-        let script = generate_script(
-            "3.11",
-            "uv run train.py",
-            false,
-            "extty-projects/myproj",
-            Some("abc123def456"),
-            "extty run uv run train.py",
-        );
+        let script = generate_script(&ScriptOptions {
+            python_version: "3.11",
+            command: "uv run train.py",
+            skip_tmux: false,
+            project_dir: "extty-projects/myproj",
+            git_hash: Some("abc123def456"),
+            run_command: "extty run uv run train.py",
+            instance_id: "i-abc123",
+            provider: "lambda",
+        });
         assert!(script.contains("uv python install 3.11"));
         assert!(script.contains("uv run train.py"));
         assert!(script.contains("cd ~/\"extty-projects/myproj\""));
@@ -133,14 +159,27 @@ mod tests {
         assert!(!script.contains("extty[gpu]"));
         assert!(script.contains("export EXTTY_GIT_HASH=\"abc123def456\""));
         assert!(script.contains("export EXTTY_RUN_COMMAND=\"extty run uv run train.py\""));
+        assert!(script.contains("export EXTTY_INSTANCE_ID=\"i-abc123\""));
+        assert!(script.contains("export EXTTY_INSTANCE_PROVIDER=\"lambda\""));
     }
 
     #[test]
     fn test_generate_script_skip_tmux() {
-        let script = generate_script("3.11", "", true, "extty-projects/test", None, "extty run");
+        let script = generate_script(&ScriptOptions {
+            python_version: "3.11",
+            command: "",
+            skip_tmux: true,
+            project_dir: "extty-projects/test",
+            git_hash: None,
+            run_command: "extty run",
+            instance_id: "12345",
+            provider: "vast",
+        });
         assert!(script.contains(r#"[ "true" != "true" ]"#));
         assert!(!script.contains("EXTTY_GIT_HASH"));
         assert!(script.contains("export EXTTY_RUN_COMMAND=\"extty run\""));
+        assert!(script.contains("export EXTTY_INSTANCE_ID=\"12345\""));
+        assert!(script.contains("export EXTTY_INSTANCE_PROVIDER=\"vast\""));
     }
 
     #[test]

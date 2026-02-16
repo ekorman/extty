@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -46,8 +46,8 @@ use data::{
     load_starred_runs, mark_run_completed, save_starred_runs,
 };
 use infra::{
-    InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, generate_script,
-    get_provider, load_config, project_remote_dir, save_config,
+    InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, ScriptOptions,
+    generate_script, get_provider, load_config, project_remote_dir, save_config,
 };
 enum SetupMessage {
     Status(String),
@@ -1014,6 +1014,8 @@ impl App {
         }
 
         let ssh_user = instance.ssh_user.clone();
+        let instance_id = instance.id.clone();
+        let provider_str = instance.provider.as_str().to_string();
         let python_version = self.session_python_version.clone();
         let command = self.session_command.clone();
         let skip_tmux = self.session_skip_tmux;
@@ -1204,14 +1206,16 @@ impl App {
 
             let _ = tx.send(SetupMessage::Status("Uploading script...".to_string()));
 
-            let script = generate_script(
-                &python_version,
-                &command,
+            let script = generate_script(&ScriptOptions {
+                python_version: &python_version,
+                command: &command,
                 skip_tmux,
-                &remote_dir,
-                git_hash.as_deref(),
-                &command,
-            );
+                project_dir: &remote_dir,
+                git_hash: git_hash.as_deref(),
+                run_command: &command,
+                instance_id: &instance_id,
+                provider: &provider_str,
+            });
 
             let upload_status = std::process::Command::new("bash")
                 .arg("-c")
@@ -6966,6 +6970,19 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
+    let mut instance_runs: HashMap<String, Vec<&Run>> = HashMap::new();
+    for run in &app.runs {
+        if run.is_running()
+            && let Some(id) = run
+                .config
+                .as_ref()
+                .and_then(|c| c.get("_instance_id"))
+                .and_then(|v| v.as_str())
+        {
+            instance_runs.entry(id.to_string()).or_default().push(run);
+        }
+    }
+
     let items: Vec<ListItem> = instances
         .iter()
         .enumerate()
@@ -7027,7 +7044,23 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
             }
             let line2 = Line::from(line2_spans);
 
-            ListItem::new(vec![line1, line2])
+            let mut lines = vec![line1, line2];
+
+            let composite_id = format!("{}:{}", instance.provider.as_str(), instance.id);
+            if let Some(runs) = instance_runs.get(&composite_id) {
+                let run_names: String = runs
+                    .iter()
+                    .map(|r| r.display_name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled("runs: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(run_names, Style::default().fg(NEON_MAGENTA)),
+                ]));
+            }
+
+            ListItem::new(lines)
         })
         .collect();
 

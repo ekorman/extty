@@ -1,6 +1,7 @@
 """Tests for extty library."""
 
 import json
+import os
 import shutil
 import tempfile
 from collections.abc import Generator
@@ -198,6 +199,54 @@ class TestExttyAPI:
         extty._active_run = None
         with pytest.raises(RuntimeError, match="No active run"):
             extty.log({"loss": 0.5}, step=0)
+
+
+class TestInstanceId:
+    def test_instance_id_from_env(self, tmp_path: Path) -> None:
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            env = {"EXTTY_INSTANCE_ID": "i-abc123", "EXTTY_INSTANCE_PROVIDER": "lambda"}
+            with mock.patch.dict(os.environ, env):
+                extty.init("test-project", name="inst-test", system_metrics=False)
+                extty.finish()
+
+            meta_path = tmp_path / "runs" / "test-project" / "inst-test" / "meta.json"
+            meta = json.loads(meta_path.read_text())
+            assert meta["config"]["_instance_id"] == "lambda:i-abc123"
+
+    def test_instance_id_missing_when_no_env(self, tmp_path: Path) -> None:
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            env_remove = {
+                k: ""
+                for k in ("EXTTY_INSTANCE_ID", "EXTTY_INSTANCE_PROVIDER")
+                if k in os.environ
+            }
+            with mock.patch.dict(os.environ, env_remove, clear=False):
+                for k in ("EXTTY_INSTANCE_ID", "EXTTY_INSTANCE_PROVIDER"):
+                    os.environ.pop(k, None)
+                extty.init("test-project", name="no-inst-test", system_metrics=False)
+                extty.finish()
+
+            meta_path = (
+                tmp_path / "runs" / "test-project" / "no-inst-test" / "meta.json"
+            )
+            meta = json.loads(meta_path.read_text())
+            assert "_instance_id" not in meta["config"]
+
+    def test_instance_id_missing_when_partial_env(self, tmp_path: Path) -> None:
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            env = {"EXTTY_INSTANCE_ID": "i-abc123"}
+            with mock.patch.dict(os.environ, env, clear=False):
+                os.environ.pop("EXTTY_INSTANCE_PROVIDER", None)
+                extty.init(
+                    "test-project", name="partial-inst-test", system_metrics=False
+                )
+                extty.finish()
+
+            meta_path = (
+                tmp_path / "runs" / "test-project" / "partial-inst-test" / "meta.json"
+            )
+            meta = json.loads(meta_path.read_text())
+            assert "_instance_id" not in meta["config"]
 
 
 class TestExampleRewards:

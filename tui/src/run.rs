@@ -11,8 +11,8 @@ use chrono::Local;
 use dialoguer::{Select, theme::ColorfulTheme};
 
 use crate::infra::{
-    self, InfraConfig, Instance, InstanceStatus, Provider, generate_script, get_provider,
-    project_remote_dir,
+    self, InfraConfig, Instance, InstanceStatus, Provider, ScriptOptions, generate_script,
+    get_provider, project_remote_dir,
 };
 
 pub struct RunOptions {
@@ -135,14 +135,18 @@ pub fn run(opts: RunOptions) -> Result<()> {
         &mut log,
     )?;
     copy_s3_config(&ssh_base, &host, port.as_deref(), ssh_user, &mut log);
-    upload_bootstrap_script(
-        &ssh_base,
-        &opts,
-        &remote_dir,
-        git_hash.as_deref(),
-        &run_command,
-        &mut log,
-    )?;
+    let command_str = opts.command.join(" ");
+    let script_opts = ScriptOptions {
+        python_version: &opts.python_version,
+        command: &command_str,
+        skip_tmux: opts.skip_tmux,
+        project_dir: &remote_dir,
+        git_hash: git_hash.as_deref(),
+        run_command: &run_command,
+        instance_id: &instance.id,
+        provider: instance.provider.as_str(),
+    };
+    upload_bootstrap_script(&ssh_base, &script_opts, &mut log)?;
 
     log.log("Exec into SSH session");
     println!("Connecting to {}...", instance.display_name());
@@ -443,24 +447,13 @@ fn copy_s3_config(
 
 fn upload_bootstrap_script(
     ssh_base: &str,
-    opts: &RunOptions,
-    remote_dir: &str,
-    git_hash: Option<&str>,
-    run_command: &str,
+    script_opts: &ScriptOptions,
     log: &mut LogFile,
 ) -> Result<()> {
     log.log("Uploading bootstrap script...");
     println!("Uploading bootstrap script...");
 
-    let command_str = opts.command.join(" ");
-    let script = generate_script(
-        &opts.python_version,
-        &command_str,
-        opts.skip_tmux,
-        remote_dir,
-        git_hash,
-        run_command,
-    );
+    let script = generate_script(script_opts);
 
     let mut child = Command::new("bash")
         .arg("-c")
