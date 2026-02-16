@@ -13,6 +13,15 @@ pub enum Provider {
 }
 
 impl Provider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Provider::Lambda => "lambda",
+            Provider::Vast => "vast",
+            Provider::Prime => "prime",
+            Provider::Local => "local",
+        }
+    }
+
     pub fn display_name(&self) -> &'static str {
         match self {
             Provider::Lambda => "Lambda",

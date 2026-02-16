@@ -449,13 +449,11 @@ name = "extty"
 source = { editable = "sdk" }
 dependencies = [
     { name = "boto3" },
+    { name = "nvidia-ml-py" },
     { name = "psutil" },
 ]
 
 [package.optional-dependencies]
-gpu = [
-    { name = "nvidia-ml-py" },
-]
 modal = [
     { name = "modal" },
 ]
@@ -471,10 +469,10 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.34.0" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.3.0.post1" },
-    { name = "nvidia-ml-py", marker = "extra == 'gpu'", specifier = ">=12.0.0" },
+    { name = "nvidia-ml-py", specifier = ">=12.0.0" },
     { name = "psutil", specifier = ">=5.9.0" },
 ]
-provides-extras = ["modal", "gpu"]
+provides-extras = ["modal"]
 
 [package.metadata.requires-dev]
 dev = [
