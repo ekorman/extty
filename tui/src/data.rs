@@ -274,6 +274,21 @@ pub fn reload_run(path: &Path) -> Option<Run> {
     load_run(path)
 }
 
+pub fn mark_run_completed(path: &Path) -> Result<(), std::io::Error> {
+    let meta_path = path.join("meta.json");
+    let mut data: serde_json::Value = if meta_path.exists() {
+        let content = fs::read_to_string(&meta_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    let now = chrono::Local::now().to_rfc3339();
+    data["status"] = serde_json::json!("completed");
+    data["finished_at"] = serde_json::json!(now);
+    let json = serde_json::to_string_pretty(&data).map_err(std::io::Error::other)?;
+    fs::write(&meta_path, json)
+}
+
 // Delete a run by removing its directory
 // WARNING: This operation cannot be undone and will recursively delete
 // all files and subdirectories within the run directory

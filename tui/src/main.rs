@@ -43,7 +43,7 @@ mod s3;
 use data::{
     Checkpoint, Evaluation, Example, ExampleGroup, MetricPoint, Model, Reward, Run,
     delete_evaluation, delete_model, load_all_evaluations, load_models, load_runs_lightweight,
-    load_starred_runs, save_starred_runs,
+    load_starred_runs, mark_run_completed, save_starred_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, generate_script,
@@ -1972,6 +1972,15 @@ impl App {
                     self.starred_runs.insert(name);
                 }
                 save_starred_runs(&self.starred_runs);
+            }
+            KeyCode::Char('m')
+                if !self.runs.is_empty() && self.runs[self.selected_run].is_running() =>
+            {
+                let run = &mut self.runs[self.selected_run];
+                if mark_run_completed(&run.path).is_ok() {
+                    run.status = data::RunStatus::Completed;
+                    run.end_time = Some(chrono::Local::now());
+                }
             }
             _ => {}
         }
@@ -3979,7 +3988,7 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
 
     // Footer with styled keys
     let config_hint = if app.show_config { "hide" } else { "config" };
-    let footer = Line::from(vec![
+    let mut footer_spans = vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
         Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
@@ -4004,6 +4013,15 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("p", Style::default().fg(NEON_CYAN)),
         Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
+    ];
+    if run.is_running() {
+        footer_spans.extend([
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("m", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] mark done  ", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+    footer_spans.extend([
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("[]", Style::default().fg(NEON_YELLOW)),
         Span::styled("] run ", Style::default().fg(Color::DarkGray)),
@@ -4012,6 +4030,7 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
             Style::default().fg(NEON_YELLOW),
         ),
     ]);
+    let footer = Line::from(footer_spans);
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
