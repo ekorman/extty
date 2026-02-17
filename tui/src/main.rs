@@ -188,6 +188,7 @@ struct App {
     view_mode: ViewMode,
     should_quit: bool,
     show_config: bool,
+    config_panel_scroll: usize,
     show_delete_confirm: bool,
     pending_delete_run: Option<usize>, // Index into runs vector of run to delete
     pending_delete_model: Option<usize>, // Index into models vector of model to delete
@@ -283,6 +284,7 @@ impl App {
             view_mode: ViewMode::Runs,
             should_quit: false,
             show_config: false,
+            config_panel_scroll: 0,
             show_delete_confirm: false,
             pending_delete_run: None,
             pending_delete_model: None,
@@ -1945,16 +1947,25 @@ impl App {
                 self.selected_run -= 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.config_panel_scroll = 0;
                 self.cached_example = None;
             }
             KeyCode::Char(']') if self.selected_run < self.runs.len().saturating_sub(1) => {
                 self.selected_run += 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.config_panel_scroll = 0;
                 self.cached_example = None;
             }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
+                self.config_panel_scroll = 0;
+            }
+            KeyCode::Char('J') if self.show_config => {
+                self.config_panel_scroll += 1;
+            }
+            KeyCode::Char('K') if self.show_config => {
+                self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
             }
             KeyCode::Char('C') if !self.runs.is_empty() => {
                 if self.runs[self.selected_run].config.is_some() {
@@ -2073,14 +2084,23 @@ impl App {
                 self.selected_model -= 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.config_panel_scroll = 0;
             }
             KeyCode::Char(']') if self.selected_model < self.models.len().saturating_sub(1) => {
                 self.selected_model += 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.config_panel_scroll = 0;
             }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
+                self.config_panel_scroll = 0;
+            }
+            KeyCode::Char('J') if self.show_config => {
+                self.config_panel_scroll += 1;
+            }
+            KeyCode::Char('K') if self.show_config => {
+                self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
             }
             KeyCode::Char('d') if card_count > 0 => {
                 let cards = self.model_cards();
@@ -2134,6 +2154,13 @@ impl App {
             }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
+                self.config_panel_scroll = 0;
+            }
+            KeyCode::Char('J') if self.show_config => {
+                self.config_panel_scroll += 1;
+            }
+            KeyCode::Char('K') if self.show_config => {
+                self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -2433,6 +2460,13 @@ impl App {
             // c toggles model config panel (Models view only)
             KeyCode::Char('c') if self.view_mode == ViewMode::Models => {
                 self.show_config = !self.show_config;
+                self.config_panel_scroll = 0;
+            }
+            KeyCode::Char('J') if self.show_config => {
+                self.config_panel_scroll += 1;
+            }
+            KeyCode::Char('K') if self.show_config => {
+                self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -3987,7 +4021,7 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
     if let Some(config_area) = config_area
         && let Some(config) = &run.config
     {
-        render_config_panel(frame, config_area, config);
+        render_config_panel(frame, config_area, config, app.config_panel_scroll);
     }
 
     // Footer with styled keys
@@ -4018,6 +4052,13 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         Span::styled("p", Style::default().fg(NEON_CYAN)),
         Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
     ];
+    if app.show_config {
+        footer_spans.extend([
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("JK", Style::default().fg(NEON_CYAN)),
+            Span::styled("] scroll config  ", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
     if run.is_running() {
         footer_spans.extend([
             Span::styled("[", Style::default().fg(DIM_CYAN)),
@@ -4114,7 +4155,7 @@ fn render_model_detail(app: &App, frame: &mut Frame) {
     if let Some(config_area) = config_area
         && let Some(config) = &model.config
     {
-        render_config_panel(frame, config_area, config);
+        render_config_panel(frame, config_area, config, app.config_panel_scroll);
     }
 
     let config_hint = if app.show_config { "hide" } else { "config" };
@@ -4502,6 +4543,10 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
                 if let Some(config) = &run.config {
                     let mut lines: Vec<Line> = Vec::new();
                     render_json_value(config, 0, &mut lines);
+                    let total_lines = lines.len();
+                    let visible = col_chunks[i].height.saturating_sub(2) as usize;
+                    let max_scroll = total_lines.saturating_sub(visible);
+                    let scroll = app.config_panel_scroll.min(max_scroll) as u16;
                     let block = Block::default()
                         .title(Span::styled(
                             format!(" {} ", run.display_name()),
@@ -4510,9 +4555,7 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(DIM_CYAN));
-                    let paragraph = Paragraph::new(lines)
-                        .block(block)
-                        .wrap(ratatui::widgets::Wrap { trim: false });
+                    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
                     frame.render_widget(paragraph, col_chunks[i]);
                 } else {
                     let block = Block::default()
@@ -4633,22 +4676,34 @@ fn render_compare_examples_card(
     frame.render_widget(paragraph, area);
 }
 
-fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value) {
+fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value, scroll: usize) {
     let mut lines: Vec<Line> = Vec::new();
     render_json_value(config, 0, &mut lines);
 
+    let total_lines = lines.len();
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = total_lines.saturating_sub(visible);
+    let scroll = scroll.min(max_scroll) as u16;
+
+    let has_above = scroll > 0;
+    let has_below = (scroll as usize) < max_scroll;
+    let scroll_hint = match (has_above, has_below) {
+        (true, true) => " ↑↓ ",
+        (true, false) => " ↑ ",
+        (false, true) => " ↓ ",
+        _ => "",
+    };
+
     let block = Block::default()
-        .title(Span::styled(
-            " CONFIG ",
-            Style::default().fg(NEON_CYAN).bold(),
-        ))
+        .title(Line::from(vec![
+            Span::styled(" CONFIG ", Style::default().fg(NEON_CYAN).bold()),
+            Span::styled(scroll_hint, Style::default().fg(Color::DarkGray)),
+        ]))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(DIM_CYAN));
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(ratatui::widgets::Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
 
     frame.render_widget(paragraph, area);
 }
@@ -4714,10 +4769,7 @@ fn render_config_full(app: &App, frame: &mut Frame) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(DIM_CYAN));
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(ratatui::widgets::Wrap { trim: false })
-        .scroll((scroll, 0));
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
 
     frame.render_widget(paragraph, chunks[0]);
 
@@ -5902,6 +5954,7 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
             app.response_scroll_offset,
             app.show_config,
             model_config.as_ref(),
+            app.config_panel_scroll,
         );
         let example_count = eval.examples.len();
         let current_example = eval.examples.get(app.selected_example);
@@ -6001,6 +6054,7 @@ fn render_focused_evaluation(
     response_scroll_offset: usize,
     show_model_config: bool,
     model_config: Option<&serde_json::Value>,
+    config_panel_scroll: usize,
 ) {
     let (main_area, config_area) = if show_model_config && model_config.is_some() {
         let h_chunks = Layout::default()
@@ -6023,6 +6077,10 @@ fn render_focused_evaluation(
                 Style::default().fg(Color::DarkGray),
             ))]
         };
+        let total_lines = config_content.len();
+        let visible = config_area.height.saturating_sub(2) as usize;
+        let max_scroll = total_lines.saturating_sub(visible);
+        let scroll = config_panel_scroll.min(max_scroll) as u16;
         let config_block = Block::default()
             .title(Span::styled(
                 "◆ MODEL CONFIG ",
@@ -6034,7 +6092,7 @@ fn render_focused_evaluation(
         frame.render_widget(
             Paragraph::new(config_content)
                 .block(config_block)
-                .wrap(ratatui::widgets::Wrap { trim: false }),
+                .scroll((scroll, 0)),
             config_area,
         );
     }
