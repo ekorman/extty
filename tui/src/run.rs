@@ -6,7 +6,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Local;
 use dialoguer::{Select, theme::ColorfulTheme};
 
@@ -134,7 +134,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
         &opts.exclude,
         &mut log,
     )?;
-    copy_s3_config(&ssh_base, &host, port.as_deref(), ssh_user, &mut log);
+    copy_s3_config(&ssh_base, &host, port.as_deref(), ssh_user, &mut log)?;
     let command_str = opts.command.join(" ");
     let script_opts = ScriptOptions {
         python_version: &opts.python_version,
@@ -399,7 +399,7 @@ fn copy_s3_config(
     port: Option<&str>,
     ssh_user: &str,
     log: &mut LogFile,
-) {
+) -> Result<()> {
     let s3_config_path = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".extty")
@@ -407,7 +407,7 @@ fn copy_s3_config(
         .join("config.toml");
 
     if !s3_config_path.exists() {
-        return;
+        return Ok(());
     }
 
     log.log("Copying S3 config...");
@@ -415,7 +415,7 @@ fn copy_s3_config(
 
     let scp_port_arg = port.map(|p| format!("-P {}", p)).unwrap_or_default();
 
-    let result = Command::new("bash")
+    let output = Command::new("bash")
         .arg("-c")
         .arg(format!(
             "{} 'mkdir -p ~/.extty/s3' && scp -o StrictHostKeyChecking=no {} {} {}@{}:~/.extty/s3/config.toml",
@@ -427,22 +427,19 @@ fn copy_s3_config(
         ))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .output();
+        .output()
+        .context("Failed to run scp for S3 config")?;
 
-    match result {
-        Ok(output) if output.status.success() => {
-            log.log("S3 config copied");
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log.log(&format!("S3 config copy failed: {}", stderr.trim()));
-            eprintln!("Warning: failed to copy S3 config (non-fatal)");
-        }
-        Err(e) => {
-            log.log(&format!("S3 config copy error: {}", e));
-            eprintln!("Warning: failed to copy S3 config (non-fatal)");
-        }
+    if output.status.success() {
+        log.log("S3 config copied");
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = format!("Failed to copy S3 config: {}", stderr.trim());
+        log.log(&msg);
+        anyhow::bail!(msg);
     }
+
+    Ok(())
 }
 
 fn upload_bootstrap_script(
