@@ -170,7 +170,6 @@ struct PrimeGpu {
     #[serde(default)]
     prices: Option<PriceInfo>,
     region: Option<String>,
-    #[allow(dead_code)]
     data_center: Option<String>,
     socket: Option<String>,
     provider: Option<String>,
@@ -223,6 +222,7 @@ impl CloudProvider for PrimeProvider {
                     provider: Provider::Prime,
                     ssh_user,
                     raw_status,
+                    price_cents_per_hour: None,
                 }
             })
             .collect())
@@ -249,6 +249,9 @@ impl CloudProvider for PrimeProvider {
                 }
                 if let Some(provider) = &g.provider {
                     metadata.insert("provider".to_string(), provider.clone());
+                }
+                if let Some(data_center) = &g.data_center {
+                    metadata.insert("data_center".to_string(), data_center.clone());
                 }
                 metadata.insert("gpu_type".to_string(), gpu_type.clone());
                 metadata.insert("gpu_count".to_string(), gpu_count.to_string());
@@ -295,11 +298,17 @@ impl CloudProvider for PrimeProvider {
             .get("provider")
             .ok_or_else(|| anyhow!("Missing provider in metadata"))?;
 
+        let data_center_id = opts
+            .metadata
+            .get("data_center")
+            .ok_or_else(|| anyhow!("Missing data_center in metadata"))?;
+
         let mut pod = serde_json::json!({
             "cloudId": cloud_id,
             "gpuType": gpu_type,
             "socket": socket,
             "gpuCount": gpu_count,
+            "dataCenterId": data_center_id,
         });
 
         if let Some(name) = &opts.name {

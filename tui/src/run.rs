@@ -6,13 +6,13 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Local;
 use dialoguer::{Select, theme::ColorfulTheme};
 
 use crate::infra::{
-    self, InfraConfig, Instance, InstanceStatus, Provider, generate_script, get_provider,
-    project_remote_dir,
+    self, InfraConfig, Instance, InstanceStatus, Provider, ScriptOptions, generate_script,
+    get_provider, project_remote_dir,
 };
 
 pub struct RunOptions {
@@ -134,15 +134,19 @@ pub fn run(opts: RunOptions) -> Result<()> {
         &opts.exclude,
         &mut log,
     )?;
-    copy_s3_config(&ssh_base, &host, port.as_deref(), ssh_user, &mut log);
-    upload_bootstrap_script(
-        &ssh_base,
-        &opts,
-        &remote_dir,
-        git_hash.as_deref(),
-        &run_command,
-        &mut log,
-    )?;
+    copy_s3_config(&ssh_base, &host, port.as_deref(), ssh_user, &mut log)?;
+    let command_str = opts.command.join(" ");
+    let script_opts = ScriptOptions {
+        python_version: &opts.python_version,
+        command: &command_str,
+        skip_tmux: opts.skip_tmux,
+        project_dir: &remote_dir,
+        git_hash: git_hash.as_deref(),
+        run_command: &run_command,
+        instance_id: &instance.id,
+        provider: instance.provider.as_str(),
+    };
+    upload_bootstrap_script(&ssh_base, &script_opts, &mut log)?;
 
     log.log("Exec into SSH session");
     println!("Connecting to {}...", instance.display_name());
@@ -238,22 +242,13 @@ fn select_instance(config: &InfraConfig, opts: &RunOptions, log: &mut LogFile) -
     let providers_to_check: Vec<Provider> = if let Some(ref name) = opts.provider {
         vec![resolve_provider(name)?]
     } else {
-        vec![config.default_provider]
+        Provider::all().to_vec()
     };
 
     let mut instances: Vec<Instance> = providers_to_check
         .iter()
         .flat_map(|p| fetch_running_instances(config, *p, log))
         .collect();
-
-    if instances.is_empty() && opts.provider.is_none() {
-        log.log("No running instances on default provider, trying all providers");
-        instances = Provider::all()
-            .iter()
-            .filter(|p| **p != config.default_provider)
-            .flat_map(|p| fetch_running_instances(config, *p, log))
-            .collect();
-    }
 
     if instances.is_empty() {
         bail!("No running instances found");
@@ -404,7 +399,7 @@ fn copy_s3_config(
     port: Option<&str>,
     ssh_user: &str,
     log: &mut LogFile,
-) {
+) -> Result<()> {
     let s3_config_path = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".extty")
@@ -412,7 +407,7 @@ fn copy_s3_config(
         .join("config.toml");
 
     if !s3_config_path.exists() {
-        return;
+        return Ok(());
     }
 
     log.log("Copying S3 config...");
@@ -420,7 +415,7 @@ fn copy_s3_config(
 
     let scp_port_arg = port.map(|p| format!("-P {}", p)).unwrap_or_default();
 
-    let result = Command::new("bash")
+    let output = Command::new("bash")
         .arg("-c")
         .arg(format!(
             "{} 'mkdir -p ~/.extty/s3' && scp -o StrictHostKeyChecking=no {} {} {}@{}:~/.extty/s3/config.toml",
@@ -432,44 +427,30 @@ fn copy_s3_config(
         ))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .output();
+        .output()
+        .context("Failed to run scp for S3 config")?;
 
-    match result {
-        Ok(output) if output.status.success() => {
-            log.log("S3 config copied");
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log.log(&format!("S3 config copy failed: {}", stderr.trim()));
-            eprintln!("Warning: failed to copy S3 config (non-fatal)");
-        }
-        Err(e) => {
-            log.log(&format!("S3 config copy error: {}", e));
-            eprintln!("Warning: failed to copy S3 config (non-fatal)");
-        }
+    if output.status.success() {
+        log.log("S3 config copied");
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = format!("Failed to copy S3 config: {}", stderr.trim());
+        log.log(&msg);
+        anyhow::bail!(msg);
     }
+
+    Ok(())
 }
 
 fn upload_bootstrap_script(
     ssh_base: &str,
-    opts: &RunOptions,
-    remote_dir: &str,
-    git_hash: Option<&str>,
-    run_command: &str,
+    script_opts: &ScriptOptions,
     log: &mut LogFile,
 ) -> Result<()> {
     log.log("Uploading bootstrap script...");
     println!("Uploading bootstrap script...");
 
-    let command_str = opts.command.join(" ");
-    let script = generate_script(
-        &opts.python_version,
-        &command_str,
-        opts.skip_tmux,
-        remote_dir,
-        git_hash,
-        run_command,
-    );
+    let script = generate_script(script_opts);
 
     let mut child = Command::new("bash")
         .arg("-c")

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Protocol
 
 import psutil
+import pynvml as _pynvml
+
+logger = logging.getLogger(__name__)
 
 
 class SystemMetricSink(Protocol):
@@ -19,20 +23,11 @@ class SystemMetricSink(Protocol):
     ) -> None: ...
 
 
-try:
-    import pynvml as _pynvml
-
-    PYNVML_AVAILABLE = True
-except ImportError:
-    _pynvml = None  # type: ignore[assignment]
-    PYNVML_AVAILABLE = False
-
-
 class SystemMonitor:
     """
     Background thread that samples system metrics periodically.
 
-    Collects RAM usage and optionally GPU metrics if pynvml is available.
+    Collects RAM usage and GPU metrics (when a GPU is present).
     """
 
     def __init__(
@@ -54,6 +49,7 @@ class SystemMonitor:
         self._thread: threading.Thread | None = None
         self._gpu_initialized = False
         self._gpu_handle = None
+        self._gpu_sample_error_logged = False
 
     def start(self) -> None:
         """Start the monitoring thread."""
@@ -71,7 +67,7 @@ class SystemMonitor:
             self._thread.join(timeout=2.0)
             self._thread = None
 
-        if self._gpu_initialized and _pynvml is not None:
+        if self._gpu_initialized:
             try:
                 _pynvml.nvmlShutdown()
             except Exception:
@@ -79,17 +75,19 @@ class SystemMonitor:
             self._gpu_initialized = False
 
     def _init_gpu(self) -> None:
-        """Initialize pynvml if available."""
-        if not PYNVML_AVAILABLE or _pynvml is None:
-            return
-
+        """Initialize pynvml if a GPU is present."""
         try:
             _pynvml.nvmlInit()
             device_count = _pynvml.nvmlDeviceGetCount()
             if device_count > 0:
                 self._gpu_handle = _pynvml.nvmlDeviceGetHandleByIndex(0)
                 self._gpu_initialized = True
+            else:
+                logger.warning("No NVIDIA GPUs detected — GPU metrics disabled")
         except Exception:
+            logger.warning(
+                "Failed to initialize pynvml — GPU metrics disabled", exc_info=True
+            )
             self._gpu_initialized = False
 
     def _run(self) -> None:
@@ -108,11 +106,7 @@ class SystemMonitor:
         gpu_mem_total_gb: float | None = None
         gpu_util_pct: float | None = None
 
-        if (
-            self._gpu_initialized
-            and self._gpu_handle is not None
-            and _pynvml is not None
-        ):
+        if self._gpu_initialized and self._gpu_handle is not None:
             try:
                 mem_info = _pynvml.nvmlDeviceGetMemoryInfo(self._gpu_handle)
                 gpu_mem_used_gb = mem_info.used / (1024**3)
@@ -121,7 +115,9 @@ class SystemMonitor:
                 util = _pynvml.nvmlDeviceGetUtilizationRates(self._gpu_handle)
                 gpu_util_pct = float(util.gpu)
             except Exception:
-                pass
+                if not self._gpu_sample_error_logged:
+                    logger.warning("Error reading GPU metrics", exc_info=True)
+                    self._gpu_sample_error_logged = True
 
         self._storage.log_system(
             ram_used_gb=ram_used_gb,

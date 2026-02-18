@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -41,13 +41,13 @@ mod infra;
 mod run;
 mod s3;
 use data::{
-    Checkpoint, Evaluation, Example, MetricPoint, Model, Reward, Run, delete_evaluation,
-    delete_model, load_all_evaluations, load_models, load_runs_lightweight, load_starred_runs,
-    save_starred_runs,
+    Checkpoint, Evaluation, Example, ExampleGroup, MetricPoint, Model, Reward, Run,
+    delete_evaluation, delete_model, load_all_evaluations, load_models, load_runs_lightweight,
+    load_starred_runs, mark_run_completed, save_starred_runs,
 };
 use infra::{
-    InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, generate_script,
-    get_provider, load_config, project_remote_dir, save_config,
+    InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, ScriptOptions,
+    generate_script, get_provider, load_config, project_remote_dir, save_config,
 };
 enum SetupMessage {
     Status(String),
@@ -188,6 +188,7 @@ struct App {
     view_mode: ViewMode,
     should_quit: bool,
     show_config: bool,
+    config_panel_scroll: usize,
     show_delete_confirm: bool,
     pending_delete_run: Option<usize>, // Index into runs vector of run to delete
     pending_delete_model: Option<usize>, // Index into models vector of model to delete
@@ -245,12 +246,14 @@ struct App {
     s3_pull_rx: Option<mpsc::Receiver<S3PullMessage>>,
     s3_pull_status: Option<String>,
     s3_pull_time: Option<Instant>,
+    cached_example: Option<(String, usize, Example)>,
     goto_step_input: Option<String>,
     pull_run_modal_open: bool,
     pull_run_input: String,
     config_cursor: usize,
     config_copied_at: Option<Instant>,
     selected_checkpoint: usize,
+    show_system_metrics: bool,
 }
 
 impl App {
@@ -282,6 +285,7 @@ impl App {
             view_mode: ViewMode::Runs,
             should_quit: false,
             show_config: false,
+            config_panel_scroll: 0,
             show_delete_confirm: false,
             pending_delete_run: None,
             pending_delete_model: None,
@@ -333,12 +337,14 @@ impl App {
             s3_pull_rx: None,
             s3_pull_status: None,
             s3_pull_time: None,
+            cached_example: None,
             goto_step_input: None,
             pull_run_modal_open: false,
             pull_run_input: String::new(),
             config_cursor: 0,
             config_copied_at: None,
             selected_checkpoint: 0,
+            show_system_metrics: false,
         }
     }
 
@@ -1012,6 +1018,8 @@ impl App {
         }
 
         let ssh_user = instance.ssh_user.clone();
+        let instance_id = instance.id.clone();
+        let provider_str = instance.provider.as_str().to_string();
         let python_version = self.session_python_version.clone();
         let command = self.session_command.clone();
         let skip_tmux = self.session_skip_tmux;
@@ -1202,14 +1210,16 @@ impl App {
 
             let _ = tx.send(SetupMessage::Status("Uploading script...".to_string()));
 
-            let script = generate_script(
-                &python_version,
-                &command,
+            let script = generate_script(&ScriptOptions {
+                python_version: &python_version,
+                command: &command,
                 skip_tmux,
-                &remote_dir,
-                git_hash.as_deref(),
-                &command,
-            );
+                project_dir: &remote_dir,
+                git_hash: git_hash.as_deref(),
+                run_command: &command,
+                instance_id: &instance_id,
+                provider: &provider_str,
+            });
 
             let upload_status = std::process::Command::new("bash")
                 .arg("-c")
@@ -1324,20 +1334,32 @@ impl App {
 
         let mut cards = Vec::new();
 
-        let mut metric_names: Vec<&String> = run.metrics.keys().collect();
+        let mut metric_names: Vec<&String> = run
+            .metrics
+            .keys()
+            .filter(|n| {
+                if self.show_system_metrics {
+                    n.starts_with("sys/")
+                } else {
+                    !n.starts_with("sys/")
+                }
+            })
+            .collect();
         metric_names.sort();
         for name in metric_names {
             cards.push(Card::Chart { name: name.clone() });
         }
 
-        let mut example_names: Vec<&String> = run.examples.keys().collect();
-        example_names.sort();
-        for name in example_names {
-            cards.push(Card::Examples { name: name.clone() });
-        }
+        if !self.show_system_metrics {
+            let mut example_names: Vec<&String> = run.examples.keys().collect();
+            example_names.sort();
+            for name in example_names {
+                cards.push(Card::Examples { name: name.clone() });
+            }
 
-        if !run.checkpoints.is_empty() {
-            cards.push(Card::Checkpoints);
+            if !run.checkpoints.is_empty() {
+                cards.push(Card::Checkpoints);
+            }
         }
 
         cards
@@ -1366,35 +1388,46 @@ impl App {
     }
 
     fn compare_cards(&self) -> Vec<Card> {
+        let show_sys = self.show_system_metrics;
         let mut metric_names: Vec<String> = self
             .compared_runs
             .iter()
             .filter_map(|&idx| self.runs.get(idx))
             .flat_map(|run| run.metrics.keys().cloned())
+            .filter(|n| {
+                if show_sys {
+                    n.starts_with("sys/")
+                } else {
+                    !n.starts_with("sys/")
+                }
+            })
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
         metric_names.sort();
 
-        let mut example_names: Vec<String> = self
-            .compared_runs
-            .iter()
-            .filter_map(|&idx| self.runs.get(idx))
-            .flat_map(|run| run.examples.keys().cloned())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        example_names.sort();
-
         let mut cards: Vec<Card> = metric_names
             .into_iter()
             .map(|name| Card::Chart { name })
             .collect();
-        cards.extend(
-            example_names
+
+        if !show_sys {
+            let mut example_names: Vec<String> = self
+                .compared_runs
+                .iter()
+                .filter_map(|&idx| self.runs.get(idx))
+                .flat_map(|run| run.examples.keys().cloned())
+                .collect::<HashSet<_>>()
                 .into_iter()
-                .map(|name| Card::Examples { name }),
-        );
+                .collect();
+            example_names.sort();
+
+            cards.extend(
+                example_names
+                    .into_iter()
+                    .map(|name| Card::Examples { name }),
+            );
+        }
         cards
     }
 
@@ -1403,8 +1436,8 @@ impl App {
             .compared_runs
             .iter()
             .filter_map(|&idx| self.runs.get(idx))
-            .flat_map(|run| run.examples.get(name).into_iter().flatten())
-            .map(|e| e.step)
+            .filter_map(|run| run.examples.get(name))
+            .flat_map(|g| g.steps())
             .collect();
         steps.into_iter().collect()
     }
@@ -1431,6 +1464,25 @@ impl App {
             .iter()
             .filter(|e| e.model_name == model.name && e.project == model.project)
             .count()
+    }
+
+    fn get_or_load_example(&mut self, name: &str, idx: usize) -> Option<&Example> {
+        if self
+            .cached_example
+            .as_ref()
+            .is_none_or(|(n, i, _)| n != name || *i != idx)
+        {
+            let example = self
+                .current_run()
+                .and_then(|r| r.examples.get(name))
+                .and_then(|g| g.load(idx));
+            if let Some(ex) = example {
+                self.cached_example = Some((name.to_string(), idx, ex));
+            } else {
+                return None;
+            }
+        }
+        self.cached_example.as_ref().map(|(_, _, ex)| ex)
     }
 
     // Calculate wrapped line count for text given a width
@@ -1485,17 +1537,15 @@ impl App {
 
         let text = match current_card {
             Some(Card::Examples { name }) => {
-                if let Some(examples) = self.current_run().and_then(|r| r.examples.get(name)) {
-                    if let Some(example) = examples.get(self.selected_example) {
+                if let Some((ref cn, ci, ref ex)) = self.cached_example {
+                    if cn == name && ci == self.selected_example {
                         if is_prompt {
-                            example
-                                .prompts
+                            ex.prompts
                                 .get(self.selected_prompt)
                                 .cloned()
                                 .unwrap_or_default()
                         } else {
-                            example
-                                .responses
+                            ex.responses
                                 .get(self.selected_prompt)
                                 .and_then(|r| r.get(self.selected_response))
                                 .cloned()
@@ -1592,7 +1642,7 @@ impl App {
                                     Some(Card::Examples { name }) => self
                                         .current_run()
                                         .and_then(|r| r.examples.get(name))
-                                        .map(|exs| exs.iter().map(|e| e.step).collect())
+                                        .map(|g| g.steps().collect())
                                         .unwrap_or_default(),
                                     _ => vec![],
                                 }
@@ -1610,6 +1660,7 @@ impl App {
                             .map(|(i, _)| i)
                             .unwrap_or(0);
                         self.selected_example = best_idx;
+                        self.cached_example = None;
                         self.selected_prompt = 0;
                         self.selected_response = 0;
                         self.prompt_scroll_offset = 0;
@@ -1914,20 +1965,32 @@ impl App {
             }
             KeyCode::Enter if card_count > 0 => {
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.view = View::Focused;
             }
             KeyCode::Char('[') if self.selected_run > 0 => {
                 self.selected_run -= 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.config_panel_scroll = 0;
+                self.cached_example = None;
             }
             KeyCode::Char(']') if self.selected_run < self.runs.len().saturating_sub(1) => {
                 self.selected_run += 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.config_panel_scroll = 0;
+                self.cached_example = None;
             }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
+                self.config_panel_scroll = 0;
+            }
+            KeyCode::Char('J') if self.show_config => {
+                self.config_panel_scroll += 1;
+            }
+            KeyCode::Char('K') if self.show_config => {
+                self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
             }
             KeyCode::Char('C') if !self.runs.is_empty() => {
                 if self.runs[self.selected_run].config.is_some() {
@@ -1949,6 +2012,20 @@ impl App {
                     self.starred_runs.insert(name);
                 }
                 save_starred_runs(&self.starred_runs);
+            }
+            KeyCode::Char('S') => {
+                self.show_system_metrics = !self.show_system_metrics;
+                self.selected_card = 0;
+                self.scroll_offset = 0;
+            }
+            KeyCode::Char('m')
+                if !self.runs.is_empty() && self.runs[self.selected_run].is_running() =>
+            {
+                let run = &mut self.runs[self.selected_run];
+                if mark_run_completed(&run.path).is_ok() {
+                    run.status = data::RunStatus::Completed;
+                    run.end_time = Some(chrono::Local::now());
+                }
             }
             _ => {}
         }
@@ -2030,20 +2107,30 @@ impl App {
             }
             KeyCode::Enter if card_count > 0 => {
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.view = View::Focused;
             }
             KeyCode::Char('[') if self.selected_model > 0 => {
                 self.selected_model -= 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.config_panel_scroll = 0;
             }
             KeyCode::Char(']') if self.selected_model < self.models.len().saturating_sub(1) => {
                 self.selected_model += 1;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+                self.config_panel_scroll = 0;
             }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
+                self.config_panel_scroll = 0;
+            }
+            KeyCode::Char('J') if self.show_config => {
+                self.config_panel_scroll += 1;
+            }
+            KeyCode::Char('K') if self.show_config => {
+                self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
             }
             KeyCode::Char('d') if card_count > 0 => {
                 let cards = self.model_cards();
@@ -2097,6 +2184,13 @@ impl App {
             }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
+                self.config_panel_scroll = 0;
+            }
+            KeyCode::Char('J') if self.show_config => {
+                self.config_panel_scroll += 1;
+            }
+            KeyCode::Char('K') if self.show_config => {
+                self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -2151,7 +2245,9 @@ impl App {
                             .iter()
                             .filter_map(|&idx| self.runs.get(idx))
                             .filter_map(|run| {
-                                run.examples.get(name)?.iter().find(|e| e.step == step)
+                                let g = run.examples.get(name)?;
+                                let idx = g.find_step(step)?;
+                                g.load(idx)
                             })
                             .map(|ex| ex.prompts.len())
                             .max()
@@ -2160,10 +2256,10 @@ impl App {
                     .unwrap_or(0)
             }
             Some(Card::Examples { name }) => self
-                .current_run()
-                .and_then(|r| r.examples.get(name))
-                .and_then(|e| e.get(self.selected_example))
-                .map(|ex| ex.prompts.len())
+                .cached_example
+                .as_ref()
+                .filter(|(n, i, _)| n == name && *i == self.selected_example)
+                .map(|(_, _, ex)| ex.prompts.len())
                 .unwrap_or(0),
             Some(Card::Evaluation { name }) => self
                 .get_model_evaluation(name)
@@ -2183,9 +2279,11 @@ impl App {
                             .iter()
                             .filter_map(|&idx| self.runs.get(idx))
                             .filter_map(|run| {
-                                run.examples.get(name)?.iter().find(|e| e.step == step)
+                                let g = run.examples.get(name)?;
+                                let idx = g.find_step(step)?;
+                                g.load(idx)
                             })
-                            .filter_map(|ex| ex.responses.get(self.selected_prompt))
+                            .filter_map(|ex| ex.responses.get(self.selected_prompt).cloned())
                             .map(|r| r.len())
                             .max()
                             .unwrap_or(0)
@@ -2193,16 +2291,10 @@ impl App {
                     .unwrap_or(0)
             }
             Some(Card::Examples { name }) => self
-                .current_run()
-                .and_then(|r| r.examples.get(name))
-                .and_then(|e| e.get(self.selected_example))
-                .and_then(|ex| ex.responses.get(self.selected_prompt))
-                .map(|r| r.len())
-                .unwrap_or(0),
-            Some(Card::Evaluation { name }) => self
-                .get_model_evaluation(name)
-                .and_then(|e| e.examples.get(self.selected_example))
-                .and_then(|ex| ex.responses.get(self.selected_prompt))
+                .cached_example
+                .as_ref()
+                .filter(|(n, i, _)| n == name && *i == self.selected_example)
+                .and_then(|(_, _, ex)| ex.responses.get(self.selected_prompt))
                 .map(|r| r.len())
                 .unwrap_or(0),
             _ => 0,
@@ -2272,6 +2364,7 @@ impl App {
             KeyCode::Left if card_count > 1 && self.selected_card > 0 => {
                 self.selected_card -= 1;
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.selected_checkpoint = 0;
@@ -2283,6 +2376,7 @@ impl App {
             {
                 self.selected_card += 1;
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.selected_checkpoint = 0;
@@ -2311,6 +2405,7 @@ impl App {
             // Shift+Up/Down jump 10 examples at a time
             KeyCode::Up if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
                 self.selected_example = self.selected_example.saturating_sub(10);
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2319,6 +2414,7 @@ impl App {
             KeyCode::Down if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
                 self.selected_example =
                     (self.selected_example + 10).min(example_count.saturating_sub(1));
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2327,6 +2423,7 @@ impl App {
             // Up/Down navigate within example groups
             KeyCode::Up if example_count > 0 && self.selected_example > 0 => {
                 self.selected_example -= 1;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2336,6 +2433,7 @@ impl App {
                 if example_count > 0 && self.selected_example < example_count.saturating_sub(1) =>
             {
                 self.selected_example += 1;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2371,6 +2469,7 @@ impl App {
             // Home/End jump to first/last example
             KeyCode::Home if example_count > 0 => {
                 self.selected_example = 0;
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2378,6 +2477,7 @@ impl App {
             }
             KeyCode::End if example_count > 0 => {
                 self.selected_example = example_count.saturating_sub(1);
+                self.cached_example = None;
                 self.selected_prompt = 0;
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
@@ -2390,6 +2490,13 @@ impl App {
             // c toggles model config panel (Models view only)
             KeyCode::Char('c') if self.view_mode == ViewMode::Models => {
                 self.show_config = !self.show_config;
+                self.config_panel_scroll = 0;
+            }
+            KeyCode::Char('J') if self.show_config => {
+                self.config_panel_scroll += 1;
+            }
+            KeyCode::Char('K') if self.show_config => {
+                self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -3097,6 +3204,15 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
         {
             app.s3_pull_status = None;
             app.s3_pull_time = None;
+        }
+
+        if app.view == View::Focused && !app.compare_focused {
+            let cards = app.active_cards();
+            if let Some(Card::Examples { name }) = cards.get(app.selected_card) {
+                let name = name.clone();
+                let idx = app.selected_example;
+                app.get_or_load_example(&name, idx);
+            }
         }
 
         // Draw the UI
@@ -3865,7 +3981,7 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         String::new()
     };
 
-    let total_examples: usize = run.examples.values().map(|v| v.len()).sum();
+    let total_examples: usize = run.examples.values().map(|g| g.len()).sum();
     let latest_step = run
         .metrics
         .values()
@@ -3935,12 +4051,12 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
     if let Some(config_area) = config_area
         && let Some(config) = &run.config
     {
-        render_config_panel(frame, config_area, config);
+        render_config_panel(frame, config_area, config, app.config_panel_scroll);
     }
 
     // Footer with styled keys
     let config_hint = if app.show_config { "hide" } else { "config" };
-    let footer = Line::from(vec![
+    let mut footer_spans = vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
         Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
@@ -3965,6 +4081,37 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("p", Style::default().fg(NEON_CYAN)),
         Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
+    ];
+    if run.metrics.keys().any(|k| k.starts_with("sys/")) {
+        let sys_hint = if app.show_system_metrics {
+            "train"
+        } else {
+            "system"
+        };
+        footer_spans.extend([
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("S", Style::default().fg(NEON_CYAN)),
+            Span::styled(
+                format!("] {}  ", sys_hint),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+    if app.show_config {
+        footer_spans.extend([
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("JK", Style::default().fg(NEON_CYAN)),
+            Span::styled("] scroll config  ", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+    if run.is_running() {
+        footer_spans.extend([
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("m", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] mark done  ", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+    footer_spans.extend([
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("[]", Style::default().fg(NEON_YELLOW)),
         Span::styled("] run ", Style::default().fg(Color::DarkGray)),
@@ -3973,6 +4120,7 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
             Style::default().fg(NEON_YELLOW),
         ),
     ]);
+    let footer = Line::from(footer_spans);
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
@@ -4052,7 +4200,7 @@ fn render_model_detail(app: &App, frame: &mut Frame) {
     if let Some(config_area) = config_area
         && let Some(config) = &model.config
     {
-        render_config_panel(frame, config_area, config);
+        render_config_panel(frame, config_area, config, app.config_panel_scroll);
     }
 
     let config_hint = if app.show_config { "hide" } else { "config" };
@@ -4440,6 +4588,10 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
                 if let Some(config) = &run.config {
                     let mut lines: Vec<Line> = Vec::new();
                     render_json_value(config, 0, &mut lines);
+                    let total_lines = lines.len();
+                    let visible = col_chunks[i].height.saturating_sub(2) as usize;
+                    let max_scroll = total_lines.saturating_sub(visible);
+                    let scroll = app.config_panel_scroll.min(max_scroll) as u16;
                     let block = Block::default()
                         .title(Span::styled(
                             format!(" {} ", run.display_name()),
@@ -4448,9 +4600,7 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(DIM_CYAN));
-                    let paragraph = Paragraph::new(lines)
-                        .block(block)
-                        .wrap(ratatui::widgets::Wrap { trim: false });
+                    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
                     frame.render_widget(paragraph, col_chunks[i]);
                 } else {
                     let block = Block::default()
@@ -4519,7 +4669,7 @@ fn render_compare_examples_card(
         }
         let color = COMPARE_COLORS[i % COMPARE_COLORS.len()];
         if let Some(run) = app.runs.get(run_idx) {
-            let count = run.examples.get(name).map(|e| e.len()).unwrap_or(0);
+            let count = run.examples.get(name).map(|g| g.len()).unwrap_or(0);
             let label = if count > 0 {
                 format!("{}: {} examples", run.display_name(), count)
             } else {
@@ -4538,7 +4688,7 @@ fn render_compare_examples_card(
             .iter()
             .filter_map(|&idx| app.runs.get(idx))
             .filter_map(|run| run.examples.get(name))
-            .flat_map(|examples| examples.last())
+            .filter_map(|g| g.last())
             .next()
     {
         lines.push(Line::from(""));
@@ -4571,22 +4721,34 @@ fn render_compare_examples_card(
     frame.render_widget(paragraph, area);
 }
 
-fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value) {
+fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value, scroll: usize) {
     let mut lines: Vec<Line> = Vec::new();
     render_json_value(config, 0, &mut lines);
 
+    let total_lines = lines.len();
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = total_lines.saturating_sub(visible);
+    let scroll = scroll.min(max_scroll) as u16;
+
+    let has_above = scroll > 0;
+    let has_below = (scroll as usize) < max_scroll;
+    let scroll_hint = match (has_above, has_below) {
+        (true, true) => " ↑↓ ",
+        (true, false) => " ↑ ",
+        (false, true) => " ↓ ",
+        _ => "",
+    };
+
     let block = Block::default()
-        .title(Span::styled(
-            " CONFIG ",
-            Style::default().fg(NEON_CYAN).bold(),
-        ))
+        .title(Line::from(vec![
+            Span::styled(" CONFIG ", Style::default().fg(NEON_CYAN).bold()),
+            Span::styled(scroll_hint, Style::default().fg(Color::DarkGray)),
+        ]))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(DIM_CYAN));
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(ratatui::widgets::Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
 
     frame.render_widget(paragraph, area);
 }
@@ -4776,6 +4938,14 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(max).collect::<String>())
+    }
+}
+
 fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<Line>) {
     let pad = "  ".repeat(indent);
     match value {
@@ -4800,7 +4970,7 @@ fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<L
                         ]));
                     }
                     _ => {
-                        let val_str = format_json_primitive(val);
+                        let val_str = truncate_str(&format_json_primitive(val), 28);
                         lines.push(Line::from(vec![
                             Span::styled(pad.clone(), Style::default()),
                             Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
@@ -4811,7 +4981,7 @@ fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<L
             }
         }
         _ => {
-            let val_str = format_json_primitive(value);
+            let val_str = truncate_str(&format_json_primitive(value), 28);
             lines.push(Line::from(Span::styled(
                 format!("{}{}", pad, val_str),
                 Style::default().fg(Color::White),
@@ -4988,7 +5158,7 @@ fn render_examples_card(
     frame: &mut Frame,
     area: Rect,
     name: &str,
-    examples: &[Example],
+    group: &ExampleGroup,
     selected: bool,
 ) {
     let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
@@ -4998,13 +5168,10 @@ fn render_examples_card(
         Style::default().fg(NEON_GREEN)
     };
 
-    // Show the latest example as preview
-    let content: Vec<Line> = if let Some(example) = examples.last() {
+    let content: Vec<Line> = if let Some(example) = group.last() {
         let max_lines = area.height.saturating_sub(4) as usize;
-        // Use the first prompt for preview
         let first_prompt = example.prompts.first().map(|s| s.as_str()).unwrap_or("");
         let prompt_preview: String = first_prompt.chars().take(50).collect();
-        // Use the first response of first prompt for preview
         let first_response = example
             .responses
             .first()
@@ -5041,21 +5208,19 @@ fn render_examples_card(
         ))]
     };
 
-    // Calculate average reward if rewards exist
-    let avg_reward = compute_average_reward(examples);
+    let avg_reward = group.avg_reward();
 
-    // Build title with batch info if applicable
-    let batch_size = examples.last().map(|e| e.prompts.len()).unwrap_or(0);
+    let batch_size = group.last().map(|e| e.prompts.len()).unwrap_or(0);
     let mut title_spans = vec![Span::styled(format!("{} ", name), title_style)];
 
     if batch_size > 1 {
         title_spans.push(Span::styled(
-            format!("({} total, batch={})", examples.len(), batch_size),
+            format!("({} total, batch={})", group.len(), batch_size),
             Style::default().fg(Color::DarkGray),
         ));
     } else {
         title_spans.push(Span::styled(
-            format!("({} total)", examples.len()),
+            format!("({} total)", group.len()),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -5341,26 +5506,6 @@ fn render_evaluation_card(frame: &mut Frame, area: Rect, eval: &Evaluation, sele
     frame.render_widget(paragraph, area);
 }
 
-fn compute_average_reward(examples: &[Example]) -> Option<f64> {
-    let mut total = 0.0;
-    let mut count = 0;
-    for example in examples {
-        if let Some(rewards) = &example.rewards {
-            for prompt_rewards in rewards {
-                for reward in prompt_rewards {
-                    total += reward.total();
-                    count += 1;
-                }
-            }
-        }
-    }
-    if count > 0 {
-        Some(total / count as f64)
-    } else {
-        None
-    }
-}
-
 fn reward_color(reward: f64) -> Color {
     if reward >= 0.7 {
         NEON_GREEN
@@ -5528,7 +5673,8 @@ fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, nam
         let example = run
             .examples
             .get(name)
-            .and_then(|examples| examples.iter().find(|e| e.step == current_step));
+            .and_then(|g| g.find_step(current_step))
+            .and_then(|idx| run.examples.get(name).unwrap().load(idx));
 
         let col_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -5676,14 +5822,19 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
         Card::Examples { name } => {
-            if let Some(examples) = run.examples.get(name) {
-                if let Some(example) = examples.get(app.selected_example) {
+            if let Some(group) = run.examples.get(name) {
+                let example = app
+                    .cached_example
+                    .as_ref()
+                    .filter(|(n, i, _)| n == name && *i == app.selected_example)
+                    .map(|(_, _, ex)| ex);
+                if let Some(example) = example {
                     render_focused_example(
                         frame,
                         chunks[0],
                         name,
                         app.selected_example,
-                        examples.len(),
+                        group.len(),
                         example,
                         app.selected_prompt,
                         app.selected_response,
@@ -5692,12 +5843,8 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                         app.response_scroll_offset,
                     );
                 }
-                let prompt_count = examples
-                    .get(app.selected_example)
-                    .map(|e| e.prompts.len())
-                    .unwrap_or(0);
-                let response_count = examples
-                    .get(app.selected_example)
+                let prompt_count = example.map(|e| e.prompts.len()).unwrap_or(0);
+                let response_count = example
                     .and_then(|e| e.responses.get(app.selected_prompt))
                     .map(|r| r.len())
                     .unwrap_or(0);
@@ -5729,7 +5876,7 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                     Span::styled("↑↓/⇧", Style::default().fg(NEON_CYAN)),
                     Span::styled("] example ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        format!("{}/{}", app.selected_example + 1, examples.len()),
+                        format!("{}/{}", app.selected_example + 1, group.len()),
                         Style::default().fg(NEON_YELLOW),
                     ),
                     Span::styled("  [", Style::default().fg(DIM_CYAN)),
@@ -5852,6 +5999,7 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
             app.response_scroll_offset,
             app.show_config,
             model_config.as_ref(),
+            app.config_panel_scroll,
         );
         let example_count = eval.examples.len();
         let current_example = eval.examples.get(app.selected_example);
@@ -5951,6 +6099,7 @@ fn render_focused_evaluation(
     response_scroll_offset: usize,
     show_model_config: bool,
     model_config: Option<&serde_json::Value>,
+    config_panel_scroll: usize,
 ) {
     let (main_area, config_area) = if show_model_config && model_config.is_some() {
         let h_chunks = Layout::default()
@@ -5973,6 +6122,10 @@ fn render_focused_evaluation(
                 Style::default().fg(Color::DarkGray),
             ))]
         };
+        let total_lines = config_content.len();
+        let visible = config_area.height.saturating_sub(2) as usize;
+        let max_scroll = total_lines.saturating_sub(visible);
+        let scroll = config_panel_scroll.min(max_scroll) as u16;
         let config_block = Block::default()
             .title(Span::styled(
                 "◆ MODEL CONFIG ",
@@ -5984,7 +6137,7 @@ fn render_focused_evaluation(
         frame.render_widget(
             Paragraph::new(config_content)
                 .block(config_block)
-                .wrap(ratatui::widgets::Wrap { trim: false }),
+                .scroll((scroll, 0)),
             config_area,
         );
     }
@@ -6428,14 +6581,12 @@ fn render_focused_example(
     prompt_title_spans.extend(vec![
         Span::styled("│ ", Style::default().fg(DIM_CYAN)),
         Span::styled(group_name, Style::default().fg(NEON_MAGENTA)),
-        Span::styled(
-            format!(" #{}", index + 1),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(format!("/{}", total), Style::default().fg(Color::DarkGray)),
-        Span::styled(" │ ", Style::default().fg(DIM_CYAN)),
-        Span::styled("step ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" step ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", example.step), Style::default().fg(NEON_CYAN)),
+        Span::styled(
+            format!("  ({}/{})", index + 1, total),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     let prompt_title = Line::from(prompt_title_spans);
 
@@ -6922,6 +7073,19 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
+    let mut instance_runs: HashMap<String, Vec<&Run>> = HashMap::new();
+    for run in &app.runs {
+        if run.is_running()
+            && let Some(id) = run
+                .config
+                .as_ref()
+                .and_then(|c| c.get("_instance_id"))
+                .and_then(|v| v.as_str())
+        {
+            instance_runs.entry(id.to_string()).or_default().push(run);
+        }
+    }
+
     let items: Vec<ListItem> = instances
         .iter()
         .enumerate()
@@ -6966,7 +7130,7 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled(&instance.instance_type, Style::default().fg(NEON_YELLOW)),
             ]);
 
-            let line2 = Line::from(vec![
+            let mut line2_spans = vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     instance.status.as_str().to_string(),
@@ -6976,9 +7140,30 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled(&instance.region, Style::default().fg(Color::DarkGray)),
                 Span::styled("  ", Style::default()),
                 Span::styled(ip_display, Style::default().fg(NEON_CYAN)),
-            ]);
+            ];
+            if let Some(price) = instance.price_display() {
+                line2_spans.push(Span::styled("  ", Style::default()));
+                line2_spans.push(Span::styled(price, Style::default().fg(NEON_GREEN)));
+            }
+            let line2 = Line::from(line2_spans);
 
-            ListItem::new(vec![line1, line2])
+            let mut lines = vec![line1, line2];
+
+            let composite_id = format!("{}:{}", instance.provider.as_str(), instance.id);
+            if let Some(runs) = instance_runs.get(&composite_id) {
+                let run_names: String = runs
+                    .iter()
+                    .map(|r| r.display_name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled("runs: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(run_names, Style::default().fg(NEON_MAGENTA)),
+                ]));
+            }
+
+            ListItem::new(lines)
         })
         .collect();
 
@@ -7229,7 +7414,7 @@ fn render_infra_region_popup(app: &App, frame: &mut Frame) {
     let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
 
     let area = frame.area();
-    let popup_width = 40u16.min(area.width.saturating_sub(4));
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
     let popup_height = (regions.len() as u16 + 5).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -7257,10 +7442,18 @@ fn render_infra_region_popup(app: &App, frame: &mut Frame) {
         } else {
             Style::default().fg(Color::Gray)
         };
-        lines.push(Line::from(Span::styled(
-            format!("{}{}", prefix, region),
-            style,
-        )));
+
+        let price_suffix = selected_type
+            .and_then(|t| t.metadata.get(&format!("price:{}", region)))
+            .and_then(|c| c.parse::<u32>().ok())
+            .map(|cents| format!("  ${:.2}/hr", cents as f64 / 100.0))
+            .unwrap_or_default();
+
+        let mut spans = vec![Span::styled(format!("{}{}", prefix, region), style)];
+        if !price_suffix.is_empty() {
+            spans.push(Span::styled(price_suffix, Style::default().fg(NEON_GREEN)));
+        }
+        lines.push(Line::from(spans));
     }
 
     let block = Block::default()
@@ -7282,13 +7475,22 @@ fn render_infra_launch_confirm(app: &App, frame: &mut Frame) {
 
     let selected_type = app.infra_types.get(app.selected_infra_type);
     let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
-    let type_price = selected_type
-        .map(|t| t.price_display())
-        .unwrap_or_else(|| "?".to_string());
     let region = selected_type
         .and_then(|t| t.regions.get(app.launch_selected_region))
         .map(|s| s.as_str())
         .unwrap_or("default");
+    let type_price = selected_type
+        .and_then(|t| {
+            t.metadata
+                .get(&format!("price:{}", region))
+                .and_then(|c| c.parse::<u32>().ok())
+                .map(|cents| format!("${:.2}/hr", cents as f64 / 100.0))
+        })
+        .unwrap_or_else(|| {
+            selected_type
+                .map(|t| t.price_display())
+                .unwrap_or_else(|| "?".to_string())
+        });
 
     let area = frame.area();
     let popup_width = 50u16.min(area.width.saturating_sub(4));

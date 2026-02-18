@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
@@ -146,6 +146,7 @@ struct VastInstance {
     status_msg: Option<String>,
     gpu_name: Option<String>,
     geolocation: Option<String>,
+    dph_total: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -164,6 +165,7 @@ struct VastOffer {
     cpu_ram: Option<f64>,
     disk_space: Option<f64>,
     dph_base: Option<f64>,
+    dph_total: Option<f64>,
     geolocation: Option<String>,
 }
 
@@ -203,6 +205,7 @@ impl CloudProvider for VastProvider {
                     provider: Provider::Vast,
                     ssh_user: "root".to_string(),
                     raw_status,
+                    price_cents_per_hour: i.dph_total.map(|d| (d * 100.0) as u32),
                 }
             })
             .collect())
@@ -221,42 +224,60 @@ impl CloudProvider for VastProvider {
 
         let response: BundlesResponse = self.post("/bundles/", &body)?;
 
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut types = Vec::new();
+        let mut grouped: HashMap<String, InstanceType> = HashMap::new();
+        let mut insertion_order: Vec<String> = Vec::new();
 
         for offer in response.offers {
             let gpu_name = offer.gpu_name.unwrap_or_else(|| "unknown".to_string());
             let num_gpus = offer.num_gpus.unwrap_or(1);
             let type_key = format!("{}x{}", gpu_name, num_gpus);
+            let region = offer.geolocation.unwrap_or_else(|| "unknown".to_string());
+            let total_price = offer
+                .dph_total
+                .unwrap_or_else(|| offer.dph_base.unwrap_or(0.0) * num_gpus as f64);
+            let price_cents = (total_price * 100.0) as u32;
 
-            if seen.contains(&type_key) {
-                continue;
+            if let Some(existing) = grouped.get_mut(&type_key) {
+                if !existing.regions.contains(&region) {
+                    existing.regions.push(region.clone());
+                }
+                let price_key = format!("price:{}", region);
+                existing
+                    .metadata
+                    .entry(price_key)
+                    .or_insert_with(|| price_cents.to_string());
+            } else {
+                let gpu_ram_gb = offer.gpu_ram.map(|r| r / 1024);
+                let gpu_description = gpu_ram_gb.map(|gb| format!("{}GB", gb));
+
+                let mut metadata = HashMap::new();
+                metadata.insert(format!("price:{}", region), price_cents.to_string());
+
+                insertion_order.push(type_key.clone());
+                grouped.insert(
+                    type_key.clone(),
+                    InstanceType {
+                        name: type_key,
+                        description: Some(format!("{}x {}", num_gpus, gpu_name)),
+                        gpu_count: num_gpus,
+                        gpu_name: Some(gpu_name),
+                        gpu_description,
+                        gpu_memory_gib: gpu_ram_gb.unwrap_or(0) as u32,
+                        vcpus: offer.cpu_cores_effective.unwrap_or(0.0) as u32,
+                        memory_gib: (offer.cpu_ram.unwrap_or(0.0) / 1024.0) as u32,
+                        storage_gib: offer.disk_space.unwrap_or(0.0) as u32,
+                        price_cents_per_hour: price_cents,
+                        regions: vec![region],
+                        metadata,
+                    },
+                );
             }
-            seen.insert(type_key.clone());
-
-            let price_per_gpu = offer.dph_base.unwrap_or(0.0);
-            let total_price = price_per_gpu * num_gpus as f64;
-
-            let gpu_ram_gb = offer.gpu_ram.map(|r| r / 1024);
-            let gpu_description = gpu_ram_gb.map(|gb| format!("{}GB", gb));
-
-            types.push(InstanceType {
-                name: type_key,
-                description: Some(format!("{}x {}", num_gpus, gpu_name)),
-                gpu_count: num_gpus,
-                gpu_name: Some(gpu_name),
-                gpu_description,
-                gpu_memory_gib: gpu_ram_gb.unwrap_or(0) as u32,
-                vcpus: offer.cpu_cores_effective.unwrap_or(0.0) as u32,
-                memory_gib: (offer.cpu_ram.unwrap_or(0.0) / 1024.0) as u32,
-                storage_gib: offer.disk_space.unwrap_or(0.0) as u32,
-                price_cents_per_hour: (total_price * 100.0) as u32,
-                regions: vec![offer.geolocation.unwrap_or_else(|| "unknown".to_string())],
-                metadata: Default::default(),
-            });
         }
 
-        Ok(types)
+        Ok(insertion_order
+            .into_iter()
+            .filter_map(|key| grouped.remove(&key))
+            .collect())
     }
 
     fn launch(&self, opts: &LaunchOptions) -> Result<Vec<String>> {
@@ -270,15 +291,21 @@ impl CloudProvider for VastProvider {
             "num_gpus": {"eq": num_gpus},
             "type": "on-demand",
             "order": [["dph_total", "asc"]],
-            "limit": 1,
+            "limit": 100,
         });
 
         let search_response: BundlesResponse = self.post("/bundles/", &search_body)?;
 
-        let offer = search_response
-            .offers
-            .first()
-            .ok_or_else(|| anyhow!("No offers found for {}", opts.instance_type))?;
+        let offer = if let Some(region) = &opts.region {
+            search_response
+                .offers
+                .iter()
+                .find(|o| o.geolocation.as_deref() == Some(region.as_str()))
+                .or_else(|| search_response.offers.first())
+        } else {
+            search_response.offers.first()
+        }
+        .ok_or_else(|| anyhow!("No offers found for {}", opts.instance_type))?;
 
         let mut create_body = serde_json::json!({
             "client_id": "me",

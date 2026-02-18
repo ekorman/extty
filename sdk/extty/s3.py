@@ -434,13 +434,12 @@ class S3Storage:
         try:
             file_size = os.path.getsize(local_path)
             checkpoint_key = self._s3_key("checkpoints", str(step), "checkpoint.pt")
-            with open(local_path, "rb") as f:
-                self._client.put_object(
-                    Bucket=self.config.bucket,
-                    Key=checkpoint_key,
-                    Body=f.read(),
-                    ContentType="application/octet-stream",
-                )
+            self._client.upload_file(
+                Filename=local_path,
+                Bucket=self.config.bucket,
+                Key=checkpoint_key,
+                ExtraArgs={"ContentType": "application/octet-stream"},
+            )
 
             timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
             meta_entry = {
