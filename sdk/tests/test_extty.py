@@ -735,8 +735,13 @@ class TestSaveCheckpoint:
                 {"Error": {"Code": "NoSuchKey"}}, "GetObject"
             )
 
+        def upload_file(Filename, Bucket, Key, ExtraArgs=None):
+            with open(Filename, "rb") as f:
+                stored[Key] = f.read()
+
         client.put_object.side_effect = put_object
         client.get_object.side_effect = get_object
+        client.upload_file.side_effect = upload_file
         client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
         return client, stored
 
