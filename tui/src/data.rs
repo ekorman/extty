@@ -309,7 +309,8 @@ pub fn delete_model(path: &Path) -> Result<(), std::io::Error> {
 // Load a single run from a directory
 fn load_run(path: &Path) -> Option<Run> {
     let name = path.file_name()?.to_string_lossy().to_string();
-    let metrics = load_metrics(path);
+    let mut metrics = load_metrics(path);
+    metrics.extend(load_system_metrics(path));
     let examples = load_examples(path);
     let checkpoints = load_checkpoints(path);
 
@@ -688,6 +689,81 @@ fn load_metric_csv(path: &PathBuf) -> Result<Vec<MetricPoint>, csv::Error> {
     }
 
     Ok(points)
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemMetricRow {
+    timestamp: f64,
+    ram_used_gb: f64,
+    ram_total_gb: f64,
+    gpu_mem_used_gb: f64,
+    gpu_mem_total_gb: f64,
+    gpu_util_pct: f64,
+}
+
+fn load_system_metrics(run_path: &Path) -> HashMap<String, Vec<MetricPoint>> {
+    let mut metrics = HashMap::new();
+    let path = run_path.join("system.csv");
+
+    if !path.exists() {
+        return metrics;
+    }
+
+    let Ok(mut reader) = csv::Reader::from_path(&path) else {
+        return metrics;
+    };
+
+    let mut ram_used = Vec::new();
+    let mut gpu_mem_used = Vec::new();
+    let mut gpu_util = Vec::new();
+
+    let mut first_ts: Option<f64> = None;
+
+    for result in reader.deserialize() {
+        let Ok(row): Result<SystemMetricRow, _> = result else {
+            continue;
+        };
+
+        let ts = *first_ts.get_or_insert(row.timestamp);
+        let elapsed_min = ((row.timestamp - ts) / 60.0).round() as u64;
+
+        let ram_pct = if row.ram_total_gb > 0.0 {
+            row.ram_used_gb / row.ram_total_gb * 100.0
+        } else {
+            0.0
+        };
+        ram_used.push(MetricPoint {
+            step: elapsed_min,
+            value: ram_pct,
+        });
+
+        let gpu_mem_pct = if row.gpu_mem_total_gb > 0.0 {
+            row.gpu_mem_used_gb / row.gpu_mem_total_gb * 100.0
+        } else {
+            0.0
+        };
+        gpu_mem_used.push(MetricPoint {
+            step: elapsed_min,
+            value: gpu_mem_pct,
+        });
+
+        gpu_util.push(MetricPoint {
+            step: elapsed_min,
+            value: row.gpu_util_pct,
+        });
+    }
+
+    if !ram_used.is_empty() {
+        metrics.insert("sys/ram %".to_string(), ram_used);
+    }
+    if !gpu_mem_used.is_empty() {
+        metrics.insert("sys/gpu mem %".to_string(), gpu_mem_used);
+    }
+    if !gpu_util.is_empty() {
+        metrics.insert("sys/gpu util %".to_string(), gpu_util);
+    }
+
+    metrics
 }
 
 type ExampleGroupBuilder = (Vec<PathBuf>, Vec<ExampleMeta>, f64, usize, Option<Example>);

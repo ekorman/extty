@@ -253,6 +253,7 @@ struct App {
     config_cursor: usize,
     config_copied_at: Option<Instant>,
     selected_checkpoint: usize,
+    show_system_metrics: bool,
 }
 
 impl App {
@@ -343,6 +344,7 @@ impl App {
             config_cursor: 0,
             config_copied_at: None,
             selected_checkpoint: 0,
+            show_system_metrics: false,
         }
     }
 
@@ -1332,20 +1334,32 @@ impl App {
 
         let mut cards = Vec::new();
 
-        let mut metric_names: Vec<&String> = run.metrics.keys().collect();
+        let mut metric_names: Vec<&String> = run
+            .metrics
+            .keys()
+            .filter(|n| {
+                if self.show_system_metrics {
+                    n.starts_with("sys/")
+                } else {
+                    !n.starts_with("sys/")
+                }
+            })
+            .collect();
         metric_names.sort();
         for name in metric_names {
             cards.push(Card::Chart { name: name.clone() });
         }
 
-        let mut example_names: Vec<&String> = run.examples.keys().collect();
-        example_names.sort();
-        for name in example_names {
-            cards.push(Card::Examples { name: name.clone() });
-        }
+        if !self.show_system_metrics {
+            let mut example_names: Vec<&String> = run.examples.keys().collect();
+            example_names.sort();
+            for name in example_names {
+                cards.push(Card::Examples { name: name.clone() });
+            }
 
-        if !run.checkpoints.is_empty() {
-            cards.push(Card::Checkpoints);
+            if !run.checkpoints.is_empty() {
+                cards.push(Card::Checkpoints);
+            }
         }
 
         cards
@@ -1374,35 +1388,46 @@ impl App {
     }
 
     fn compare_cards(&self) -> Vec<Card> {
+        let show_sys = self.show_system_metrics;
         let mut metric_names: Vec<String> = self
             .compared_runs
             .iter()
             .filter_map(|&idx| self.runs.get(idx))
             .flat_map(|run| run.metrics.keys().cloned())
+            .filter(|n| {
+                if show_sys {
+                    n.starts_with("sys/")
+                } else {
+                    !n.starts_with("sys/")
+                }
+            })
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
         metric_names.sort();
 
-        let mut example_names: Vec<String> = self
-            .compared_runs
-            .iter()
-            .filter_map(|&idx| self.runs.get(idx))
-            .flat_map(|run| run.examples.keys().cloned())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        example_names.sort();
-
         let mut cards: Vec<Card> = metric_names
             .into_iter()
             .map(|name| Card::Chart { name })
             .collect();
-        cards.extend(
-            example_names
+
+        if !show_sys {
+            let mut example_names: Vec<String> = self
+                .compared_runs
+                .iter()
+                .filter_map(|&idx| self.runs.get(idx))
+                .flat_map(|run| run.examples.keys().cloned())
+                .collect::<HashSet<_>>()
                 .into_iter()
-                .map(|name| Card::Examples { name }),
-        );
+                .collect();
+            example_names.sort();
+
+            cards.extend(
+                example_names
+                    .into_iter()
+                    .map(|name| Card::Examples { name }),
+            );
+        }
         cards
     }
 
@@ -1987,6 +2012,11 @@ impl App {
                     self.starred_runs.insert(name);
                 }
                 save_starred_runs(&self.starred_runs);
+            }
+            KeyCode::Char('S') => {
+                self.show_system_metrics = !self.show_system_metrics;
+                self.selected_card = 0;
+                self.scroll_offset = 0;
             }
             KeyCode::Char('m')
                 if !self.runs.is_empty() && self.runs[self.selected_run].is_running() =>
@@ -4052,6 +4082,21 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         Span::styled("p", Style::default().fg(NEON_CYAN)),
         Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
     ];
+    if run.metrics.keys().any(|k| k.starts_with("sys/")) {
+        let sys_hint = if app.show_system_metrics {
+            "train"
+        } else {
+            "system"
+        };
+        footer_spans.extend([
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("S", Style::default().fg(NEON_CYAN)),
+            Span::styled(
+                format!("] {}  ", sys_hint),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
     if app.show_config {
         footer_spans.extend([
             Span::styled("[", Style::default().fg(DIM_CYAN)),
