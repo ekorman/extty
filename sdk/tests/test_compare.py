@@ -99,6 +99,14 @@ class TestReduceMetric:
     def test_default_reduction_is_last(self) -> None:
         assert reduce_metric(self._pts([1.0, 5.0])) == 5.0
 
+    def test_zero_span_raises(self) -> None:
+        with pytest.raises(ValueError, match="Span must be positive"):
+            reduce_metric(self._pts([1.0]), "mean:0")
+
+    def test_negative_span_raises(self) -> None:
+        with pytest.raises(ValueError, match="Span must be positive"):
+            reduce_metric(self._pts([1.0]), "ema:-1")
+
 
 class TestConfigDiff:
     def test_finds_differing_keys(self, tmp_path: Path) -> None:

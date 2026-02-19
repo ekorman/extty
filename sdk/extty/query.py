@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -165,11 +167,15 @@ def get_runs(project: str | None = None) -> list[RunData]:
                 continue
             if not (run_dir / "meta.json").exists():
                 continue
-            storage = RunStorage.open_readonly(run_dir)
-            meta = storage.read_meta()
-            if meta is None:
+            try:
+                storage = RunStorage.open_readonly(run_dir)
+                meta = storage.read_meta()
+                if meta is None:
+                    continue
+                result.append(_run_data_from_meta(meta, storage))
+            except (json.JSONDecodeError, KeyError):
+                warnings.warn(f"Skipping run with invalid meta.json: {run_dir}")
                 continue
-            result.append(_run_data_from_meta(meta, storage))
 
     result.sort(key=lambda r: r.started_at, reverse=True)
     return result

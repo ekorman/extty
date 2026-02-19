@@ -944,6 +944,26 @@ class TestRunDataReading:
         ):
             assert extty.get_runs() == []
 
+    def test_get_runs_skips_corrupt_meta(self, tmp_path: Path) -> None:
+        """Test that get_runs skips runs with corrupt meta.json."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj", name="good-run", system_metrics=False)
+            extty.finish()
+
+            corrupt_dir = tmp_path / "runs" / "proj" / "bad-run"
+            corrupt_dir.mkdir(parents=True)
+            (corrupt_dir / "meta.json").write_text("{invalid json")
+
+            import warnings
+
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                runs = extty.get_runs(project="proj")
+            assert len(runs) == 1
+            assert runs[0].name == "good-run"
+            assert any("invalid meta.json" in str(warning.message) for warning in w)
+
     def test_metric_names(self, tmp_path: Path) -> None:
         """Test that metric_names discovers all logged metrics."""
         m1, m2 = self._mock_runs_dir(tmp_path)

@@ -17,7 +17,7 @@ def _require_pandas():
     except ImportError:
         raise ImportError(
             "pandas is required for this function. "
-            "Install with: pip install extty[compare]"
+            "Install with: pip install extty[run-analysis]"
         )
 
 
@@ -30,7 +30,7 @@ def _require_matplotlib():
     except ImportError:
         raise ImportError(
             "matplotlib is required for this function. "
-            "Install with: pip install extty[compare]"
+            "Install with: pip install extty[run-analysis]"
         )
 
 
@@ -78,6 +78,8 @@ def _parse_reduction(spec: str) -> Callable[[list[MetricPoint]], float]:
             raise ValueError(
                 f"Invalid span in reduction '{spec}': expected integer after ':'"
             )
+        if n <= 0:
+            raise ValueError(f"Span must be positive in reduction '{spec}', got {n}")
 
         if name == "mean":
             return lambda pts, _n=n: sum(p.value for p in pts[-_n:]) / min(len(pts), _n)
