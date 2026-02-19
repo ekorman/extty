@@ -869,14 +869,16 @@ class TestRunDataReading:
         runs_dir = tmp_path / "runs"
         return (
             mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
-            mock.patch("extty.get_runs_dir", return_value=runs_dir),
+            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
         )
 
     def test_get_run_loads_metadata(self, tmp_path: Path) -> None:
         """Test that get_run returns RunData with correct metadata."""
         m1, m2 = self._mock_runs_dir(tmp_path)
         with m1, m2:
-            extty.init("myproject", name="run-1", config={"lr": 0.001}, system_metrics=False)
+            extty.init(
+                "myproject", name="run-1", config={"lr": 0.001}, system_metrics=False
+            )
             extty.log({"train/loss": 0.5}, step=0)
             extty.finish()
 
@@ -937,7 +939,9 @@ class TestRunDataReading:
 
     def test_get_runs_empty_dir(self, tmp_path: Path) -> None:
         """Test get_runs with no runs dir returns empty list."""
-        with mock.patch("extty.get_runs_dir", return_value=tmp_path / "nonexistent"):
+        with mock.patch(
+            "extty.query.get_runs_dir", return_value=tmp_path / "nonexistent"
+        ):
             assert extty.get_runs() == []
 
     def test_metric_names(self, tmp_path: Path) -> None:
@@ -1022,11 +1026,7 @@ class TestRunDataReading:
         with m1, m2:
             extty.init("proj", name="run-1", system_metrics=False)
             extty.log(
-                {
-                    "val/example": extty.Example(
-                        prompt="Hello", responses=["Hi"]
-                    )
-                },
+                {"val/example": extty.Example(prompt="Hello", responses=["Hi"])},
                 step=0,
             )
             extty.finish()

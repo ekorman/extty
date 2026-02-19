@@ -220,6 +220,7 @@ class RunStorage:
     """Handles all file I/O for a single run."""
 
     run_dir: Path
+    _readonly: bool = field(default=False, repr=False)
     _metric_files: dict[str, Any] = field(default_factory=dict, repr=False)
     _system_file: Any = field(default=None, repr=False)
     _buffer: list[tuple[str, int, float, float]] = field(
@@ -230,22 +231,15 @@ class RunStorage:
     _flush_interval: float = 1.0
 
     def __post_init__(self) -> None:
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        (self.run_dir / "metrics").mkdir(exist_ok=True)
-        (self.run_dir / "examples").mkdir(exist_ok=True)
+        if not self._readonly:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            (self.run_dir / "metrics").mkdir(exist_ok=True)
+            (self.run_dir / "examples").mkdir(exist_ok=True)
 
     @classmethod
     def open_readonly(cls, run_dir: Path) -> RunStorage:
         """Open an existing run directory for reading without creating directories."""
-        obj = cls.__new__(cls)
-        obj.run_dir = run_dir
-        obj._metric_files = {}
-        obj._system_file = None
-        obj._buffer = []
-        obj._buffer_size = 10
-        obj._last_flush = 0.0
-        obj._flush_interval = 1.0
-        return obj
+        return cls(run_dir=run_dir, _readonly=True)
 
     def write_meta(self, meta: MetaData) -> None:
         """Write or update the meta.json file."""
