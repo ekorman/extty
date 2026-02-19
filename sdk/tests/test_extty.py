@@ -859,3 +859,230 @@ class TestSaveCheckpoint:
             with pytest.raises(RuntimeError, match="S3 storage is not configured"):
                 run.save_checkpoint(step=1, path="/nonexistent")
             extty.finish()
+
+
+class TestRunDataReading:
+    """Tests for RunData, get_run(), and get_runs() read-path API."""
+
+    def _mock_runs_dir(self, tmp_path: Path):
+        """Context manager that patches get_runs_dir in both modules."""
+        runs_dir = tmp_path / "runs"
+        return (
+            mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
+            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+        )
+
+    def test_get_run_loads_metadata(self, tmp_path: Path) -> None:
+        """Test that get_run returns RunData with correct metadata."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init(
+                "myproject", name="run-1", config={"lr": 0.001}, system_metrics=False
+            )
+            extty.log({"train/loss": 0.5}, step=0)
+            extty.finish()
+
+            run = extty.get_run("myproject", "run-1")
+            assert run.project == "myproject"
+            assert run.name == "run-1"
+            assert run.config["lr"] == 0.001
+            assert run.status == "completed"
+            assert run.finished_at is not None
+
+    def test_get_run_not_found_raises(self, tmp_path: Path) -> None:
+        """Test that get_run raises FileNotFoundError for missing runs."""
+        _, m2 = self._mock_runs_dir(tmp_path)
+        with m2:
+            with pytest.raises(FileNotFoundError):
+                extty.get_run("nonexistent", "no-run")
+
+    def test_get_runs_returns_all(self, tmp_path: Path) -> None:
+        """Test that get_runs returns all runs across projects."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj-a", name="run-1", system_metrics=False)
+            extty.finish()
+            extty.init("proj-b", name="run-2", system_metrics=False)
+            extty.finish()
+
+            runs = extty.get_runs()
+            assert len(runs) == 2
+            projects = {r.project for r in runs}
+            assert projects == {"proj-a", "proj-b"}
+
+    def test_get_runs_filters_by_project(self, tmp_path: Path) -> None:
+        """Test that get_runs filters by project name."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj-a", name="run-1", system_metrics=False)
+            extty.finish()
+            extty.init("proj-b", name="run-2", system_metrics=False)
+            extty.finish()
+
+            runs = extty.get_runs(project="proj-a")
+            assert len(runs) == 1
+            assert runs[0].project == "proj-a"
+
+    def test_get_runs_sorted_by_started_at(self, tmp_path: Path) -> None:
+        """Test that get_runs returns runs sorted most recent first."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj", name="older-run", system_metrics=False)
+            extty.finish()
+            extty.init("proj", name="newer-run", system_metrics=False)
+            extty.finish()
+
+            runs = extty.get_runs(project="proj")
+            assert len(runs) == 2
+            assert runs[0].name == "newer-run"
+            assert runs[1].name == "older-run"
+
+    def test_get_runs_empty_dir(self, tmp_path: Path) -> None:
+        """Test get_runs with no runs dir returns empty list."""
+        with mock.patch(
+            "extty.query.get_runs_dir", return_value=tmp_path / "nonexistent"
+        ):
+            assert extty.get_runs() == []
+
+    def test_get_runs_skips_corrupt_meta(self, tmp_path: Path) -> None:
+        """Test that get_runs skips runs with corrupt meta.json."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj", name="good-run", system_metrics=False)
+            extty.finish()
+
+            corrupt_dir = tmp_path / "runs" / "proj" / "bad-run"
+            corrupt_dir.mkdir(parents=True)
+            (corrupt_dir / "meta.json").write_text("{invalid json")
+
+            import warnings
+
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                runs = extty.get_runs(project="proj")
+            assert len(runs) == 1
+            assert runs[0].name == "good-run"
+            assert any("invalid meta.json" in str(warning.message) for warning in w)
+
+    def test_metric_names(self, tmp_path: Path) -> None:
+        """Test that metric_names discovers all logged metrics."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj", name="run-1", system_metrics=False)
+            extty.log({"train/loss": 0.5, "train/acc": 0.8}, step=0)
+            extty.finish()
+
+            run = extty.get_run("proj", "run-1")
+            names = run.metric_names
+            assert "train/loss" in names
+            assert "train/acc" in names
+
+    def test_metric_returns_points(self, tmp_path: Path) -> None:
+        """Test that metric() returns correct MetricPoint values."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj", name="run-1", system_metrics=False)
+            extty.log({"loss": 0.5}, step=0)
+            extty.log({"loss": 0.3}, step=1)
+            extty.log({"loss": 0.1}, step=2)
+            extty.finish()
+
+            run = extty.get_run("proj", "run-1")
+            points = run.metric("loss")
+            assert len(points) == 3
+            assert points[0].step == 0
+            assert points[0].value == 0.5
+            assert points[2].step == 2
+            assert points[2].value == 0.1
+
+    def test_metric_not_found_raises(self, tmp_path: Path) -> None:
+        """Test that metric() raises FileNotFoundError for missing metrics."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj", name="run-1", system_metrics=False)
+            extty.finish()
+
+            run = extty.get_run("proj", "run-1")
+            with pytest.raises(FileNotFoundError):
+                run.metric("nonexistent")
+
+    def test_system_metrics(self, tmp_path: Path) -> None:
+        """Test reading system metrics from a run."""
+        _, m2 = self._mock_runs_dir(tmp_path)
+        with m2:
+            run_dir = tmp_path / "runs" / "proj" / "run-1"
+            storage = RunStorage(run_dir=run_dir)
+            meta = MetaData(
+                project="proj",
+                run_name="run-1",
+                config={},
+                started_at="2024-01-01T00:00:00Z",
+                status="completed",
+            )
+            storage.write_meta(meta)
+            storage.log_system(8.0, 32.0, 4.0, 24.0, 50.0)
+            storage.log_system(9.0, 32.0, 5.0, 24.0, 60.0)
+
+            run = extty.get_run("proj", "run-1")
+            sys_metrics = run.system_metrics
+            assert len(sys_metrics) == 2
+            assert sys_metrics[0].ram_used_gb == 8.0
+            assert sys_metrics[0].gpu_util_pct == 50.0
+            assert sys_metrics[1].ram_used_gb == 9.0
+
+    def test_system_metrics_empty(self, tmp_path: Path) -> None:
+        """Test that system_metrics returns empty list when no system.csv."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj", name="run-1", system_metrics=False)
+            extty.finish()
+
+            run = extty.get_run("proj", "run-1")
+            assert run.system_metrics == []
+
+    def test_example_names_and_data(self, tmp_path: Path) -> None:
+        """Test reading example data from a run."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj", name="run-1", system_metrics=False)
+            extty.log(
+                {"val/example": extty.Example(prompt="Hello", responses=["Hi"])},
+                step=0,
+            )
+            extty.finish()
+
+            run = extty.get_run("proj", "run-1")
+            assert "val/example" in run.example_names
+            examples = run.examples("val/example")
+            assert len(examples) == 1
+            assert examples[0].step == 0
+            assert examples[0].data["prompt"] == ["Hello"]
+
+    def test_duration_seconds(self, tmp_path: Path) -> None:
+        """Test duration_seconds computation."""
+        m1, m2 = self._mock_runs_dir(tmp_path)
+        with m1, m2:
+            extty.init("proj", name="run-1", system_metrics=False)
+            extty.finish()
+
+            run = extty.get_run("proj", "run-1")
+            assert run.duration_seconds is not None
+            assert run.duration_seconds >= 0
+
+    def test_duration_seconds_none_when_running(self, tmp_path: Path) -> None:
+        """Test duration_seconds returns None for unfinished runs."""
+        _, m2 = self._mock_runs_dir(tmp_path)
+        with m2:
+            run_dir = tmp_path / "runs" / "proj" / "run-1"
+            storage = RunStorage(run_dir=run_dir)
+            meta = MetaData(
+                project="proj",
+                run_name="run-1",
+                config={},
+                started_at="2024-01-01T00:00:00Z",
+                status="running",
+            )
+            storage.write_meta(meta)
+
+            run = extty.get_run("proj", "run-1")
+            assert run.duration_seconds is None

@@ -9,8 +9,17 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Callable, ParamSpec, TypeVar
 
 from extty.example import BatchExample, Example
+from extty.compare import compare, config_diff, plot_metric, reduce_metric
+from extty.query import RunData, get_run, get_runs
 from extty.run import Run
-from extty.storage import log_model_evaluation, generate_random_name, get_runs_dir
+from extty.storage import (
+    ExampleRecord,
+    MetricPoint,
+    SystemMetricPoint,
+    log_model_evaluation,
+    generate_random_name,
+    get_runs_dir,
+)
 from extty.s3 import S3Config
 
 __all__ = [
@@ -20,10 +29,20 @@ __all__ = [
     "save_checkpoint",
     "finish",
     "Run",
+    "RunData",
+    "get_runs",
+    "get_run",
     "push",
     "list_local_runs",
+    "compare",
+    "config_diff",
+    "plot_metric",
+    "reduce_metric",
     "Example",
     "BatchExample",
+    "MetricPoint",
+    "SystemMetricPoint",
+    "ExampleRecord",
 ]
 
 # Version is managed by setuptools_scm
@@ -305,23 +324,10 @@ def list_local_runs(project: str | None = None) -> list[tuple[str, str]]:
     Returns
     -------
     list[tuple[str, str]]
-        List of (project, run_name) tuples.
+        List of (project, run_name) tuples, sorted by start time
+        (most recent first).
     """
-    runs_dir = get_runs_dir()
-    if not runs_dir.exists():
-        return []
-
-    result = []
-    for proj_dir in runs_dir.iterdir():
-        if not proj_dir.is_dir():
-            continue
-        proj_name = proj_dir.name
-        if project is not None and proj_name != project:
-            continue
-        for run_dir in proj_dir.iterdir():
-            if run_dir.is_dir() and (run_dir / "meta.json").exists():
-                result.append((proj_name, run_dir.name))
-    return result
+    return [(r.project, r.name) for r in get_runs(project=project)]
 
 
 def push(
