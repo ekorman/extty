@@ -1218,3 +1218,31 @@ pub fn save_starred_runs(starred: &HashSet<String>) {
         let _ = fs::write(&path, json);
     }
 }
+
+fn notes_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".extty")
+        .join("notes.json")
+}
+
+pub fn load_run_notes() -> HashMap<String, String> {
+    let path = notes_path();
+    let Ok(content) = fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(notes) = serde_json::from_str::<HashMap<String, String>>(&content) else {
+        return HashMap::new();
+    };
+    notes
+}
+
+pub fn save_run_notes(notes: &HashMap<String, String>) {
+    let path = notes_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(notes) {
+        let _ = fs::write(&path, json);
+    }
+}

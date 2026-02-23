@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -10,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Local;
 use dialoguer::{Select, theme::ColorfulTheme};
 
+use crate::data::{self, RunStatus};
 use crate::infra::{
     self, InfraConfig, Instance, InstanceStatus, Provider, ScriptOptions, generate_script,
     get_provider, project_remote_dir,
@@ -234,6 +236,25 @@ fn fetch_running_instances(
     }
 }
 
+fn count_active_runs_per_instance() -> HashMap<String, usize> {
+    let runs = data::load_runs_lightweight();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for run in &runs {
+        if run.status != RunStatus::Running {
+            continue;
+        }
+        let instance_id = run
+            .config
+            .as_ref()
+            .and_then(|c| c.get("_instance_id"))
+            .and_then(|v| v.as_str());
+        if let Some(id) = instance_id {
+            *counts.entry(id.to_string()).or_default() += 1;
+        }
+    }
+    counts
+}
+
 fn select_instance(config: &InfraConfig, opts: &RunOptions, log: &mut LogFile) -> Result<Instance> {
     if let Some(ref id_or_name) = opts.instance_id {
         return find_instance_by_id_or_name(config, id_or_name, opts, log);
@@ -254,15 +275,28 @@ fn select_instance(config: &InfraConfig, opts: &RunOptions, log: &mut LogFile) -
         bail!("No running instances found");
     }
 
+    let active_runs = count_active_runs_per_instance();
+
     let labels: Vec<String> = instances
         .iter()
         .map(|i| {
+            let key = format!("{}:{}", i.provider.as_str(), i.id);
+            let run_count = active_runs.get(&key).copied().unwrap_or(0);
+            let runs_label = if run_count == 1 { "run" } else { "runs" };
+            let color = if run_count == 0 {
+                "\x1b[32m"
+            } else {
+                "\x1b[33m"
+            };
             format!(
-                "{} - {} ({}) [{}]",
+                "{} - {} ({}) [{}] {}({} active {})\x1b[0m",
                 i.display_name(),
                 i.instance_type,
                 i.ip.as_deref().unwrap_or("?"),
-                i.provider.display_name()
+                i.provider.display_name(),
+                color,
+                run_count,
+                runs_label,
             )
         })
         .collect();

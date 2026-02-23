@@ -42,8 +42,9 @@ mod run;
 mod s3;
 use data::{
     Checkpoint, Evaluation, Example, ExampleGroup, MetricPoint, Model, Reward, Run,
-    delete_evaluation, delete_model, load_all_evaluations, load_models, load_runs_lightweight,
-    load_starred_runs, mark_run_completed, save_starred_runs,
+    delete_evaluation, delete_model, load_all_evaluations, load_models, load_run_notes,
+    load_runs_lightweight, load_starred_runs, mark_run_completed, save_run_notes,
+    save_starred_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, ScriptOptions,
@@ -242,6 +243,7 @@ struct App {
     setup_rx: Option<mpsc::Receiver<SetupMessage>>,
     compared_runs: Vec<usize>,
     starred_runs: HashSet<String>,
+    run_notes: HashMap<String, String>,
     compare_focused: bool,
     s3_pull_rx: Option<mpsc::Receiver<S3PullMessage>>,
     s3_pull_status: Option<String>,
@@ -249,6 +251,9 @@ struct App {
     cached_example: Option<(String, usize, Example)>,
     goto_step_input: Option<String>,
     pull_run_modal_open: bool,
+    note_modal_open: bool,
+    note_modal_input: String,
+    note_modal_run_name: String,
     pull_run_input: String,
     config_cursor: usize,
     config_copied_at: Option<Instant>,
@@ -333,6 +338,7 @@ impl App {
             setup_rx: None,
             compared_runs: Vec::new(),
             starred_runs: load_starred_runs(),
+            run_notes: load_run_notes(),
             compare_focused: false,
             s3_pull_rx: None,
             s3_pull_status: None,
@@ -340,6 +346,9 @@ impl App {
             cached_example: None,
             goto_step_input: None,
             pull_run_modal_open: false,
+            note_modal_open: false,
+            note_modal_input: String::new(),
+            note_modal_run_name: String::new(),
             pull_run_input: String::new(),
             config_cursor: 0,
             config_copied_at: None,
@@ -1600,6 +1609,11 @@ impl App {
             return;
         }
 
+        if self.note_modal_open {
+            self.handle_note_modal_key(code);
+            return;
+        }
+
         if self.pull_run_modal_open {
             self.handle_pull_run_modal_key(code);
             return;
@@ -1715,6 +1729,36 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.pull_run_input.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_note_modal_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.note_modal_open = false;
+                self.note_modal_input.clear();
+                self.note_modal_run_name.clear();
+            }
+            KeyCode::Enter => {
+                let name = self.note_modal_run_name.clone();
+                let input = self.note_modal_input.trim().to_string();
+                self.note_modal_open = false;
+                self.note_modal_input.clear();
+                self.note_modal_run_name.clear();
+                if input.is_empty() {
+                    self.run_notes.remove(&name);
+                } else {
+                    self.run_notes.insert(name, input);
+                }
+                save_run_notes(&self.run_notes);
+            }
+            KeyCode::Char(c) => {
+                self.note_modal_input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.note_modal_input.pop();
             }
             _ => {}
         }
@@ -1860,6 +1904,14 @@ impl App {
                         self.starred_runs.insert(name);
                     }
                     save_starred_runs(&self.starred_runs);
+                }
+            }
+            KeyCode::Char('n') => {
+                if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
+                    let name = self.runs[*run_index].display_name();
+                    self.note_modal_input = self.run_notes.get(&name).cloned().unwrap_or_default();
+                    self.note_modal_run_name = name;
+                    self.note_modal_open = true;
                 }
             }
             KeyCode::Char('d') => {
@@ -2012,6 +2064,12 @@ impl App {
                     self.starred_runs.insert(name);
                 }
                 save_starred_runs(&self.starred_runs);
+            }
+            KeyCode::Char('n') if !self.runs.is_empty() => {
+                let name = self.runs[self.selected_run].display_name();
+                self.note_modal_input = self.run_notes.get(&name).cloned().unwrap_or_default();
+                self.note_modal_run_name = name;
+                self.note_modal_open = true;
             }
             KeyCode::Char('S') => {
                 self.show_system_metrics = !self.show_system_metrics;
@@ -3580,6 +3638,9 @@ fn render(app: &App, frame: &mut Frame) {
     if app.pull_run_modal_open {
         render_pull_run_modal(app, frame);
     }
+    if app.note_modal_open {
+        render_note_modal(app, frame);
+    }
 }
 
 fn render_runs_list(app: &App, frame: &mut Frame) {
@@ -3678,7 +3739,8 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
                         Color::DarkGray
                     };
 
-                    let is_starred = app.starred_runs.contains(&run.display_name());
+                    let run_display_name = run.display_name();
+                    let is_starred = app.starred_runs.contains(&run_display_name);
                     let star = if is_starred { "★" } else { " " };
                     let star_color = if is_starred {
                         NEON_YELLOW
@@ -3686,10 +3748,15 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
                         Color::DarkGray
                     };
 
+                    let has_note = app.run_notes.contains_key(&run_display_name);
+                    let note_icon = if has_note { "✎" } else { " " };
+                    let note_color = if has_note { NEON_CYAN } else { Color::DarkGray };
+
                     let spans = vec![
                         Span::styled(check, Style::default().fg(check_color)),
                         Span::styled(" ", Style::default()),
                         Span::styled(star, Style::default().fg(star_color)),
+                        Span::styled(note_icon, Style::default().fg(note_color)),
                         Span::styled(" └─ ", Style::default().fg(DIM_CYAN)),
                         Span::styled(status_icon, Style::default().fg(status_color)),
                         Span::styled(run.name.clone(), name_style),
@@ -3766,6 +3833,9 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("s", Style::default().fg(NEON_YELLOW)),
         Span::styled("] star  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("n", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] note  ", Style::default().fg(Color::DarkGray)),
     ];
     if app.compared_runs.len() >= 2 {
         help_spans.extend(vec![
@@ -4035,6 +4105,19 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         header_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
         header_spans.push(Span::styled(status.clone(), Style::default().fg(color)));
     }
+    if let Some(note) = app.run_notes.get(&run.display_name()) {
+        let display_note = if note.len() > 60 {
+            format!("{}...", &note[..57])
+        } else {
+            note.clone()
+        };
+        header_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        header_spans.push(Span::styled("✎ ", Style::default().fg(NEON_CYAN)));
+        header_spans.push(Span::styled(
+            display_note,
+            Style::default().fg(Color::White),
+        ));
+    }
     let header_text = Line::from(header_spans);
     let header = Paragraph::new(header_text).block(
         Block::default()
@@ -4081,6 +4164,9 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("p", Style::default().fg(NEON_CYAN)),
         Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("n", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] note  ", Style::default().fg(Color::DarkGray)),
     ];
     if run.metrics.keys().any(|k| k.starts_with("sys/")) {
         let sys_hint = if app.show_system_metrics {
@@ -6820,6 +6906,52 @@ fn render_pull_run_modal(app: &App, frame: &mut Frame) {
     let block = Block::default()
         .title(Span::styled(
             " Pull Run (project/run) ",
+            Style::default().fg(NEON_YELLOW).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_YELLOW))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_note_modal(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 5u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let inner_width = popup_width.saturating_sub(2) as usize;
+    let input = &app.note_modal_input;
+    let display = if input.len() >= inner_width {
+        &input[input.len() - inner_width + 1..]
+    } else {
+        input.as_str()
+    };
+    let cursor = "_";
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(display, Style::default().fg(NEON_CYAN)),
+            Span::styled(cursor, Style::default().fg(NEON_CYAN)),
+        ]),
+        Line::from(""),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Note ",
             Style::default().fg(NEON_YELLOW).bold(),
         ))
         .borders(Borders::ALL)

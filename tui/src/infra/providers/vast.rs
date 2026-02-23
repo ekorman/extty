@@ -214,12 +214,11 @@ impl CloudProvider for VastProvider {
     fn list_instance_types(&self) -> Result<Vec<InstanceType>> {
         let body = serde_json::json!({
             "verified": {"eq": true},
-            "external": {"eq": false},
             "rentable": {"eq": true},
             "num_gpus": {"gte": 1},
             "type": "on-demand",
             "order": [["dph_total", "asc"]],
-            "limit": 100,
+            "limit": 1000,
         });
 
         let response: BundlesResponse = self.post("/bundles/", &body)?;
@@ -285,7 +284,6 @@ impl CloudProvider for VastProvider {
 
         let search_body = serde_json::json!({
             "verified": {"eq": true},
-            "external": {"eq": false},
             "rentable": {"eq": true},
             "gpu_name": {"eq": gpu_name},
             "num_gpus": {"eq": num_gpus},
