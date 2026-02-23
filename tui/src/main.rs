@@ -4659,6 +4659,13 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
     }
 
     if let Some(config_area) = config_area {
+        let configs: Vec<Option<&serde_json::Value>> = app
+            .compared_runs
+            .iter()
+            .map(|&ri| app.runs.get(ri).and_then(|r| r.config.as_ref()))
+            .collect();
+        let diff_keys = collect_differing_keys(&configs);
+
         let col_constraints: Vec<Constraint> = app
             .compared_runs
             .iter()
@@ -4673,7 +4680,7 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
             if let Some(run) = app.runs.get(run_idx) {
                 if let Some(config) = &run.config {
                     let mut lines: Vec<Line> = Vec::new();
-                    render_json_value(config, 0, &mut lines);
+                    render_json_value(config, 0, &mut lines, Some(&diff_keys), "");
                     let total_lines = lines.len();
                     let visible = col_chunks[i].height.saturating_sub(2) as usize;
                     let max_scroll = total_lines.saturating_sub(visible);
@@ -4809,7 +4816,7 @@ fn render_compare_examples_card(
 
 fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value, scroll: usize) {
     let mut lines: Vec<Line> = Vec::new();
-    render_json_value(config, 0, &mut lines);
+    render_json_value(config, 0, &mut lines, None, "");
 
     let total_lines = lines.len();
     let visible = area.height.saturating_sub(2) as usize;
@@ -5032,35 +5039,105 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
-fn render_json_value(value: &serde_json::Value, indent: usize, lines: &mut Vec<Line>) {
+fn collect_differing_keys(configs: &[Option<&serde_json::Value>]) -> HashSet<String> {
+    let mut diffs = HashSet::new();
+    collect_diffs_recursive(configs, "", &mut diffs);
+    diffs
+}
+
+fn collect_diffs_recursive(
+    configs: &[Option<&serde_json::Value>],
+    prefix: &str,
+    diffs: &mut HashSet<String>,
+) {
+    let mut all_keys: Vec<String> = Vec::new();
+    for cfg in configs.iter().flatten() {
+        if let serde_json::Value::Object(map) = cfg {
+            for key in map.keys() {
+                if !all_keys.contains(key) {
+                    all_keys.push(key.clone());
+                }
+            }
+        }
+    }
+
+    for key in &all_keys {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{}.{}", prefix, key)
+        };
+
+        let values: Vec<Option<&serde_json::Value>> = configs
+            .iter()
+            .map(|cfg| cfg.and_then(|c| c.get(key)))
+            .collect();
+
+        let present: Vec<&serde_json::Value> = values.iter().copied().flatten().collect();
+
+        if present.len() != configs.iter().filter(|c| c.is_some()).count() {
+            diffs.insert(path.clone());
+        } else if present.len() >= 2 {
+            let all_objects = present.iter().all(|v| v.is_object());
+            if all_objects {
+                let sub_configs: Vec<Option<&serde_json::Value>> =
+                    present.iter().map(|v| Some(*v)).collect();
+                collect_diffs_recursive(&sub_configs, &path, diffs);
+            } else if !present.windows(2).all(|w| w[0] == w[1]) {
+                diffs.insert(path.clone());
+            }
+        }
+    }
+}
+
+fn render_json_value(
+    value: &serde_json::Value,
+    indent: usize,
+    lines: &mut Vec<Line>,
+    diff_keys: Option<&HashSet<String>>,
+    path_prefix: &str,
+) {
     let pad = "  ".repeat(indent);
     match value {
         serde_json::Value::Object(map) => {
             for (key, val) in map {
+                let path = if path_prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", path_prefix, key)
+                };
+                let is_diff = diff_keys.is_some_and(|d| d.contains(&path));
                 match val {
                     serde_json::Value::Object(_) => {
                         lines.push(Line::from(vec![
                             Span::styled(pad.clone(), Style::default()),
                             Span::styled(format!("{}:", key), Style::default().fg(NEON_MAGENTA)),
                         ]));
-                        render_json_value(val, indent + 1, lines);
+                        render_json_value(val, indent + 1, lines, diff_keys, &path);
                     }
                     serde_json::Value::Array(arr) => {
+                        let val_style = if is_diff {
+                            Style::default().fg(NEON_YELLOW).bold()
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
                         lines.push(Line::from(vec![
                             Span::styled(pad.clone(), Style::default()),
                             Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
-                            Span::styled(
-                                format!("[{}]", arr.len()),
-                                Style::default().fg(Color::DarkGray),
-                            ),
+                            Span::styled(format!("[{}]", arr.len()), val_style),
                         ]));
                     }
                     _ => {
                         let val_str = truncate_str(&format_json_primitive(val), 28);
+                        let val_style = if is_diff {
+                            Style::default().fg(NEON_YELLOW).bold()
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
                         lines.push(Line::from(vec![
                             Span::styled(pad.clone(), Style::default()),
                             Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
-                            Span::styled(val_str, Style::default().fg(Color::White)),
+                            Span::styled(val_str, val_style),
                         ]));
                     }
                 }
@@ -6200,7 +6277,7 @@ fn render_focused_evaluation(
     if let Some(config_area) = config_area {
         let config_content: Vec<Line> = if let Some(config) = model_config {
             let mut lines = Vec::new();
-            render_json_value(config, 0, &mut lines);
+            render_json_value(config, 0, &mut lines, None, "");
             lines
         } else {
             vec![Line::from(Span::styled(
@@ -6277,7 +6354,7 @@ fn render_focused_evaluation(
 
         // Add config
         if let Some(config) = &eval.config {
-            render_json_value(config, 0, &mut config_content);
+            render_json_value(config, 0, &mut config_content, None, "");
         } else if config_content.is_empty() {
             config_content.push(Line::from(Span::styled(
                 "No config",
@@ -6399,7 +6476,7 @@ fn render_focused_evaluation(
 
         // Add config
         if let Some(config) = &eval.config {
-            render_json_value(config, 0, &mut config_content);
+            render_json_value(config, 0, &mut config_content, None, "");
         } else if config_content.is_empty() {
             config_content.push(Line::from(Span::styled(
                 "No config",
