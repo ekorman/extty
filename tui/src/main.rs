@@ -2024,6 +2024,7 @@ impl App {
                 self.scroll_offset = 0;
                 self.config_panel_scroll = 0;
                 self.cached_example = None;
+                self.ensure_run_loaded(self.selected_run);
             }
             KeyCode::Char(']') if self.selected_run < self.runs.len().saturating_sub(1) => {
                 self.selected_run += 1;
@@ -2031,6 +2032,7 @@ impl App {
                 self.scroll_offset = 0;
                 self.config_panel_scroll = 0;
                 self.cached_example = None;
+                self.ensure_run_loaded(self.selected_run);
             }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
@@ -4357,7 +4359,12 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
     let Some(run) = app.current_run() else { return };
 
     if cards.is_empty() {
-        frame.render_widget(Paragraph::new("No data"), area);
+        let msg = if run.data_loaded {
+            "No data"
+        } else {
+            "Loading..."
+        };
+        frame.render_widget(Paragraph::new(msg), area);
         return;
     }
 
