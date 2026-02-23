@@ -3394,10 +3394,7 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
                         app.s3_pull_time = Some(Instant::now());
                         app.s3_pull_rx = None;
                         app.refresh_runs();
-                        if matches!(app.view, View::RunDetail | View::Focused)
-                            && !app.compare_focused
-                            && let Some(run) = app.runs.get(app.selected_run)
-                        {
+                        if let Some(run) = app.runs.get(app.selected_run) {
                             let path = run.path.clone();
                             if let Some(updated) = data::reload_run(&path) {
                                 app.runs[app.selected_run] = updated;
