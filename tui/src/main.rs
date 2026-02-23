@@ -143,6 +143,13 @@ enum AddMachineField {
     Name,
 }
 
+#[derive(Clone, Copy, PartialEq, Default)]
+enum FilterPhase {
+    #[default]
+    KeySelect,
+    ValueSelect,
+}
+
 // A card in the detail grid - either a chart, example group, or evaluation
 #[derive(Clone)]
 enum Card {
@@ -259,6 +266,12 @@ struct App {
     config_copied_at: Option<Instant>,
     selected_checkpoint: usize,
     show_system_metrics: bool,
+    config_filters: Vec<(String, String)>,
+    filter_modal_open: bool,
+    filter_modal_phase: FilterPhase,
+    filter_modal_input: String,
+    filter_modal_selected: usize,
+    filter_modal_key: String,
 }
 
 impl App {
@@ -354,6 +367,12 @@ impl App {
             config_copied_at: None,
             selected_checkpoint: 0,
             show_system_metrics: false,
+            config_filters: Vec::new(),
+            filter_modal_open: false,
+            filter_modal_phase: FilterPhase::default(),
+            filter_modal_input: String::new(),
+            filter_modal_selected: 0,
+            filter_modal_key: String::new(),
         }
     }
 
@@ -370,6 +389,9 @@ impl App {
         let mut projects: BTreeMap<String, Vec<usize>> = BTreeMap::new();
 
         for (i, run) in self.runs.iter().enumerate() {
+            if !self.config_filters.is_empty() && !run_matches_filters(run, &self.config_filters) {
+                continue;
+            }
             let project = run
                 .project
                 .clone()
@@ -1609,6 +1631,11 @@ impl App {
             return;
         }
 
+        if self.filter_modal_open {
+            self.handle_filter_modal_key(code);
+            return;
+        }
+
         if self.note_modal_open {
             self.handle_note_modal_key(code);
             return;
@@ -1761,6 +1788,124 @@ impl App {
                 self.note_modal_input.pop();
             }
             _ => {}
+        }
+    }
+
+    fn filtered_config_keys(&self) -> Vec<String> {
+        let all = collect_config_keys(&self.runs);
+        let query = self.filter_modal_input.to_lowercase();
+        if query.is_empty() {
+            all
+        } else {
+            all.into_iter()
+                .filter(|k| k.to_lowercase().contains(&query))
+                .collect()
+        }
+    }
+
+    fn filtered_config_values(&self) -> Vec<String> {
+        let all = collect_config_values(&self.runs, &self.filter_modal_key);
+        let query = self.filter_modal_input.to_lowercase();
+        if query.is_empty() {
+            all
+        } else {
+            all.into_iter()
+                .filter(|v| v.to_lowercase().contains(&query))
+                .collect()
+        }
+    }
+
+    fn handle_filter_modal_key(&mut self, code: KeyCode) {
+        match self.filter_modal_phase {
+            FilterPhase::KeySelect => match code {
+                KeyCode::Esc => {
+                    self.filter_modal_open = false;
+                }
+                KeyCode::Char('d') => {
+                    let num_filters = self.config_filters.len();
+                    if num_filters > 0 && self.filter_modal_selected < num_filters {
+                        self.config_filters.remove(self.filter_modal_selected);
+                        if self.filter_modal_selected >= self.config_filters.len()
+                            && self.filter_modal_selected > 0
+                        {
+                            self.filter_modal_selected -= 1;
+                        }
+                        self.selected_list_item = 0;
+                    } else {
+                        self.filter_modal_input.push('d');
+                        self.filter_modal_selected = 0;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    self.filter_modal_input.push(c);
+                    self.filter_modal_selected = 0;
+                }
+                KeyCode::Backspace => {
+                    self.filter_modal_input.pop();
+                    self.filter_modal_selected = 0;
+                }
+                KeyCode::Up => {
+                    if self.filter_modal_selected > 0 {
+                        self.filter_modal_selected -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    let count = self.config_filters.len() + self.filtered_config_keys().len();
+                    if self.filter_modal_selected < count.saturating_sub(1) {
+                        self.filter_modal_selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let num_filters = self.config_filters.len();
+                    let keys = self.filtered_config_keys();
+                    if self.filter_modal_selected >= num_filters {
+                        let key_idx = self.filter_modal_selected - num_filters;
+                        if let Some(key) = keys.get(key_idx) {
+                            self.filter_modal_key = key.clone();
+                            self.filter_modal_phase = FilterPhase::ValueSelect;
+                            self.filter_modal_input.clear();
+                            self.filter_modal_selected = 0;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            FilterPhase::ValueSelect => match code {
+                KeyCode::Esc => {
+                    self.filter_modal_phase = FilterPhase::KeySelect;
+                    self.filter_modal_input.clear();
+                    self.filter_modal_selected = 0;
+                }
+                KeyCode::Char(c) => {
+                    self.filter_modal_input.push(c);
+                    self.filter_modal_selected = 0;
+                }
+                KeyCode::Backspace => {
+                    self.filter_modal_input.pop();
+                    self.filter_modal_selected = 0;
+                }
+                KeyCode::Up => {
+                    if self.filter_modal_selected > 0 {
+                        self.filter_modal_selected -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    let count = self.filtered_config_values().len();
+                    if self.filter_modal_selected < count.saturating_sub(1) {
+                        self.filter_modal_selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let values = self.filtered_config_values();
+                    if let Some(val) = values.get(self.filter_modal_selected) {
+                        self.config_filters
+                            .push((self.filter_modal_key.clone(), val.clone()));
+                        self.filter_modal_open = false;
+                        self.selected_list_item = 0;
+                    }
+                }
+                _ => {}
+            },
         }
     }
 
@@ -1919,6 +2064,17 @@ impl App {
                     self.show_delete_confirm = true;
                 }
             }
+            KeyCode::Char('f') => {
+                self.filter_modal_open = true;
+                self.filter_modal_phase = FilterPhase::KeySelect;
+                self.filter_modal_input.clear();
+                self.filter_modal_selected = 0;
+                self.filter_modal_key.clear();
+            }
+            KeyCode::Char('F') => {
+                self.config_filters.clear();
+                self.selected_list_item = 0;
+            }
             _ => {}
         }
     }
@@ -2018,21 +2174,33 @@ impl App {
                 self.cached_example = None;
                 self.view = View::Focused;
             }
-            KeyCode::Char('[') if self.selected_run > 0 => {
-                self.selected_run -= 1;
-                self.selected_card = 0;
-                self.scroll_offset = 0;
-                self.config_panel_scroll = 0;
-                self.cached_example = None;
-                self.ensure_run_loaded(self.selected_run);
+            KeyCode::Char('[') => {
+                let prev = (0..self.selected_run).rev().find(|&i| {
+                    self.config_filters.is_empty()
+                        || run_matches_filters(&self.runs[i], &self.config_filters)
+                });
+                if let Some(idx) = prev {
+                    self.selected_run = idx;
+                    self.selected_card = 0;
+                    self.scroll_offset = 0;
+                    self.config_panel_scroll = 0;
+                    self.cached_example = None;
+                    self.ensure_run_loaded(self.selected_run);
+                }
             }
-            KeyCode::Char(']') if self.selected_run < self.runs.len().saturating_sub(1) => {
-                self.selected_run += 1;
-                self.selected_card = 0;
-                self.scroll_offset = 0;
-                self.config_panel_scroll = 0;
-                self.cached_example = None;
-                self.ensure_run_loaded(self.selected_run);
+            KeyCode::Char(']') => {
+                let next = (self.selected_run + 1..self.runs.len()).find(|&i| {
+                    self.config_filters.is_empty()
+                        || run_matches_filters(&self.runs[i], &self.config_filters)
+                });
+                if let Some(idx) = next {
+                    self.selected_run = idx;
+                    self.selected_card = 0;
+                    self.scroll_offset = 0;
+                    self.config_panel_scroll = 0;
+                    self.cached_example = None;
+                    self.ensure_run_loaded(self.selected_run);
+                }
             }
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
@@ -3640,6 +3808,9 @@ fn render(app: &App, frame: &mut Frame) {
     if app.note_modal_open {
         render_note_modal(app, frame);
     }
+    if app.filter_modal_open {
+        render_filter_modal(app, frame);
+    }
 }
 
 fn render_runs_list(app: &App, frame: &mut Frame) {
@@ -3657,19 +3828,13 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
                     let is_expanded = app.expanded_projects.contains(name);
                     let icon = if is_expanded { "▼ " } else { "▶ " };
 
-                    // Count runs in this project
-                    let run_count = app
-                        .runs
-                        .iter()
-                        .filter(|r| r.project.as_deref().unwrap_or("(no project)") == name)
-                        .count();
-
-                    // Check if any runs in this project are running
-                    let has_running = app
-                        .runs
-                        .iter()
-                        .filter(|r| r.project.as_deref().unwrap_or("(no project)") == name)
-                        .any(|r| r.is_running());
+                    let matching = |r: &&Run| {
+                        r.project.as_deref().unwrap_or("(no project)") == name
+                            && (app.config_filters.is_empty()
+                                || run_matches_filters(r, &app.config_filters))
+                    };
+                    let run_count = app.runs.iter().filter(matching).count();
+                    let has_running = app.runs.iter().filter(matching).any(|r| r.is_running());
 
                     let name_style = if is_selected {
                         Style::default().fg(NEON_MAGENTA).bold()
@@ -3797,6 +3962,17 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         title_spans.push(Span::styled(status.clone(), Style::default().fg(color)));
     }
 
+    if !app.config_filters.is_empty() {
+        title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        let filter_str = app
+            .config_filters
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(" & ");
+        title_spans.push(Span::styled(filter_str, Style::default().fg(NEON_YELLOW)));
+    }
+
     let list = List::new(items)
         .block(
             Block::default()
@@ -3855,8 +4031,18 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled("] pull by name  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] delete", Style::default().fg(Color::DarkGray)),
+        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("f", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] filter", Style::default().fg(Color::DarkGray)),
     ]);
+    if !app.config_filters.is_empty() {
+        help_spans.extend(vec![
+            Span::styled("  [", Style::default().fg(DIM_CYAN)),
+            Span::styled("F", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] clear filters", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
     let help = Line::from(help_spans);
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
@@ -5035,6 +5221,66 @@ fn truncate_str(s: &str, max: usize) -> String {
     } else {
         format!("{}...", s.chars().take(max).collect::<String>())
     }
+}
+
+fn resolve_config_path<'a>(
+    config: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = config;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+fn collect_config_keys(runs: &[Run]) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    for run in runs {
+        if let Some(config) = &run.config {
+            collect_keys_recursive(config, "", &mut keys);
+        }
+    }
+    keys.into_iter().collect()
+}
+
+fn collect_keys_recursive(value: &serde_json::Value, prefix: &str, keys: &mut BTreeSet<String>) {
+    if let serde_json::Value::Object(map) = value {
+        for (key, val) in map {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{}.{}", prefix, key)
+            };
+            if val.is_object() {
+                collect_keys_recursive(val, &path, keys);
+            } else {
+                keys.insert(path);
+            }
+        }
+    }
+}
+
+fn collect_config_values(runs: &[Run], key: &str) -> Vec<String> {
+    let mut values = BTreeSet::new();
+    for run in runs {
+        if let Some(config) = &run.config
+            && let Some(val) = resolve_config_path(config, key)
+        {
+            values.insert(format_json_primitive(val));
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn run_matches_filters(run: &Run, filters: &[(String, String)]) -> bool {
+    let config = match &run.config {
+        Some(c) => c,
+        None => return false,
+    };
+    filters.iter().all(|(key, val)| {
+        resolve_config_path(config, key).is_some_and(|v| format_json_primitive(v) == *val)
+    })
 }
 
 fn collect_differing_keys(configs: &[Option<&serde_json::Value>]) -> HashSet<String> {
@@ -7036,6 +7282,137 @@ fn render_note_modal(app: &App, frame: &mut Frame) {
 
     let paragraph = Paragraph::new(text).block(block);
 
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_filter_modal(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let max_list_items = 15usize;
+
+    let (items, title_str) = match app.filter_modal_phase {
+        FilterPhase::KeySelect => {
+            let keys = {
+                let all = collect_config_keys(&app.runs);
+                let query = app.filter_modal_input.to_lowercase();
+                if query.is_empty() {
+                    all
+                } else {
+                    all.into_iter()
+                        .filter(|k| k.to_lowercase().contains(&query))
+                        .collect()
+                }
+            };
+            (keys, " Filter by Config ".to_string())
+        }
+        FilterPhase::ValueSelect => {
+            let values = {
+                let all = collect_config_values(&app.runs, &app.filter_modal_key);
+                let query = app.filter_modal_input.to_lowercase();
+                if query.is_empty() {
+                    all
+                } else {
+                    all.into_iter()
+                        .filter(|v| v.to_lowercase().contains(&query))
+                        .collect()
+                }
+            };
+            (values, format!(" Filter: {} = ? ", app.filter_modal_key))
+        }
+    };
+
+    let filter_lines: Vec<Line> =
+        if app.filter_modal_phase == FilterPhase::KeySelect && !app.config_filters.is_empty() {
+            app.config_filters
+                .iter()
+                .enumerate()
+                .map(|(i, (k, v))| {
+                    let selected = i == app.filter_modal_selected;
+                    let style = if selected {
+                        Style::default().fg(NEON_YELLOW).bg(Color::Rgb(30, 40, 50))
+                    } else {
+                        Style::default().fg(NEON_YELLOW)
+                    };
+                    Line::from(vec![Span::styled(format!("  ✕ {}={}", k, v), style)])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    let visible_items = items.len().min(max_list_items);
+    let content_height = 2 + filter_lines.len() + visible_items + 1;
+    let popup_height = (content_height as u16 + 2)
+        .min(area.height.saturating_sub(4))
+        .max(5);
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let inner_width = popup_width.saturating_sub(4) as usize;
+    let input = &app.filter_modal_input;
+    let display = if input.len() >= inner_width {
+        &input[input.len() - inner_width + 1..]
+    } else {
+        input.as_str()
+    };
+
+    let mut text: Vec<Line> = Vec::new();
+    text.push(Line::from(vec![
+        Span::styled("  > ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled(display, Style::default().fg(NEON_CYAN)),
+        Span::styled("_", Style::default().fg(NEON_CYAN)),
+    ]));
+    text.push(Line::from(""));
+
+    text.extend(filter_lines);
+
+    let offset = if app.filter_modal_phase == FilterPhase::KeySelect {
+        app.config_filters.len()
+    } else {
+        0
+    };
+
+    for (i, item) in items.iter().enumerate().take(max_list_items) {
+        let idx = offset + i;
+        let selected = idx == app.filter_modal_selected;
+        let style = if selected {
+            Style::default().fg(NEON_CYAN).bg(Color::Rgb(30, 40, 50))
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let prefix = if selected { "  ▸ " } else { "    " };
+        text.push(Line::from(Span::styled(
+            format!("{}{}", prefix, item),
+            style,
+        )));
+    }
+
+    let footer = match app.filter_modal_phase {
+        FilterPhase::KeySelect => "[Enter] select  [Esc] close  [↑↓] nav",
+        FilterPhase::ValueSelect => "[Enter] select  [Esc] back  [↑↓] nav",
+    };
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        format!("  {}", footer),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .title(Span::styled(
+            title_str,
+            Style::default().fg(NEON_YELLOW).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_YELLOW))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 
