@@ -1815,7 +1815,6 @@ impl App {
         let entry_count = entries.len();
 
         match code {
-            KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('m') => {
                 self.view_mode = ViewMode::Models;
                 self.selected_card = 0;
@@ -1929,7 +1928,6 @@ impl App {
         let entry_count = entries.len();
 
         match code {
-            KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('r') => {
                 self.view_mode = ViewMode::Runs;
                 self.selected_card = 0;
@@ -2596,7 +2594,6 @@ impl App {
         let type_count = self.infra_types.len();
 
         match code {
-            KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('r') => {
                 self.view_mode = ViewMode::Runs;
                 self.view = View::List;
@@ -3856,10 +3853,7 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled("] pull by name  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+        Span::styled("] delete", Style::default().fg(Color::DarkGray)),
     ]);
     let help = Line::from(help_spans);
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
@@ -3988,10 +3982,7 @@ fn render_models_list(app: &App, frame: &mut Frame) {
         Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+        Span::styled("] delete", Style::default().fg(Color::DarkGray)),
     ]);
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
@@ -7543,10 +7534,7 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("] remove  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("1-4", Style::default().fg(NEON_YELLOW)),
-            Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+            Span::styled("] provider", Style::default().fg(Color::DarkGray)),
         ])
     } else if app.infra_active_panel == InfraPanel::Instances {
         Line::from(vec![
@@ -7570,10 +7558,7 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("R", Style::default().fg(NEON_CYAN)),
-            Span::styled("] refresh  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+            Span::styled("] refresh", Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
@@ -7594,10 +7579,7 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("R", Style::default().fg(NEON_CYAN)),
-            Span::styled("] refresh  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+            Span::styled("] refresh", Style::default().fg(Color::DarkGray)),
         ])
     };
 
