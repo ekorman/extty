@@ -97,7 +97,7 @@ def _detect_gpu() -> tuple[str, int | None] | None:
 
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
-            total = torch.cuda.get_device_properties(0).total_mem
+            total = torch.cuda.get_device_properties(0).total_memory
             vram_mb = total // (1024 * 1024)
             return name, vram_mb
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
