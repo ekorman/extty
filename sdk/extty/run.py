@@ -91,6 +91,30 @@ class FinishableStorage(Protocol):
     def finish(self, finished_at: str, status: str) -> None: ...
 
 
+def _detect_gpu() -> tuple[str, int | None] | None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            total = torch.cuda.get_device_properties(0).total_mem
+            vram_mb = total // (1024 * 1024)
+            return name, vram_mb
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return f"Apple MPS ({result.stdout.strip()})", None
+            return "Apple MPS", None
+    except ImportError:
+        pass
+    return None
+
+
 def _collect_environment() -> dict[str, Any]:
     from extty import __version__
 
@@ -119,6 +143,12 @@ def _collect_environment() -> dict[str, Any]:
     instance_provider = os.environ.get("EXTTY_INSTANCE_PROVIDER")
     if instance_id and instance_provider:
         env["_instance_id"] = f"{instance_provider}:{instance_id}"
+
+    gpu_info = _detect_gpu()
+    if gpu_info:
+        env["_gpu"] = gpu_info[0]
+        if gpu_info[1] is not None:
+            env["_gpu_vram_mb"] = gpu_info[1]
 
     return env
 
