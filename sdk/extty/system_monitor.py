@@ -85,9 +85,7 @@ class SystemMonitor:
             else:
                 logger.warning("No NVIDIA GPUs detected — GPU metrics disabled")
         except Exception:
-            logger.warning(
-                "Failed to initialize pynvml — GPU metrics disabled", exc_info=True
-            )
+            logger.warning("Failed to initialize pynvml — GPU metrics disabled")
             self._gpu_initialized = False
 
     def _run(self) -> None:
