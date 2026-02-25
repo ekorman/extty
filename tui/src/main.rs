@@ -1916,7 +1916,52 @@ impl App {
                     && let Some(run) = self.runs.get(run_idx)
                 {
                     let path = run.path.clone();
+                    let project = run.project.clone().unwrap_or_default();
+                    let name = run.name.clone();
                     let _ = data::delete_run(&path);
+
+                    if let Ok(Some(config)) = s3::load_config() {
+                        let (tx, rx) = mpsc::channel();
+                        self.s3_pull_rx = Some(rx);
+                        self.s3_pull_status = Some(format!("Deleting {}/{}...", project, name));
+                        thread::spawn(move || {
+                            let runtime = match tokio::runtime::Runtime::new() {
+                                Ok(rt) => rt,
+                                Err(e) => {
+                                    let _ = tx.send(S3PullMessage::Error(format!(
+                                        "Runtime error: {}",
+                                        e
+                                    )));
+                                    return;
+                                }
+                            };
+                            runtime.block_on(async {
+                                let client = match s3::S3Client::new(config).await {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                                        return;
+                                    }
+                                };
+                                match client.delete_run(&project, &name).await {
+                                    Ok(()) => {
+                                        let _ = tx.send(S3PullMessage::Done(format!(
+                                            "Deleted {}/{} from S3",
+                                            project, name
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(S3PullMessage::Error(format!(
+                                            "S3 delete failed: {}",
+                                            e
+                                        )));
+                                    }
+                                }
+                            });
+                        });
+                    }
+
                     self.refresh_runs();
                     if self.view == View::RunDetail {
                         self.view = View::List;

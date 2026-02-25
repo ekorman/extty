@@ -405,6 +405,66 @@ impl S3Client {
         Ok(())
     }
 
+    pub async fn delete_run(&self, project: &str, run: &str) -> Result<()> {
+        let prefix = self.s3_prefix(&format!("runs/{}/{}/", project, run));
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.config.bucket)
+                .prefix(&prefix);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Failed to list S3 objects for deletion")?;
+
+            let keys: Vec<String> = response
+                .contents()
+                .iter()
+                .filter_map(|obj| obj.key().map(|k| k.to_string()))
+                .collect();
+
+            for chunk in keys.chunks(1000) {
+                let objects: Vec<_> = chunk
+                    .iter()
+                    .map(|key| {
+                        aws_sdk_s3::types::ObjectIdentifier::builder()
+                            .key(key)
+                            .build()
+                            .unwrap()
+                    })
+                    .collect();
+
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(objects))
+                    .build()?;
+
+                self.client
+                    .delete_objects()
+                    .bucket(&self.config.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .context("Failed to delete S3 objects")?;
+            }
+
+            if response.is_truncated() == Some(true) {
+                continuation_token = response.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn sync_run(
         &self,
         project: &str,
