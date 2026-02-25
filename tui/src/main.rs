@@ -3340,9 +3340,8 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
             last_list_refresh = Instant::now();
         }
 
-        // Auto-refresh infra instances when viewing infra tab (every 5 seconds)
-        if app.view_mode == ViewMode::Infra
-            && !app.show_config
+        // Auto-refresh infra instances when viewing infra tab (every 30 seconds)
+        if app.view == View::InfraList
             && app.selected_infra_provider != Provider::Local
             && app.infra_last_refresh.elapsed() >= Duration::from_secs(30)
         {
