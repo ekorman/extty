@@ -44,6 +44,7 @@ __all__ = [
     "MetricPoint",
     "SystemMetricPoint",
     "ExampleRecord",
+    "has_active_run",
 ]
 
 # Version is managed by setuptools_scm
@@ -54,6 +55,10 @@ except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
 _active_run: Run | None = None
+
+
+def has_active_run() -> bool:
+    return _active_run is not None
 
 
 def init(
