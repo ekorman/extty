@@ -465,6 +465,54 @@ impl S3Client {
         Ok(())
     }
 
+    pub async fn move_run(&self, old_project: &str, new_project: &str, run: &str) -> Result<()> {
+        let old_prefix = self.s3_prefix(&format!("runs/{}/{}/", old_project, run));
+        let new_prefix = self.s3_prefix(&format!("runs/{}/{}/", new_project, run));
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.config.bucket)
+                .prefix(&old_prefix);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Failed to list S3 objects for move")?;
+
+            for object in response.contents() {
+                if let Some(key) = object.key() {
+                    let relative = key.strip_prefix(&old_prefix).unwrap_or(key);
+                    let new_key = format!("{}{}", new_prefix, relative);
+
+                    self.client
+                        .copy_object()
+                        .bucket(&self.config.bucket)
+                        .copy_source(format!("{}/{}", self.config.bucket, key))
+                        .key(&new_key)
+                        .send()
+                        .await
+                        .context("Failed to copy S3 object")?;
+                }
+            }
+
+            if response.is_truncated() == Some(true) {
+                continuation_token = response.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        self.delete_run(old_project, run).await?;
+        Ok(())
+    }
+
     pub async fn sync_run(
         &self,
         project: &str,

@@ -261,6 +261,9 @@ struct App {
     note_modal_open: bool,
     note_modal_input: String,
     note_modal_run_name: String,
+    move_run_modal_open: bool,
+    move_run_input: String,
+    move_run_index: Option<usize>,
     pull_run_input: String,
     config_cursor: usize,
     config_copied_at: Option<Instant>,
@@ -362,6 +365,9 @@ impl App {
             note_modal_open: false,
             note_modal_input: String::new(),
             note_modal_run_name: String::new(),
+            move_run_modal_open: false,
+            move_run_input: String::new(),
+            move_run_index: None,
             pull_run_input: String::new(),
             config_cursor: 0,
             config_copied_at: None,
@@ -1641,6 +1647,11 @@ impl App {
             return;
         }
 
+        if self.move_run_modal_open {
+            self.handle_move_run_modal_key(code);
+            return;
+        }
+
         if self.pull_run_modal_open {
             self.handle_pull_run_modal_key(code);
             return;
@@ -1786,6 +1797,122 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.note_modal_input.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_move_run_modal_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.move_run_modal_open = false;
+                self.move_run_input.clear();
+                self.move_run_index = None;
+            }
+            KeyCode::Enter => {
+                let new_project = self.move_run_input.trim().to_string();
+                if let Some(run_idx) = self.move_run_index
+                    && let Some(run) = self.runs.get(run_idx)
+                {
+                    let old_display_name = run.display_name();
+                    let old_path = run.path.clone();
+                    let old_project = run.project.clone().unwrap_or_default();
+                    let run_name = run.name.clone();
+
+                    let new_display_name = if new_project.is_empty() {
+                        run_name.clone()
+                    } else {
+                        format!("{}/{}", new_project, run_name)
+                    };
+
+                    if old_display_name == new_display_name {
+                        self.move_run_modal_open = false;
+                        self.move_run_input.clear();
+                        self.move_run_index = None;
+                        return;
+                    }
+
+                    if data::move_run(&old_path, &new_project).is_ok() {
+                        if self.starred_runs.remove(&old_display_name) {
+                            self.starred_runs.insert(new_display_name.clone());
+                            save_starred_runs(&self.starred_runs);
+                        }
+                        if let Some(note) = self.run_notes.remove(&old_display_name) {
+                            self.run_notes.insert(new_display_name.clone(), note);
+                            save_run_notes(&self.run_notes);
+                        }
+
+                        if !old_project.is_empty()
+                            && let Ok(Some(config)) = s3::load_config()
+                        {
+                            let new_proj = new_project.clone();
+                            let run_n = run_name.clone();
+                            let old_proj = old_project.clone();
+                            let (tx, rx) = mpsc::channel();
+                            self.s3_pull_rx = Some(rx);
+                            self.s3_pull_status = Some(format!(
+                                "Moving {} → {}...",
+                                old_display_name, new_display_name
+                            ));
+                            thread::spawn(move || {
+                                let runtime = match tokio::runtime::Runtime::new() {
+                                    Ok(rt) => rt,
+                                    Err(e) => {
+                                        let _ = tx.send(S3PullMessage::Error(format!(
+                                            "Runtime error: {}",
+                                            e
+                                        )));
+                                        return;
+                                    }
+                                };
+                                runtime.block_on(async {
+                                    let client = match s3::S3Client::new(config).await {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            let _ = tx.send(S3PullMessage::Error(format!(
+                                                "S3 error: {}",
+                                                e
+                                            )));
+                                            return;
+                                        }
+                                    };
+                                    match client.move_run(&old_proj, &new_proj, &run_n).await {
+                                        Ok(()) => {
+                                            let _ = tx.send(S3PullMessage::Done(format!(
+                                                "Moved to {} on S3",
+                                                if new_proj.is_empty() {
+                                                    "(no project)".to_string()
+                                                } else {
+                                                    new_proj
+                                                }
+                                            )));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(S3PullMessage::Error(format!(
+                                                "S3 move failed: {}",
+                                                e
+                                            )));
+                                        }
+                                    }
+                                });
+                            });
+                        }
+
+                        self.refresh_runs();
+                        if self.view == View::RunDetail {
+                            self.view = View::List;
+                        }
+                    }
+                }
+                self.move_run_modal_open = false;
+                self.move_run_input.clear();
+                self.move_run_index = None;
+            }
+            KeyCode::Char(c) => {
+                self.move_run_input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.move_run_input.pop();
             }
             _ => {}
         }
@@ -2109,6 +2236,14 @@ impl App {
                     self.show_delete_confirm = true;
                 }
             }
+            KeyCode::Char('M') => {
+                if let Some(ListEntry::Run { run_index }) = entries.get(self.selected_list_item) {
+                    let project = self.runs[*run_index].project.clone().unwrap_or_default();
+                    self.move_run_input = project;
+                    self.move_run_index = Some(*run_index);
+                    self.move_run_modal_open = true;
+                }
+            }
             KeyCode::Char('f') => {
                 self.filter_modal_open = true;
                 self.filter_modal_phase = FilterPhase::KeySelect;
@@ -2297,6 +2432,15 @@ impl App {
                     run.status = data::RunStatus::Completed;
                     run.end_time = Some(chrono::Local::now());
                 }
+            }
+            KeyCode::Char('M') if !self.runs.is_empty() => {
+                let project = self.runs[self.selected_run]
+                    .project
+                    .clone()
+                    .unwrap_or_default();
+                self.move_run_input = project;
+                self.move_run_index = Some(self.selected_run);
+                self.move_run_modal_open = true;
             }
             _ => {}
         }
@@ -3849,6 +3993,9 @@ fn render(app: &App, frame: &mut Frame) {
     if app.note_modal_open {
         render_note_modal(app, frame);
     }
+    if app.move_run_modal_open {
+        render_move_run_modal(app, frame);
+    }
     if app.filter_modal_open {
         render_filter_modal(app, frame);
     }
@@ -4073,6 +4220,9 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
         Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("M", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] move  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("f", Style::default().fg(NEON_YELLOW)),
         Span::styled("] filter", Style::default().fg(Color::DarkGray)),
@@ -4372,6 +4522,9 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
         Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("M", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] move  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("c", Style::default().fg(NEON_CYAN)),
         Span::styled(
@@ -7314,6 +7467,57 @@ fn render_note_modal(app: &App, frame: &mut Frame) {
     let block = Block::default()
         .title(Span::styled(
             " Note ",
+            Style::default().fg(NEON_YELLOW).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_YELLOW))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_move_run_modal(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_height = 7u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let inner_width = popup_width.saturating_sub(2) as usize;
+    let input = &app.move_run_input;
+    let display = if input.len() >= inner_width {
+        &input[input.len() - inner_width + 1..]
+    } else {
+        input.as_str()
+    };
+    let cursor = "_";
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(display, Style::default().fg(NEON_CYAN)),
+            Span::styled(cursor, Style::default().fg(NEON_CYAN)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Leave empty to remove from project",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Move to Project ",
             Style::default().fg(NEON_YELLOW).bold(),
         ))
         .borders(Borders::ALL)

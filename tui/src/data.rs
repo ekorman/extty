@@ -296,6 +296,43 @@ pub fn delete_run(path: &Path) -> Result<(), std::io::Error> {
     fs::remove_dir_all(path)
 }
 
+pub fn move_run(old_path: &Path, new_project: &str) -> Result<PathBuf, std::io::Error> {
+    let run_name = old_path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("invalid run path"))?;
+
+    let dest = if new_project.is_empty() {
+        runs_dir().join(run_name)
+    } else {
+        runs_dir().join(new_project).join(run_name)
+    };
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::rename(old_path, &dest)?;
+
+    let meta_path = dest.join("meta.json");
+    let mut data: serde_json::Value = if meta_path.exists() {
+        let content = fs::read_to_string(&meta_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    if new_project.is_empty() {
+        data.as_object_mut().map(|m| m.remove("project"));
+    } else {
+        data["project"] = serde_json::json!(new_project);
+    }
+
+    let json = serde_json::to_string_pretty(&data).map_err(std::io::Error::other)?;
+    fs::write(&meta_path, json)?;
+
+    Ok(dest)
+}
+
 // Delete an evaluation by removing its JSON file
 pub fn delete_evaluation(path: &Path) -> Result<(), std::io::Error> {
     fs::remove_file(path)
