@@ -1,6 +1,7 @@
 """extty: Terminal-native ML experiment tracker."""
 
 import copy
+import dataclasses
 import functools
 import warnings
 from datetime import datetime
@@ -210,6 +211,19 @@ P = ParamSpec("P")
 T = TypeVar("T")
 
 
+def _sanitize_config(config: dict[str, Any]) -> dict[str, Any]:
+    def _convert(val: Any) -> Any:
+        if dataclasses.is_dataclass(val) and not isinstance(val, type):
+            return dataclasses.asdict(val)
+        if isinstance(val, dict):
+            return {k: _convert(v) for k, v in val.items()}
+        if isinstance(val, list):
+            return [_convert(v) for v in val]
+        return val
+
+    return {k: _convert(v) for k, v in config.items()}
+
+
 def evaluation(
     project: str,
     *,
@@ -289,6 +303,8 @@ def experiment(
                     kwargs_copy = {
                         k: v for k, v in kwargs_copy.items() if k not in non_conf_kwargs
                     }
+
+                kwargs_copy = _sanitize_config(kwargs_copy)
 
                 run_name = name
 

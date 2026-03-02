@@ -1,5 +1,6 @@
 """Tests for extty library."""
 
+import dataclasses
 import json
 import os
 import shutil
@@ -671,6 +672,74 @@ class TestExperimentDecorator:
             )
             def my_experiment(lr: float, verbose: bool) -> None:
                 pass
+
+
+class TestExperimentDataclassConfig:
+    def test_dataclass_kwarg_serialized_as_dict(self, tmp_path: Path) -> None:
+        @dataclasses.dataclass
+        class OptimizerConfig:
+            lr: float = 0.01
+            momentum: float = 0.9
+
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment("test-project", name="dc-test", system_metrics=False)
+            def my_experiment(optimizer: OptimizerConfig, epochs: int = 10) -> None:
+                pass
+
+            my_experiment(optimizer=OptimizerConfig(lr=0.001, momentum=0.95), epochs=5)
+
+            meta_path = tmp_path / "runs" / "test-project" / "dc-test" / "meta.json"
+            meta = json.loads(meta_path.read_text())
+            assert meta["config"]["optimizer"] == {"lr": 0.001, "momentum": 0.95}
+            assert meta["config"]["epochs"] == 5
+
+    def test_nested_dataclass_in_list(self, tmp_path: Path) -> None:
+        @dataclasses.dataclass
+        class LayerConfig:
+            units: int
+            activation: str = "relu"
+
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment("test-project", name="dc-list-test", system_metrics=False)
+            def my_experiment(layers: list[LayerConfig] | None = None) -> None:
+                pass
+
+            my_experiment(layers=[LayerConfig(128), LayerConfig(64, "tanh")])
+
+            meta_path = (
+                tmp_path / "runs" / "test-project" / "dc-list-test" / "meta.json"
+            )
+            meta = json.loads(meta_path.read_text())
+            assert meta["config"]["layers"] == [
+                {"units": 128, "activation": "relu"},
+                {"units": 64, "activation": "tanh"},
+            ]
+
+    def test_nested_dataclass_in_dict(self, tmp_path: Path) -> None:
+        @dataclasses.dataclass
+        class SchedulerConfig:
+            step_size: int = 10
+            gamma: float = 0.1
+
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+
+            @extty.experiment("test-project", name="dc-dict-test", system_metrics=False)
+            def my_experiment(
+                schedulers: dict[str, SchedulerConfig] | None = None,
+            ) -> None:
+                pass
+
+            my_experiment(schedulers={"warmup": SchedulerConfig(5, 0.5)})
+
+            meta_path = (
+                tmp_path / "runs" / "test-project" / "dc-dict-test" / "meta.json"
+            )
+            meta = json.loads(meta_path.read_text())
+            assert meta["config"]["schedulers"] == {
+                "warmup": {"step_size": 5, "gamma": 0.5}
+            }
 
 
 class TestEvaluationDecorator:
