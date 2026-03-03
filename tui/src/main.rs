@@ -181,6 +181,7 @@ struct App {
     selected_run: usize,
     selected_model: usize,
     selected_list_item: usize, // Current position in the flattened list (runs)
+    list_state: ListState,
     selected_model_list_item: usize, // Current position in the flattened list (models)
     expanded_projects: HashSet<String>, // Which projects are expanded (runs)
     expanded_model_projects: HashSet<String>, // Which projects are expanded (models)
@@ -210,6 +211,7 @@ struct App {
     selected_infra_provider: Provider,
     selected_infra_instance: usize,
     selected_infra_type: usize,
+    infra_types_list_state: ListState,
     infra_loading: bool,
     infra_error: Option<String>,
     infra_message_time: Option<Instant>,
@@ -291,6 +293,7 @@ impl App {
             selected_run: 0,
             selected_model: 0,
             selected_list_item: 0,
+            list_state: ListState::default(),
             selected_model_list_item: 0,
             expanded_projects: HashSet::new(),
             expanded_model_projects: HashSet::new(),
@@ -319,6 +322,7 @@ impl App {
             selected_infra_provider: default_provider,
             selected_infra_instance: 0,
             selected_infra_type: 0,
+            infra_types_list_state: ListState::default(),
             infra_loading: false,
             infra_error: None,
             infra_message_time: None,
@@ -501,6 +505,7 @@ impl App {
 
         let entries = self.list_entries();
         self.selected_list_item = self.selected_list_item.min(entries.len().saturating_sub(1));
+        self.list_state.select(Some(self.selected_list_item));
     }
 
     fn refresh_models(&mut self) {
@@ -959,6 +964,8 @@ impl App {
         self.selected_infra_type = self
             .selected_infra_type
             .min(self.infra_types.len().saturating_sub(1));
+        self.infra_types_list_state
+            .select(Some(self.selected_infra_type));
     }
 
     fn sort_infra_types(&mut self) {
@@ -1958,6 +1965,7 @@ impl App {
                             self.filter_modal_selected -= 1;
                         }
                         self.selected_list_item = 0;
+                        self.list_state.select(Some(0));
                     } else {
                         self.filter_modal_input.push('d');
                         self.filter_modal_selected = 0;
@@ -2029,6 +2037,7 @@ impl App {
                             .push((self.filter_modal_key.clone(), val.clone()));
                         self.filter_modal_open = false;
                         self.selected_list_item = 0;
+                        self.list_state.select(Some(0));
                     }
                 }
                 _ => {}
@@ -2151,9 +2160,11 @@ impl App {
             }
             KeyCode::Up if self.selected_list_item > 0 => {
                 self.selected_list_item -= 1;
+                self.list_state.select(Some(self.selected_list_item));
             }
             KeyCode::Down if self.selected_list_item < entry_count.saturating_sub(1) => {
                 self.selected_list_item += 1;
+                self.list_state.select(Some(self.selected_list_item));
             }
             KeyCode::Tab => {
                 if let Some(ListEntry::Project { name }) = entries.get(self.selected_list_item) {
@@ -2254,6 +2265,7 @@ impl App {
             KeyCode::Char('F') => {
                 self.config_filters.clear();
                 self.selected_list_item = 0;
+                self.list_state.select(Some(0));
             }
             _ => {}
         }
@@ -2973,6 +2985,8 @@ impl App {
                 }
                 InfraPanel::Types if self.selected_infra_type > 0 => {
                     self.selected_infra_type -= 1;
+                    self.infra_types_list_state
+                        .select(Some(self.selected_infra_type));
                 }
                 _ => {}
             },
@@ -2984,6 +2998,8 @@ impl App {
                 }
                 InfraPanel::Types if self.selected_infra_type < type_count.saturating_sub(1) => {
                     self.selected_infra_type += 1;
+                    self.infra_types_list_state
+                        .select(Some(self.selected_infra_type));
                 }
                 _ => {}
             },
@@ -2991,6 +3007,7 @@ impl App {
                 self.selected_infra_provider = Provider::Vast;
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
+                self.infra_types_list_state = ListState::default();
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
@@ -2998,6 +3015,7 @@ impl App {
                 self.selected_infra_provider = Provider::Prime;
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
+                self.infra_types_list_state = ListState::default();
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
@@ -3005,6 +3023,7 @@ impl App {
                 self.selected_infra_provider = Provider::Lambda;
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
+                self.infra_types_list_state = ListState::default();
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
@@ -3012,6 +3031,7 @@ impl App {
                 self.selected_infra_provider = Provider::Local;
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
+                self.infra_types_list_state = ListState::default();
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
@@ -3626,7 +3646,7 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
         }
 
         // Draw the UI
-        terminal.draw(|frame| render(&app, frame))?;
+        terminal.draw(|frame| render(&mut app, frame))?;
 
         // Handle input (with 100ms timeout for responsive feel)
         if event::poll(Duration::from_millis(100))?
@@ -3964,7 +3984,7 @@ fn parse_sync_options(args: &mut Vec<String>) -> Result<SyncOptions> {
     })
 }
 
-fn render(app: &App, frame: &mut Frame) {
+fn render(app: &mut App, frame: &mut Frame) {
     match app.view {
         View::List => match app.view_mode {
             ViewMode::Runs => render_runs_list(app, frame),
@@ -4001,7 +4021,7 @@ fn render(app: &App, frame: &mut Frame) {
     }
 }
 
-fn render_runs_list(app: &App, frame: &mut Frame) {
+fn render_runs_list(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
     let entries = app.list_entries();
 
@@ -4123,9 +4143,6 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         })
         .collect();
 
-    let mut state = ListState::default();
-    state.select(Some(app.selected_list_item));
-
     let mut title_spans = vec![
         Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
         Span::styled("[Runs]", Style::default().fg(NEON_CYAN).bold()),
@@ -4172,7 +4189,7 @@ fn render_runs_list(app: &App, frame: &mut Frame) {
         .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, area, &mut app.list_state);
 
     let mut help_spans = vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
@@ -7661,7 +7678,7 @@ fn render_filter_modal(app: &App, frame: &mut Frame) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn render_infra_dashboard(app: &App, frame: &mut Frame) {
+fn render_infra_dashboard(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
     let v_chunks = Layout::default()
@@ -8008,7 +8025,7 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
+fn render_infra_types_panel(app: &mut App, frame: &mut Frame, area: Rect) {
     let is_focused = app.infra_active_panel == InfraPanel::Types;
 
     let title = Line::from(vec![
@@ -8124,16 +8141,15 @@ fn render_infra_types_panel(app: &App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    let mut state = ListState::default();
-    if is_focused {
-        state.select(Some(app.selected_infra_type));
+    if !is_focused {
+        app.infra_types_list_state.select(None);
     }
 
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
         .highlight_symbol("▶ ");
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, area, &mut app.infra_types_list_state);
 }
 
 fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
