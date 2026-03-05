@@ -270,6 +270,10 @@ struct App {
     config_cursor: usize,
     config_copied_at: Option<Instant>,
     selected_checkpoint: usize,
+    checkpoint_download_modal: bool,
+    checkpoint_download_options: Vec<String>,
+    checkpoint_download_selected: usize,
+    checkpoint_download_step: u64,
     show_system_metrics: bool,
     config_filters: Vec<(String, String)>,
     filter_modal_open: bool,
@@ -376,6 +380,10 @@ impl App {
             config_cursor: 0,
             config_copied_at: None,
             selected_checkpoint: 0,
+            checkpoint_download_modal: false,
+            checkpoint_download_options: Vec::new(),
+            checkpoint_download_selected: 0,
+            checkpoint_download_step: 0,
             show_system_metrics: false,
             config_filters: Vec::new(),
             filter_modal_open: false,
@@ -611,7 +619,7 @@ impl App {
         });
     }
 
-    fn start_s3_pull_checkpoint(&mut self, step: u64) {
+    fn start_s3_pull_checkpoint(&mut self, step: u64, files: Option<Vec<String>>) {
         if self.s3_pull_rx.is_some() {
             return;
         }
@@ -633,7 +641,12 @@ impl App {
         let name = run.name.clone();
         let (tx, rx) = mpsc::channel();
         self.s3_pull_rx = Some(rx);
-        self.s3_pull_status = Some(format!("Downloading checkpoint step {}...", step));
+
+        let desc = match &files {
+            Some(f) => format!("Downloading {} step {}...", f.join(", "), step),
+            None => format!("Downloading checkpoint step {}...", step),
+        };
+        self.s3_pull_status = Some(desc.clone());
 
         thread::spawn(move || {
             let runtime = match tokio::runtime::Runtime::new() {
@@ -652,12 +665,15 @@ impl App {
                     }
                 };
                 let runs_dir = runs_dir();
-                let _ = tx.send(S3PullMessage::Pulling(format!(
-                    "Downloading checkpoint step {}...",
-                    step
-                )));
+                let _ = tx.send(S3PullMessage::Pulling(desc));
+
+                let file_refs: Option<Vec<&str>> = files
+                    .as_ref()
+                    .map(|f| f.iter().map(|s| s.as_str()).collect());
+                let file_slices: Option<&[&str]> = file_refs.as_deref();
+
                 match client
-                    .download_checkpoint(&project, &name, step, &runs_dir)
+                    .download_checkpoint(&project, &name, step, &runs_dir, file_slices)
                     .await
                 {
                     Ok(()) => {
@@ -1646,6 +1662,43 @@ impl App {
 
         if self.filter_modal_open {
             self.handle_filter_modal_key(code);
+            return;
+        }
+
+        if self.checkpoint_download_modal {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.checkpoint_download_modal = false;
+                }
+                KeyCode::Up if self.checkpoint_download_selected > 0 => {
+                    self.checkpoint_download_selected -= 1;
+                }
+                KeyCode::Down
+                    if self.checkpoint_download_selected
+                        < self.checkpoint_download_options.len().saturating_sub(1) =>
+                {
+                    self.checkpoint_download_selected += 1;
+                }
+                KeyCode::Enter => {
+                    let step = self.checkpoint_download_step;
+                    let selected =
+                        &self.checkpoint_download_options[self.checkpoint_download_selected];
+                    let files = if selected == "All files" {
+                        let all: Vec<String> = self
+                            .checkpoint_download_options
+                            .iter()
+                            .filter(|s| s.as_str() != "All files")
+                            .cloned()
+                            .collect();
+                        Some(all)
+                    } else {
+                        Some(vec![selected.clone()])
+                    };
+                    self.checkpoint_download_modal = false;
+                    self.start_s3_pull_checkpoint(step, files);
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -2823,10 +2876,26 @@ impl App {
             KeyCode::Char('p') if checkpoint_count > 0 => {
                 if let Some(run) = self.current_run()
                     && let Some(ckpt) = run.checkpoints.get(self.selected_checkpoint)
-                    && !ckpt.downloaded
+                    && !ckpt.all_downloaded()
                 {
                     let step = ckpt.step;
-                    self.start_s3_pull_checkpoint(step);
+                    if ckpt.is_legacy() {
+                        self.start_s3_pull_checkpoint(step, None);
+                    } else {
+                        let mut options = Vec::new();
+                        for f in &ckpt.files {
+                            if !ckpt.downloaded_files.contains(&f.name) {
+                                options.push(f.name.clone());
+                            }
+                        }
+                        if options.len() > 1 {
+                            options.push("All files".to_string());
+                        }
+                        self.checkpoint_download_step = step;
+                        self.checkpoint_download_options = options;
+                        self.checkpoint_download_selected = 0;
+                        self.checkpoint_download_modal = true;
+                    }
                 }
             }
             // Shift+Up/Down jump 10 examples at a time
@@ -4018,6 +4087,9 @@ fn render(app: &mut App, frame: &mut Frame) {
     }
     if app.filter_modal_open {
         render_filter_modal(app, frame);
+    }
+    if app.checkpoint_download_modal {
+        render_checkpoint_download_modal(app, frame);
     }
 }
 
@@ -5867,6 +5939,16 @@ fn render_examples_card(
     frame.render_widget(paragraph, area);
 }
 
+fn format_size(size: u64) -> String {
+    if size >= 1_073_741_824 {
+        format!("{:.1} GB", size as f64 / 1_073_741_824.0)
+    } else if size >= 1_048_576 {
+        format!("{:.1} MB", size as f64 / 1_048_576.0)
+    } else {
+        format!("{:.1} KB", size as f64 / 1024.0)
+    }
+}
+
 fn render_checkpoints_card(
     frame: &mut Frame,
     area: Rect,
@@ -5885,8 +5967,12 @@ fn render_checkpoints_card(
         .iter()
         .take(max_lines)
         .map(|ckpt| {
-            let status_icon = if ckpt.downloaded { "● " } else { "○ " };
-            let status_color = if ckpt.downloaded {
+            let status_icon = if ckpt.all_downloaded() {
+                "● "
+            } else {
+                "○ "
+            };
+            let status_color = if ckpt.all_downloaded() {
                 NEON_GREEN
             } else {
                 Color::DarkGray
@@ -5905,16 +5991,9 @@ fn render_checkpoints_card(
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            if let Some(size) = ckpt.size_bytes {
-                let size_str = if size >= 1_073_741_824 {
-                    format!("{:.1} GB", size as f64 / 1_073_741_824.0)
-                } else if size >= 1_048_576 {
-                    format!("{:.1} MB", size as f64 / 1_048_576.0)
-                } else {
-                    format!("{:.1} KB", size as f64 / 1024.0)
-                };
+            if let Some(size) = ckpt.total_size_bytes() {
                 spans.push(Span::styled(
-                    format!("  {}", size_str),
+                    format!("  {}", format_size(size)),
                     Style::default().fg(NEON_GREEN),
                 ));
             }
@@ -5961,8 +6040,12 @@ fn render_focused_checkpoints(
         .map(|(i, ckpt)| {
             let is_selected = i == selected_index;
             let cursor = if is_selected { "▶ " } else { "  " };
-            let status_icon = if ckpt.downloaded { "● " } else { "○ " };
-            let status_color = if ckpt.downloaded {
+            let status_icon = if ckpt.all_downloaded() {
+                "● "
+            } else {
+                "○ "
+            };
+            let status_color = if ckpt.all_downloaded() {
                 NEON_GREEN
             } else {
                 Color::DarkGray
@@ -5990,23 +6073,32 @@ fn render_focused_checkpoints(
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            if let Some(size) = ckpt.size_bytes {
-                let size_str = if size >= 1_073_741_824 {
-                    format!("{:.1} GB", size as f64 / 1_073_741_824.0)
-                } else if size >= 1_048_576 {
-                    format!("{:.1} MB", size as f64 / 1_048_576.0)
-                } else {
-                    format!("{:.1} KB", size as f64 / 1024.0)
-                };
+            if let Some(size) = ckpt.total_size_bytes() {
                 spans.push(Span::styled(
-                    format!("  {}", size_str),
+                    format!("  {}", format_size(size)),
                     Style::default().fg(NEON_GREEN),
                 ));
             }
-            if ckpt.downloaded {
+            if !ckpt.files.is_empty() {
+                let file_info: Vec<String> = ckpt
+                    .files
+                    .iter()
+                    .map(|f| {
+                        let dl = if ckpt.downloaded_files.contains(&f.name) {
+                            "●"
+                        } else {
+                            "○"
+                        };
+                        let sz = f
+                            .size_bytes
+                            .map(|s| format!(" {}", format_size(s)))
+                            .unwrap_or_default();
+                        format!("{} {}{}", dl, f.name, sz)
+                    })
+                    .collect();
                 spans.push(Span::styled(
-                    "  downloaded",
-                    Style::default().fg(NEON_GREEN).dim(),
+                    format!("  [{}]", file_info.join(", ")),
+                    Style::default().fg(Color::DarkGray),
                 ));
             }
 
@@ -7447,6 +7539,50 @@ fn render_pull_run_modal(app: &App, frame: &mut Frame) {
 
     let paragraph = Paragraph::new(text).block(block);
 
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_checkpoint_download_modal(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let popup_width = 40u16.min(area.width.saturating_sub(4));
+    let popup_height =
+        (app.checkpoint_download_options.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+    for (i, opt) in app.checkpoint_download_options.iter().enumerate() {
+        let is_sel = i == app.checkpoint_download_selected;
+        let cursor = if is_sel { "▶ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                cursor,
+                Style::default().fg(if is_sel { NEON_CYAN } else { Color::DarkGray }),
+            ),
+            Span::styled(
+                opt.clone(),
+                Style::default().fg(if is_sel { Color::White } else { Color::Gray }),
+            ),
+        ]));
+    }
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" Download step {} ", app.checkpoint_download_step),
+            Style::default().fg(NEON_YELLOW).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_YELLOW))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
 }
 

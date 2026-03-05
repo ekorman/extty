@@ -414,39 +414,20 @@ class S3Storage:
         import tempfile
 
         if path is not None:
-            local_path = path
-        else:
-            import torch
-
-            save_obj: dict[str, Any] = {"model_state_dict": state_dict}
-            if optimizer_state_dict is not None:
-                save_obj["optimizer_state_dict"] = optimizer_state_dict
-            tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
-            try:
-                torch.save(save_obj, tmp.name)
-                tmp.close()
-                local_path = tmp.name
-            except Exception:
-                tmp.close()
-                os.unlink(tmp.name)
-                raise
-
-        try:
-            file_size = os.path.getsize(local_path)
+            file_size = os.path.getsize(path)
             checkpoint_key = self._s3_key("checkpoints", str(step), "checkpoint.pt")
             self._client.upload_file(
-                Filename=local_path,
+                Filename=path,
                 Bucket=self.config.bucket,
                 Key=checkpoint_key,
                 ExtraArgs={"ContentType": "application/octet-stream"},
             )
 
             timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            meta_entry = {
+            meta_entry: dict[str, Any] = {
                 "step": step,
                 "timestamp": timestamp,
-                "size_bytes": file_size,
-                "files": ["checkpoint.pt"],
+                "files": [{"name": "checkpoint.pt", "size_bytes": file_size}],
             }
 
             meta_key = self._s3_key("checkpoints", str(step), "meta.json")
@@ -456,11 +437,61 @@ class S3Storage:
                 Body=json.dumps(meta_entry, indent=2).encode("utf-8"),
                 ContentType="application/json",
             )
-
             self._update_checkpoints_index(meta_entry)
-        finally:
-            if state_dict is not None:
-                os.unlink(local_path)
+        else:
+            import torch
+
+            timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            files_meta: list[dict[str, Any]] = []
+            tmp_files: list[str] = []
+
+            try:
+                model_tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+                tmp_files.append(model_tmp.name)
+                torch.save(state_dict, model_tmp.name)
+                model_tmp.close()
+
+                model_size = os.path.getsize(model_tmp.name)
+                self._client.upload_file(
+                    Filename=model_tmp.name,
+                    Bucket=self.config.bucket,
+                    Key=self._s3_key("checkpoints", str(step), "model.pt"),
+                    ExtraArgs={"ContentType": "application/octet-stream"},
+                )
+                files_meta.append({"name": "model.pt", "size_bytes": model_size})
+
+                if optimizer_state_dict is not None:
+                    opt_tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+                    tmp_files.append(opt_tmp.name)
+                    torch.save(optimizer_state_dict, opt_tmp.name)
+                    opt_tmp.close()
+
+                    opt_size = os.path.getsize(opt_tmp.name)
+                    self._client.upload_file(
+                        Filename=opt_tmp.name,
+                        Bucket=self.config.bucket,
+                        Key=self._s3_key("checkpoints", str(step), "optimizer.pt"),
+                        ExtraArgs={"ContentType": "application/octet-stream"},
+                    )
+                    files_meta.append({"name": "optimizer.pt", "size_bytes": opt_size})
+
+                meta_entry = {
+                    "step": step,
+                    "timestamp": timestamp,
+                    "files": files_meta,
+                }
+
+                meta_key = self._s3_key("checkpoints", str(step), "meta.json")
+                self._client.put_object(
+                    Bucket=self.config.bucket,
+                    Key=meta_key,
+                    Body=json.dumps(meta_entry, indent=2).encode("utf-8"),
+                    ContentType="application/json",
+                )
+                self._update_checkpoints_index(meta_entry)
+            finally:
+                for f in tmp_files:
+                    os.unlink(f)
 
     def _update_checkpoints_index(self, entry: dict[str, Any]) -> None:
         index_key = self._s3_key("checkpoints.json")
@@ -488,6 +519,102 @@ class S3Storage:
             Body=json.dumps(existing, indent=2).encode("utf-8"),
             ContentType="application/json",
         )
+
+    def load_checkpoint(
+        self,
+        step: int,
+        load_optimizer: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Load a checkpoint, downloading from S3 if not cached locally.
+
+        Handles both old format (single ``checkpoint.pt`` containing
+        ``model_state_dict`` and ``optimizer_state_dict`` keys) and new
+        format (separate ``model.pt`` / ``optimizer.pt`` files).
+
+        Parameters
+        ----------
+        step : int
+            The training step to load.
+        load_optimizer : bool, default True
+            Whether to include the optimizer state in the result.
+
+        Returns
+        -------
+        dict[str, Any]
+            Always contains ``"model_state_dict"``.
+            Contains ``"optimizer_state_dict"`` when available and
+            *load_optimizer* is True.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the checkpoint step does not exist in the index.
+        """
+        from extty.storage import get_runs_dir
+
+        meta = self._checkpoint_meta(step)
+
+        import torch
+
+        project_dir = self.project if self.project else "_default"
+        local_dir = (
+            get_runs_dir() / project_dir / self.run_name / "checkpoints" / str(step)
+        )
+        local_dir.mkdir(parents=True, exist_ok=True)
+        files_raw = meta.get("files", [])
+
+        file_names: list[str] = []
+        for entry in files_raw:
+            if isinstance(entry, str):
+                file_names.append(entry)
+            elif isinstance(entry, dict):
+                file_names.append(entry["name"])
+
+        if not file_names:
+            file_names = ["checkpoint.pt"]
+
+        for fname in file_names:
+            if not load_optimizer and fname == "optimizer.pt":
+                continue
+            local_path = local_dir / fname
+            if not local_path.exists():
+                s3_key = self._s3_key("checkpoints", str(step), fname)
+                self._client.download_file(
+                    Bucket=self.config.bucket,
+                    Key=s3_key,
+                    Filename=str(local_path),
+                )
+
+        is_legacy = file_names == ["checkpoint.pt"]
+        if is_legacy:
+            data = torch.load(local_dir / "checkpoint.pt", weights_only=False)
+            result: dict[str, Any] = {
+                "model_state_dict": data.get("model_state_dict", data)
+            }
+            if load_optimizer and "optimizer_state_dict" in data:
+                result["optimizer_state_dict"] = data["optimizer_state_dict"]
+            return result
+
+        result = {
+            "model_state_dict": torch.load(local_dir / "model.pt", weights_only=False)
+        }
+        if (
+            load_optimizer
+            and "optimizer.pt" in file_names
+            and (local_dir / "optimizer.pt").exists()
+        ):
+            result["optimizer_state_dict"] = torch.load(
+                local_dir / "optimizer.pt", weights_only=False
+            )
+        return result
+
+    def _checkpoint_meta(self, step: int) -> dict[str, Any]:
+        """Fetch the meta entry for a given checkpoint step."""
+        for entry in self.list_checkpoints():
+            if entry.get("step") == step:
+                return entry
+        raise FileNotFoundError(f"Checkpoint step {step} not found.")
 
     def list_checkpoints(self) -> list[dict[str, Any]]:
         """
