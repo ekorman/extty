@@ -28,6 +28,8 @@ __all__ = [
     "log",
     "log_evaluation",
     "save_checkpoint",
+    "load_checkpoint",
+    "load_checkpoint_from",
     "finish",
     "Run",
     "RunData",
@@ -150,6 +152,74 @@ def save_checkpoint(
         state_dict=state_dict,
         optimizer_state_dict=optimizer_state_dict,
     )
+
+
+def load_checkpoint(
+    step: int,
+    *,
+    load_optimizer: bool = True,
+) -> dict[str, Any]:
+    """
+    Load a checkpoint for the active run, downloading from S3 if needed.
+
+    Parameters
+    ----------
+    step : int
+        The training step to load.
+    load_optimizer : bool, default True
+        Whether to include the optimizer state in the result.
+
+    Returns
+    -------
+    dict[str, Any]
+        Contains ``"model_state_dict"`` and optionally
+        ``"optimizer_state_dict"``.
+    """
+    if _active_run is None:
+        raise RuntimeError("No active run. Call extty.init() first.")
+    return _active_run.load_checkpoint(step, load_optimizer=load_optimizer)
+
+
+def load_checkpoint_from(
+    project: str,
+    run_name: str,
+    step: int,
+    *,
+    load_optimizer: bool = True,
+    s3_config: S3Config | None = None,
+) -> dict[str, Any]:
+    """
+    Load a checkpoint from any run, downloading from S3 if needed.
+
+    Parameters
+    ----------
+    project : str
+        The project name.
+    run_name : str
+        The run name.
+    step : int
+        The training step to load.
+    load_optimizer : bool, default True
+        Whether to include the optimizer state in the result.
+    s3_config : S3Config, optional
+        S3 configuration. Loaded from environment if not provided.
+
+    Returns
+    -------
+    dict[str, Any]
+        Contains ``"model_state_dict"`` and optionally
+        ``"optimizer_state_dict"``.
+    """
+    from extty.s3 import S3Storage
+
+    if s3_config is None:
+        s3_config = S3Config.load()
+    if s3_config is None:
+        raise RuntimeError(
+            "S3 storage is not configured. Set EXTTY_S3_BUCKET or provide s3_config."
+        )
+    storage = S3Storage(s3_config, project, run_name)
+    return storage.load_checkpoint(step, load_optimizer=load_optimizer)
 
 
 def log_evaluation(

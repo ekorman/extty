@@ -358,47 +358,62 @@ impl S3Client {
         run: &str,
         step: u64,
         dest: &Path,
+        files: Option<&[&str]>,
     ) -> Result<()> {
-        let prefix = self.s3_prefix(&format!("runs/{}/{}/checkpoints/{}/", project, run, step));
         let run_dir = dest.join(project).join(run);
+        let run_prefix = self.s3_prefix(&format!("runs/{}/{}/", project, run));
 
-        let mut continuation_token: Option<String> = None;
-
-        loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.config.bucket)
-                .prefix(&prefix);
-
-            if let Some(token) = continuation_token.take() {
-                request = request.continuation_token(token);
-            }
-
-            let response = request.send().await?;
-
-            for object in response.contents() {
-                if let Some(key) = object.key() {
-                    let relative_path = key
-                        .strip_prefix(&self.s3_prefix(&format!("runs/{}/{}/", project, run)))
-                        .unwrap_or(key);
-                    if relative_path.is_empty() {
-                        continue;
-                    }
-
-                    let local_path = run_dir.join(relative_path);
-                    if let Some(parent) = local_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-
-                    self.download_file(key, &local_path, true).await?;
+        if let Some(file_list) = files {
+            for filename in file_list {
+                let key = self.s3_prefix(&format!(
+                    "runs/{}/{}/checkpoints/{}/{}",
+                    project, run, step, filename
+                ));
+                let relative_path = key.strip_prefix(&run_prefix).unwrap_or(&key);
+                let local_path = run_dir.join(relative_path);
+                if let Some(parent) = local_path.parent() {
+                    fs::create_dir_all(parent)?;
                 }
+                self.download_file(&key, &local_path, true).await?;
             }
+        } else {
+            let prefix = self.s3_prefix(&format!("runs/{}/{}/checkpoints/{}/", project, run, step));
+            let mut continuation_token: Option<String> = None;
 
-            if response.is_truncated() == Some(true) {
-                continuation_token = response.next_continuation_token().map(|s| s.to_string());
-            } else {
-                break;
+            loop {
+                let mut request = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(&self.config.bucket)
+                    .prefix(&prefix);
+
+                if let Some(token) = continuation_token.take() {
+                    request = request.continuation_token(token);
+                }
+
+                let response = request.send().await?;
+
+                for object in response.contents() {
+                    if let Some(key) = object.key() {
+                        let relative_path = key.strip_prefix(&run_prefix).unwrap_or(key);
+                        if relative_path.is_empty() {
+                            continue;
+                        }
+
+                        let local_path = run_dir.join(relative_path);
+                        if let Some(parent) = local_path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+
+                        self.download_file(key, &local_path, true).await?;
+                    }
+                }
+
+                if response.is_truncated() == Some(true) {
+                    continuation_token = response.next_continuation_token().map(|s| s.to_string());
+                } else {
+                    break;
+                }
             }
         }
 

@@ -847,14 +847,85 @@ class TestSaveCheckpoint:
         assert meta_key in stored
         meta = json.loads(stored[meta_key])
         assert meta["step"] == 100
-        assert meta["size_bytes"] == len(b"fake model data")
-        assert meta["files"] == ["checkpoint.pt"]
+        assert meta["files"] == [
+            {"name": "checkpoint.pt", "size_bytes": len(b"fake model data")}
+        ]
 
         index_key = "test/runs/myproject/run-001/checkpoints.json"
         assert index_key in stored
         index = json.loads(stored[index_key])
         assert len(index) == 1
         assert index[0]["step"] == 100
+
+    def test_save_checkpoint_state_dict_model_and_optimizer(
+        self, tmp_path: Path
+    ) -> None:
+        """Test state_dict mode produces model.pt and optimizer.pt."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(
+            client, prefix="pfx", project="proj", run_name="run-1"
+        )
+
+        mock_torch = mock.MagicMock()
+
+        def fake_save(obj, path):
+            import pickle
+
+            with open(path, "wb") as f:
+                pickle.dump(obj, f)
+
+        mock_torch.save.side_effect = fake_save
+
+        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
+            storage.save_checkpoint(
+                step=50,
+                state_dict={"weight": "data"},
+                optimizer_state_dict={"lr": 0.01},
+            )
+
+        model_key = "pfx/runs/proj/run-1/checkpoints/50/model.pt"
+        opt_key = "pfx/runs/proj/run-1/checkpoints/50/optimizer.pt"
+        assert model_key in stored
+        assert opt_key in stored
+
+        meta_key = "pfx/runs/proj/run-1/checkpoints/50/meta.json"
+        meta = json.loads(stored[meta_key])
+        assert meta["step"] == 50
+        file_names = [f["name"] for f in meta["files"]]
+        assert file_names == ["model.pt", "optimizer.pt"]
+        for f in meta["files"]:
+            assert "size_bytes" in f
+            assert f["size_bytes"] > 0
+
+    def test_save_checkpoint_state_dict_model_only(self, tmp_path: Path) -> None:
+        """Test state_dict mode without optimizer produces only model.pt."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(
+            client, prefix="pfx", project="proj", run_name="run-2"
+        )
+
+        mock_torch = mock.MagicMock()
+
+        def fake_save(obj, path):
+            import pickle
+
+            with open(path, "wb") as f:
+                pickle.dump(obj, f)
+
+        mock_torch.save.side_effect = fake_save
+
+        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
+            storage.save_checkpoint(step=10, state_dict={"weight": "data"})
+
+        model_key = "pfx/runs/proj/run-2/checkpoints/10/model.pt"
+        opt_key = "pfx/runs/proj/run-2/checkpoints/10/optimizer.pt"
+        assert model_key in stored
+        assert opt_key not in stored
+
+        meta_key = "pfx/runs/proj/run-2/checkpoints/10/meta.json"
+        meta = json.loads(stored[meta_key])
+        file_names = [f["name"] for f in meta["files"]]
+        assert file_names == ["model.pt"]
 
     def test_save_checkpoint_updates_existing_index(self, tmp_path: Path) -> None:
         """Test that saving a second checkpoint appends to index."""
@@ -928,6 +999,192 @@ class TestSaveCheckpoint:
             with pytest.raises(RuntimeError, match="S3 storage is not configured"):
                 run.save_checkpoint(step=1, path="/nonexistent")
             extty.finish()
+
+
+class TestLoadCheckpoint:
+    """Tests for load_checkpoint functionality."""
+
+    def _make_mock_s3_client(
+        self, stored: dict[str, bytes] | None = None
+    ) -> tuple[mock.MagicMock, dict[str, bytes]]:
+        if stored is None:
+            stored = {}
+        client = mock.MagicMock()
+
+        def put_object(Bucket, Key, Body, ContentType=None):
+            if isinstance(Body, str):
+                Body = Body.encode("utf-8")
+            stored[Key] = Body
+
+        def get_object(Bucket, Key):
+            if Key in stored:
+                body = mock.MagicMock()
+                body.read.return_value = stored[Key]
+                return {"Body": body}
+            raise client.exceptions.NoSuchKey(
+                {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+            )
+
+        def upload_file(Filename, Bucket, Key, ExtraArgs=None):
+            with open(Filename, "rb") as f:
+                stored[Key] = f.read()
+
+        def download_file(Bucket, Key, Filename):
+            if Key not in stored:
+                raise client.exceptions.NoSuchKey(
+                    {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+                )
+            with open(Filename, "wb") as f:
+                f.write(stored[Key])
+
+        client.put_object.side_effect = put_object
+        client.get_object.side_effect = get_object
+        client.upload_file.side_effect = upload_file
+        client.download_file.side_effect = download_file
+        client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+        return client, stored
+
+    def _make_storage(
+        self,
+        client: mock.MagicMock,
+        bucket: str = "test-bucket",
+        prefix: str = "pfx",
+        project: str = "proj",
+        run_name: str = "run-1",
+    ) -> S3Storage:
+        config = S3Config(bucket=bucket, prefix=prefix)
+        with mock.patch("boto3.client", return_value=client):
+            storage = S3Storage(config, project, run_name)
+        return storage
+
+    def test_load_new_format_model_and_optimizer(self, tmp_path: Path) -> None:
+        """Test loading a new-format checkpoint with model.pt and optimizer.pt."""
+
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        mock_torch = mock.MagicMock()
+        mock_torch.save.side_effect = lambda obj, path: _pickle_save(obj, path)
+        mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
+
+        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
+            storage.save_checkpoint(
+                step=10,
+                state_dict={"w": [1, 2, 3]},
+                optimizer_state_dict={"lr": 0.01},
+            )
+
+        with (
+            mock.patch.dict("sys.modules", {"torch": mock_torch}),
+            mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"),
+        ):
+            result = storage.load_checkpoint(10)
+
+        assert "model_state_dict" in result
+        assert result["model_state_dict"] == {"w": [1, 2, 3]}
+        assert "optimizer_state_dict" in result
+        assert result["optimizer_state_dict"] == {"lr": 0.01}
+
+    def test_load_new_format_skip_optimizer(self, tmp_path: Path) -> None:
+        """Test loading only model weights, skipping optimizer."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        mock_torch = mock.MagicMock()
+        mock_torch.save.side_effect = lambda obj, path: _pickle_save(obj, path)
+        mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
+
+        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
+            storage.save_checkpoint(
+                step=10,
+                state_dict={"w": [1]},
+                optimizer_state_dict={"lr": 0.1},
+            )
+
+        with (
+            mock.patch.dict("sys.modules", {"torch": mock_torch}),
+            mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"),
+        ):
+            result = storage.load_checkpoint(10, load_optimizer=False)
+
+        assert "model_state_dict" in result
+        assert "optimizer_state_dict" not in result
+
+    def test_load_legacy_format(self, tmp_path: Path) -> None:
+        """Test loading an old-format checkpoint (single checkpoint.pt)."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        mock_torch = mock.MagicMock()
+        mock_torch.save.side_effect = lambda obj, path: _pickle_save(obj, path)
+        mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
+
+        legacy_data = {
+            "model_state_dict": {"w": 42},
+            "optimizer_state_dict": {"lr": 0.01},
+        }
+        import pickle
+
+        s3_key = "pfx/runs/proj/run-1/checkpoints/5/checkpoint.pt"
+        stored[s3_key] = pickle.dumps(legacy_data)
+
+        index_key = "pfx/runs/proj/run-1/checkpoints.json"
+        stored[index_key] = json.dumps(
+            [{"step": 5, "files": ["checkpoint.pt"], "size_bytes": 100}]
+        ).encode()
+
+        with (
+            mock.patch.dict("sys.modules", {"torch": mock_torch}),
+            mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"),
+        ):
+            result = storage.load_checkpoint(5)
+
+        assert result["model_state_dict"] == {"w": 42}
+        assert result["optimizer_state_dict"] == {"lr": 0.01}
+
+    def test_load_uses_local_cache(self, tmp_path: Path) -> None:
+        """Test that a cached file is not re-downloaded."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        mock_torch = mock.MagicMock()
+        mock_torch.save.side_effect = lambda obj, path: _pickle_save(obj, path)
+        mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
+
+        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
+            storage.save_checkpoint(step=20, state_dict={"w": 1})
+
+        with (
+            mock.patch.dict("sys.modules", {"torch": mock_torch}),
+            mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"),
+        ):
+            storage.load_checkpoint(20)
+            client.download_file.reset_mock()
+            storage.load_checkpoint(20)
+
+        client.download_file.assert_not_called()
+
+    def test_load_nonexistent_step_raises(self) -> None:
+        """Test that loading a step that doesn't exist raises FileNotFoundError."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        with pytest.raises(FileNotFoundError, match="step 999"):
+            storage.load_checkpoint(999)
+
+
+def _pickle_save(obj, path):
+    import pickle
+
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def _pickle_load(path):
+    import pickle
+
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 class TestRunDataReading:

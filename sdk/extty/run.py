@@ -282,6 +282,41 @@ class Run:
             optimizer_state_dict=optimizer_state_dict,
         )
 
+    def load_checkpoint(
+        self,
+        step: int,
+        load_optimizer: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Load a checkpoint, downloading from S3 if not cached locally.
+
+        Parameters
+        ----------
+        step : int
+            The training step to load.
+        load_optimizer : bool, default True
+            Whether to include the optimizer state in the result.
+
+        Returns
+        -------
+        dict[str, Any]
+            Contains ``"model_state_dict"`` and optionally
+            ``"optimizer_state_dict"``.
+
+        Raises
+        ------
+        RuntimeError
+            If no S3 storage is configured.
+        FileNotFoundError
+            If the checkpoint step does not exist.
+        """
+        if self._s3_storage is None:
+            raise RuntimeError(
+                "S3 storage is not configured. "
+                "Set EXTTY_S3_BUCKET or provide s3_config to load checkpoints."
+            )
+        return self._s3_storage.load_checkpoint(step, load_optimizer=load_optimizer)
+
     def finish(self) -> None:
         """
         Finish the run.

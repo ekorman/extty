@@ -133,13 +133,44 @@ pub struct Model {
     pub updated_at: Option<DateTime<Local>>,
 }
 
-// A checkpoint saved during training
+#[derive(Debug, Clone)]
+pub struct CheckpointFile {
+    pub name: String,
+    pub size_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
     pub step: u64,
     pub timestamp: Option<DateTime<Local>>,
-    pub size_bytes: Option<u64>,
-    pub downloaded: bool,
+    pub files: Vec<CheckpointFile>,
+    pub downloaded_files: Vec<String>,
+}
+
+impl Checkpoint {
+    pub fn total_size_bytes(&self) -> Option<u64> {
+        let mut total = 0u64;
+        let mut has_any = false;
+        for f in &self.files {
+            if let Some(sz) = f.size_bytes {
+                total += sz;
+                has_any = true;
+            }
+        }
+        if has_any { Some(total) } else { None }
+    }
+
+    pub fn all_downloaded(&self) -> bool {
+        !self.files.is_empty()
+            && self
+                .files
+                .iter()
+                .all(|f| self.downloaded_files.contains(&f.name))
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.files.len() == 1 && self.files[0].name == "checkpoint.pt"
+    }
 }
 
 // Run status
@@ -604,13 +635,44 @@ fn load_checkpoints(run_path: &Path) -> Vec<Checkpoint> {
                 .get("timestamp")
                 .and_then(|v| v.as_str())
                 .and_then(parse_datetime);
-            let size_bytes = entry.get("size_bytes").and_then(|v| v.as_u64());
-            let downloaded = checkpoints_dir.join(step.to_string()).is_dir();
+
+            let files: Vec<CheckpointFile> = match entry.get("files") {
+                Some(serde_json::Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|item| match item {
+                        serde_json::Value::String(name) => Some(CheckpointFile {
+                            name: name.clone(),
+                            size_bytes: None,
+                        }),
+                        serde_json::Value::Object(obj) => {
+                            let name = obj.get("name")?.as_str()?.to_string();
+                            let size_bytes = obj.get("size_bytes").and_then(|v| v.as_u64());
+                            Some(CheckpointFile { name, size_bytes })
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                _ => {
+                    let size_bytes = entry.get("size_bytes").and_then(|v| v.as_u64());
+                    vec![CheckpointFile {
+                        name: "checkpoint.pt".to_string(),
+                        size_bytes,
+                    }]
+                }
+            };
+
+            let step_dir = checkpoints_dir.join(step.to_string());
+            let downloaded_files: Vec<String> = files
+                .iter()
+                .filter(|f| step_dir.join(&f.name).exists())
+                .map(|f| f.name.clone())
+                .collect();
+
             Some(Checkpoint {
                 step,
                 timestamp,
-                size_bytes,
-                downloaded,
+                files,
+                downloaded_files,
             })
         })
         .collect();

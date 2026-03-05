@@ -52,6 +52,18 @@ class ExampleRecord:
     data: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CheckpointFile:
+    name: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    step: int
+    files: list[CheckpointFile]
+
+
 def sanitize_metric_name(name: str) -> str:
     """
     Sanitize a metric name for use as a file path.
@@ -444,3 +456,6 @@ class RunStorage:
                     )
                 )
         return records
+
+    def list_checkpoints():
+        pass
