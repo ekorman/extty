@@ -524,6 +524,7 @@ class S3Storage:
         self,
         step: int,
         load_optimizer: bool = True,
+        map_location=None,
     ) -> dict[str, Any]:
         """
         Load a checkpoint, downloading from S3 if not cached locally.
@@ -557,6 +558,8 @@ class S3Storage:
 
         import torch
 
+        map_location = map_location or torch.device("cpu")
+
         project_dir = self.project if self.project else "_default"
         local_dir = (
             get_runs_dir() / project_dir / self.run_name / "checkpoints" / str(step)
@@ -588,7 +591,11 @@ class S3Storage:
 
         is_legacy = file_names == ["checkpoint.pt"]
         if is_legacy:
-            data = torch.load(local_dir / "checkpoint.pt", weights_only=False)
+            data = torch.load(
+                local_dir / "checkpoint.pt",
+                weights_only=False,
+                map_location=map_location,
+            )
             result: dict[str, Any] = {
                 "model_state_dict": data.get("model_state_dict", data)
             }
@@ -597,7 +604,9 @@ class S3Storage:
             return result
 
         result = {
-            "model_state_dict": torch.load(local_dir / "model.pt", weights_only=False)
+            "model_state_dict": torch.load(
+                local_dir / "model.pt", weights_only=False, map_location=map_location
+            )
         }
         if (
             load_optimizer
@@ -605,7 +614,9 @@ class S3Storage:
             and (local_dir / "optimizer.pt").exists()
         ):
             result["optimizer_state_dict"] = torch.load(
-                local_dir / "optimizer.pt", weights_only=False
+                local_dir / "optimizer.pt",
+                weights_only=False,
+                map_location=map_location,
             )
         return result
 
