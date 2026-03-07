@@ -2320,6 +2320,9 @@ impl App {
                 self.selected_list_item = 0;
                 self.list_state.select(Some(0));
             }
+            KeyCode::Esc if !self.compared_runs.is_empty() => {
+                self.compared_runs.clear();
+            }
             _ => {}
         }
     }
@@ -4289,6 +4292,16 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
         Span::styled("n", Style::default().fg(NEON_YELLOW)),
         Span::styled("] note  ", Style::default().fg(Color::DarkGray)),
     ];
+    if !app.compared_runs.is_empty() {
+        help_spans.extend(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(NEON_CYAN)),
+            Span::styled(
+                format!("] clear {}  ", app.compared_runs.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
     if app.compared_runs.len() >= 2 {
         help_spans.extend(vec![
             Span::styled("[", Style::default().fg(DIM_CYAN)),
