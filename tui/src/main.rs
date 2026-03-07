@@ -4527,7 +4527,7 @@ fn render_models_list(app: &App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(help), help_area);
 }
 
-fn render_run_detail(app: &App, frame: &mut Frame) {
+fn render_run_detail(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
     let Some(run) = app.current_run() else {
@@ -4661,10 +4661,13 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
     render_cards_grid(app, frame, grid_area, &cards);
 
     // Config panel (if shown)
+    let run_config_cloned = run.config.clone();
+    let has_sys_metrics = run.metrics.keys().any(|k| k.starts_with("sys/"));
+    let is_running = run.is_running();
     if let Some(config_area) = config_area
-        && let Some(config) = &run.config
+        && let Some(ref config) = run_config_cloned
     {
-        render_config_panel(frame, config_area, config, app.config_panel_scroll);
+        render_config_panel(frame, config_area, config, &mut app.config_panel_scroll);
     }
 
     // Footer with styled keys
@@ -4701,7 +4704,7 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
         Span::styled("n", Style::default().fg(NEON_YELLOW)),
         Span::styled("] note  ", Style::default().fg(Color::DarkGray)),
     ];
-    if run.metrics.keys().any(|k| k.starts_with("sys/")) {
+    if has_sys_metrics {
         let sys_hint = if app.show_system_metrics {
             "train"
         } else {
@@ -4723,7 +4726,7 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
             Span::styled("] scroll config  ", Style::default().fg(Color::DarkGray)),
         ]);
     }
-    if run.is_running() {
+    if is_running {
         footer_spans.extend([
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("m", Style::default().fg(NEON_YELLOW)),
@@ -4743,7 +4746,7 @@ fn render_run_detail(app: &App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
-fn render_model_detail(app: &App, frame: &mut Frame) {
+fn render_model_detail(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
     let Some(model) = app.current_model() else {
@@ -4816,10 +4819,11 @@ fn render_model_detail(app: &App, frame: &mut Frame) {
 
     render_model_cards_grid(app, frame, grid_area, &cards);
 
+    let model_config_cloned = model.config.clone();
     if let Some(config_area) = config_area
-        && let Some(config) = &model.config
+        && let Some(ref config) = model_config_cloned
     {
-        render_config_panel(frame, config_area, config, app.config_panel_scroll);
+        render_config_panel(frame, config_area, config, &mut app.config_panel_scroll);
     }
 
     let config_hint = if app.show_config { "hide" } else { "config" };
@@ -5079,7 +5083,7 @@ fn render_comparison_chart(
     frame.render_widget(chart, area);
 }
 
-fn render_compare_view(app: &App, frame: &mut Frame) {
+fn render_compare_view(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
     let cards = app.compare_cards();
 
@@ -5222,7 +5226,8 @@ fn render_compare_view(app: &App, frame: &mut Frame) {
                     let total_lines = lines.len();
                     let visible = col_chunks[i].height.saturating_sub(2) as usize;
                     let max_scroll = total_lines.saturating_sub(visible);
-                    let scroll = app.config_panel_scroll.min(max_scroll) as u16;
+                    app.config_panel_scroll = app.config_panel_scroll.min(max_scroll);
+                    let scroll = app.config_panel_scroll as u16;
                     let block = Block::default()
                         .title(Span::styled(
                             format!(" {} ", run.display_name()),
@@ -5352,14 +5357,20 @@ fn render_compare_examples_card(
     frame.render_widget(paragraph, area);
 }
 
-fn render_config_panel(frame: &mut Frame, area: Rect, config: &serde_json::Value, scroll: usize) {
+fn render_config_panel(
+    frame: &mut Frame,
+    area: Rect,
+    config: &serde_json::Value,
+    scroll: &mut usize,
+) {
     let mut lines: Vec<Line> = Vec::new();
     render_json_value(config, 0, &mut lines, None, "");
 
     let total_lines = lines.len();
     let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = total_lines.saturating_sub(visible);
-    let scroll = scroll.min(max_scroll) as u16;
+    *scroll = (*scroll).min(max_scroll);
+    let scroll = *scroll as u16;
 
     let has_above = scroll > 0;
     let has_below = (scroll as usize) < max_scroll;
