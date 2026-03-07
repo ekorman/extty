@@ -281,6 +281,8 @@ struct App {
     filter_modal_input: String,
     filter_modal_selected: usize,
     filter_modal_key: String,
+    search_query: String,
+    search_editing: bool,
 }
 
 impl App {
@@ -391,6 +393,8 @@ impl App {
             filter_modal_input: String::new(),
             filter_modal_selected: 0,
             filter_modal_key: String::new(),
+            search_query: String::new(),
+            search_editing: false,
         }
     }
 
@@ -406,8 +410,13 @@ impl App {
         // Group runs by project
         let mut projects: BTreeMap<String, Vec<usize>> = BTreeMap::new();
 
+        let search_lower = self.search_query.to_lowercase();
+
         for (i, run) in self.runs.iter().enumerate() {
             if !self.config_filters.is_empty() && !run_matches_filters(run, &self.config_filters) {
+                continue;
+            }
+            if !search_lower.is_empty() && !run.name.to_lowercase().contains(&search_lower) {
                 continue;
             }
             let project = run
@@ -424,7 +433,7 @@ impl App {
                 name: project_name.clone(),
             });
 
-            if self.expanded_projects.contains(&project_name) {
+            if !search_lower.is_empty() || self.expanded_projects.contains(&project_name) {
                 let mut starred: Vec<usize> = Vec::new();
                 let mut unstarred: Vec<usize> = Vec::new();
                 for run_index in run_indices {
@@ -1784,6 +1793,32 @@ impl App {
             return;
         }
 
+        if self.search_editing {
+            match code {
+                KeyCode::Char(c) => {
+                    self.search_query.push(c);
+                    self.selected_list_item = 0;
+                    self.list_state.select(Some(0));
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    self.selected_list_item = 0;
+                    self.list_state.select(Some(0));
+                }
+                KeyCode::Esc => {
+                    self.search_query.clear();
+                    self.search_editing = false;
+                    self.selected_list_item = 0;
+                    self.list_state.select(Some(0));
+                }
+                KeyCode::Enter => {
+                    self.search_editing = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match self.view {
             View::List => match self.view_mode {
                 ViewMode::Runs => self.handle_list_key(code),
@@ -2317,6 +2352,14 @@ impl App {
             }
             KeyCode::Char('F') => {
                 self.config_filters.clear();
+                self.selected_list_item = 0;
+                self.list_state.select(Some(0));
+            }
+            KeyCode::Char('/') => {
+                self.search_editing = true;
+            }
+            KeyCode::Esc if !self.search_query.is_empty() => {
+                self.search_query.clear();
                 self.selected_list_item = 0;
                 self.list_state.select(Some(0));
             }
@@ -4253,6 +4296,18 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
         title_spans.push(Span::styled(filter_str, Style::default().fg(NEON_YELLOW)));
     }
 
+    if !app.search_query.is_empty() || app.search_editing {
+        title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        title_spans.push(Span::styled("/", Style::default().fg(NEON_CYAN)));
+        title_spans.push(Span::styled(
+            app.search_query.clone(),
+            Style::default().fg(NEON_YELLOW),
+        ));
+        if app.search_editing {
+            title_spans.push(Span::styled("█", Style::default().fg(NEON_CYAN)));
+        }
+    }
+
     let list = List::new(items)
         .block(
             Block::default()
@@ -4327,7 +4382,10 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
         Span::styled("] move  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("f", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] filter", Style::default().fg(Color::DarkGray)),
+        Span::styled("] filter  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("/", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] search", Style::default().fg(Color::DarkGray)),
     ]);
     if !app.config_filters.is_empty() {
         help_spans.extend(vec![
