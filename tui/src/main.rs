@@ -401,6 +401,7 @@ impl App {
     fn update_size(&mut self, width: u16, height: u16) {
         self.term_width = width;
         self.term_height = height;
+        self.ensure_card_visible();
     }
 
     // Build the flattened list of entries (projects and runs)
@@ -1372,13 +1373,29 @@ impl App {
         let card_height = 12u16;
         let grid_height = self.term_height.saturating_sub(5); // header + footer
 
-        let config_width = 35u16;
-        let has_config = self
-            .current_run()
-            .map(|r| r.config.is_some())
-            .unwrap_or(false);
+        let config_panel_width = if self.view == View::Compare {
+            35u16 * self.compared_runs.len() as u16
+        } else {
+            35u16
+        };
+        let has_config = match self.view {
+            View::Compare => self
+                .compared_runs
+                .iter()
+                .any(|&ri| self.runs.get(ri).and_then(|r| r.config.as_ref()).is_some()),
+            _ => match self.view_mode {
+                ViewMode::Models => self
+                    .current_model()
+                    .map(|m| m.config.is_some())
+                    .unwrap_or(false),
+                _ => self
+                    .current_run()
+                    .map(|r| r.config.is_some())
+                    .unwrap_or(false),
+            },
+        };
         let effective_width = if self.show_config && has_config {
-            self.term_width.saturating_sub(config_width)
+            self.term_width.saturating_sub(config_panel_width)
         } else {
             self.term_width
         };
@@ -1386,6 +1403,27 @@ impl App {
         let cols = (effective_width / card_width).max(1) as usize;
         let visible_rows = (grid_height / card_height).max(1) as usize;
         (visible_rows, cols)
+    }
+
+    fn ensure_card_visible(&mut self) {
+        let (visible_rows, cols) = self.grid_layout();
+        let card_count = match self.view {
+            View::Compare => self.compare_cards().len(),
+            _ => match self.view_mode {
+                ViewMode::Models => self.model_card_count(),
+                _ => self.card_count(),
+            },
+        };
+        self.selected_card = self.selected_card.min(card_count.saturating_sub(1));
+        let card_row = self.selected_card / cols;
+        let total_rows = card_count.div_ceil(cols);
+        let max_scroll = total_rows.saturating_sub(visible_rows);
+        if card_row < self.scroll_offset {
+            self.scroll_offset = card_row;
+        } else if card_row >= self.scroll_offset + visible_rows {
+            self.scroll_offset = (card_row + 1).saturating_sub(visible_rows);
+        }
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
     }
 
     fn current_run(&self) -> Option<&Run> {
@@ -2496,6 +2534,7 @@ impl App {
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
                 self.config_panel_scroll = 0;
+                self.ensure_card_visible();
             }
             KeyCode::Char('J') if self.show_config => {
                 self.config_panel_scroll += 1;
@@ -2651,6 +2690,7 @@ impl App {
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
                 self.config_panel_scroll = 0;
+                self.ensure_card_visible();
             }
             KeyCode::Char('J') if self.show_config => {
                 self.config_panel_scroll += 1;
@@ -2711,6 +2751,7 @@ impl App {
             KeyCode::Char('c') => {
                 self.show_config = !self.show_config;
                 self.config_panel_scroll = 0;
+                self.ensure_card_visible();
             }
             KeyCode::Char('J') if self.show_config => {
                 self.config_panel_scroll += 1;
