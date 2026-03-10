@@ -1409,6 +1409,7 @@ impl App {
         let (visible_rows, cols) = self.grid_layout();
         let card_count = match self.view {
             View::Compare => self.compare_cards().len(),
+            View::Focused if self.compare_focused => self.compare_cards().len(),
             _ => match self.view_mode {
                 ViewMode::Models => self.model_card_count(),
                 _ => self.card_count(),
