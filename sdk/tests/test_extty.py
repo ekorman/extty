@@ -425,6 +425,76 @@ class TestExampleRewards:
             assert data["data"]["reward"] == [[{"acc": 1.0, "fmt": 0.9, "eff": 0.85}]]
 
 
+class TestExampleGroundtruth:
+    """Tests for Example and BatchExample groundtruth functionality."""
+
+    def test_example_with_groundtruth(self) -> None:
+        example = extty.Example(
+            prompt="What is 2+2?",
+            responses=["4", "Five"],
+            groundtruth="4",
+        )
+        assert example.groundtruth == "4"
+        result = example.to_dict()
+        assert result["groundtruth"] == ["4"]
+
+    def test_example_without_groundtruth(self) -> None:
+        example = extty.Example(
+            prompt="Hello",
+            responses=["Hi"],
+        )
+        assert example.groundtruth is None
+        result = example.to_dict()
+        assert "groundtruth" not in result
+
+    def test_batch_example_with_groundtruth(self) -> None:
+        batch = extty.BatchExample(
+            prompts=["What is 2+2?", "What is 3+3?"],
+            responses=[["4"], ["6"]],
+            groundtruth=["4", "6"],
+        )
+        assert batch.groundtruth == ["4", "6"]
+        result = batch.to_dict()
+        assert result["groundtruth"] == ["4", "6"]
+
+    def test_batch_example_groundtruth_length_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match="groundtruth length .* != prompts length"):
+            extty.BatchExample(
+                prompts=["P1", "P2", "P3"],
+                responses=[["R1"], ["R2"], ["R3"]],
+                groundtruth=["GT1", "GT2"],
+            )
+
+    def test_log_example_with_groundtruth(self, tmp_path: Path) -> None:
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="gt-test", system_metrics=False)
+            extty.log(
+                {
+                    "val/example": extty.Example(
+                        prompt="What is 2+2?",
+                        responses=["4"],
+                        groundtruth="4",
+                    )
+                },
+                step=10,
+            )
+            extty.finish()
+
+            example_path = (
+                tmp_path
+                / "runs"
+                / "test-project"
+                / "gt-test"
+                / "examples"
+                / "val"
+                / "example.jsonl"
+            )
+            assert example_path.exists()
+            content = example_path.read_text()
+            data = json.loads(content)
+            assert data["data"]["groundtruth"] == ["4"]
+
+
 class TestLogEvaluation:
     """Tests for log_evaluation functionality."""
 

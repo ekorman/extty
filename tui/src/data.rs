@@ -36,6 +36,7 @@ pub struct Example {
     pub prompts: Vec<String>,
     pub responses: Vec<Vec<String>>,
     pub rewards: Option<Vec<Vec<Reward>>>,
+    pub groundtruth: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,7 @@ impl ExampleGroup {
             prompts: row.data.prompt,
             responses: row.data.response,
             rewards: row.data.reward,
+            groundtruth: row.data.groundtruth,
         })
     }
 }
@@ -103,6 +105,7 @@ pub struct EvaluationExample {
     pub prompts: Vec<String>,
     pub responses: Vec<Vec<String>>,
     pub rewards: Option<Vec<Vec<Reward>>>,
+    pub groundtruth: Option<Vec<String>>,
 }
 
 // An evaluation snapshot (now associated with models instead of runs)
@@ -519,6 +522,7 @@ fn load_evaluation(path: &Path, model_name: &str, project: &str) -> Option<Evalu
                         prompts: ex_data.prompt,
                         responses: ex_data.response,
                         rewards: ex_data.reward,
+                        groundtruth: ex_data.groundtruth,
                     })
                 })
                 .collect()
@@ -1013,6 +1017,67 @@ where
     deserializer.deserialize_any(StringOrVec)
 }
 
+/// Helper to deserialize an optional value that can be either a single string or a list of strings
+fn deserialize_optional_string_or_vec<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct OptionalStringOrVec;
+
+    impl<'de> de::Visitor<'de> for OptionalStringOrVec {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("null, a string, or array of strings")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(vec![value.to_owned()]))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(vec![value]))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut strings = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                strings.push(s);
+            }
+            Ok(Some(strings))
+        }
+    }
+
+    deserializer.deserialize_any(OptionalStringOrVec)
+}
+
 /// Helper to deserialize responses: string, array of strings, or array of arrays of strings
 /// - "r1" → [[r1]]
 /// - ["r1", "r2"] → [[r1, r2]] (old format: variants for single prompt)
@@ -1242,6 +1307,8 @@ struct ExampleData {
     response: Vec<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_rewards")]
     reward: Option<Vec<Vec<Reward>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_vec")]
+    groundtruth: Option<Vec<String>>,
 }
 
 fn build_example_index(
@@ -1282,6 +1349,7 @@ fn build_example_index(
                 prompts: row.data.prompt,
                 responses: row.data.response,
                 rewards: row.data.reward,
+                groundtruth: row.data.groundtruth,
             });
         }
     }

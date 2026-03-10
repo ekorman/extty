@@ -121,6 +121,7 @@ impl InfraTypeSort {
 #[derive(Clone, Copy, PartialEq)]
 enum FocusedSection {
     Prompt,
+    Groundtruth,
     Response,
 }
 
@@ -190,9 +191,10 @@ struct App {
     selected_prompt: usize,   // Index within prompts batch for an example
     selected_response: usize, // Index within response variants for an example
     scroll_offset: usize,
-    focused_section: FocusedSection, // Which section (prompt/response) is focused
+    focused_section: FocusedSection, // Which section (prompt/response/groundtruth) is focused
     prompt_scroll_offset: usize,     // Scroll offset for prompt in focused view
     response_scroll_offset: usize,   // Scroll offset for response in focused view
+    groundtruth_scroll_offset: usize, // Scroll offset for groundtruth in focused view
     view: View,
     view_mode: ViewMode,
     should_quit: bool,
@@ -311,6 +313,7 @@ impl App {
             focused_section: FocusedSection::Response,
             prompt_scroll_offset: 0,
             response_scroll_offset: 0,
+            groundtruth_scroll_offset: 0,
             view: View::List,
             view_mode: ViewMode::Runs,
             should_quit: false,
@@ -1629,6 +1632,29 @@ impl App {
         }
     }
 
+    fn current_example_has_groundtruth(&self) -> bool {
+        let cards = self.active_cards();
+        match cards.get(self.selected_card) {
+            Some(Card::Examples { name }) => {
+                if let Some((ref cn, ci, ref ex)) = self.cached_example {
+                    cn == name && ci == self.selected_example && ex.groundtruth.is_some()
+                } else {
+                    false
+                }
+            }
+            Some(Card::Evaluation { name }) => {
+                let eval = match self.view_mode {
+                    ViewMode::Runs | ViewMode::Infra => None,
+                    ViewMode::Models => self.get_model_evaluation(name),
+                };
+                eval.and_then(|e| e.examples.get(self.selected_example))
+                    .and_then(|ex| ex.groundtruth.as_ref())
+                    .is_some()
+            }
+            _ => false,
+        }
+    }
+
     // Get max scroll offset for prompt/response in focused view
     fn focused_max_scroll(&self, is_prompt: bool) -> usize {
         let cards = self.active_cards();
@@ -1825,6 +1851,7 @@ impl App {
                         self.selected_response = 0;
                         self.prompt_scroll_offset = 0;
                         self.response_scroll_offset = 0;
+                        self.groundtruth_scroll_offset = 0;
                     }
                 }
                 _ => {}
@@ -2882,11 +2909,20 @@ impl App {
                 }
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
-            // Tab toggles focus between prompt and response sections
+            // Tab cycles focus: Prompt → Groundtruth → Response (skip Groundtruth when absent)
             KeyCode::Tab => {
+                let has_gt = self.current_example_has_groundtruth();
                 self.focused_section = match self.focused_section {
-                    FocusedSection::Prompt => FocusedSection::Response,
+                    FocusedSection::Prompt => {
+                        if has_gt {
+                            FocusedSection::Groundtruth
+                        } else {
+                            FocusedSection::Response
+                        }
+                    }
+                    FocusedSection::Groundtruth => FocusedSection::Response,
                     FocusedSection::Response => FocusedSection::Prompt,
                 };
             }
@@ -2896,6 +2932,9 @@ impl App {
                     let max = self.focused_max_scroll(true);
                     self.prompt_scroll_offset = (self.prompt_scroll_offset + 1).min(max);
                 }
+                FocusedSection::Groundtruth => {
+                    self.groundtruth_scroll_offset += 1;
+                }
                 FocusedSection::Response => {
                     let max = self.focused_max_scroll(false);
                     self.response_scroll_offset = (self.response_scroll_offset + 1).min(max);
@@ -2904,6 +2943,10 @@ impl App {
             KeyCode::Char('j') => match self.focused_section {
                 FocusedSection::Prompt => {
                     self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_sub(1);
+                }
+                FocusedSection::Groundtruth => {
+                    self.groundtruth_scroll_offset =
+                        self.groundtruth_scroll_offset.saturating_sub(1);
                 }
                 FocusedSection::Response => {
                     self.response_scroll_offset = self.response_scroll_offset.saturating_sub(1);
@@ -2915,6 +2958,9 @@ impl App {
                     let max = self.focused_max_scroll(true);
                     self.prompt_scroll_offset = (self.prompt_scroll_offset + 10).min(max);
                 }
+                FocusedSection::Groundtruth => {
+                    self.groundtruth_scroll_offset += 10;
+                }
                 FocusedSection::Response => {
                     let max = self.focused_max_scroll(false);
                     self.response_scroll_offset = (self.response_scroll_offset + 10).min(max);
@@ -2923,6 +2969,10 @@ impl App {
             KeyCode::PageUp => match self.focused_section {
                 FocusedSection::Prompt => {
                     self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_sub(10);
+                }
+                FocusedSection::Groundtruth => {
+                    self.groundtruth_scroll_offset =
+                        self.groundtruth_scroll_offset.saturating_sub(10);
                 }
                 FocusedSection::Response => {
                     self.response_scroll_offset = self.response_scroll_offset.saturating_sub(10);
@@ -2938,6 +2988,7 @@ impl App {
                 self.selected_checkpoint = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             KeyCode::Right
                 if card_count > 1 && self.selected_card < card_count.saturating_sub(1) =>
@@ -2950,6 +3001,7 @@ impl App {
                 self.selected_checkpoint = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             // Checkpoint navigation
             KeyCode::Up if checkpoint_count > 0 && self.selected_checkpoint > 0 => {
@@ -2994,6 +3046,7 @@ impl App {
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             KeyCode::Down if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
                 self.selected_example =
@@ -3003,6 +3056,7 @@ impl App {
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             // Up/Down navigate within example groups
             KeyCode::Up if example_count > 0 && self.selected_example > 0 => {
@@ -3012,6 +3066,7 @@ impl App {
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             KeyCode::Down
                 if example_count > 0 && self.selected_example < example_count.saturating_sub(1) =>
@@ -3022,6 +3077,7 @@ impl App {
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             // [ and ] navigate between prompts in batch
             KeyCode::Char('[') if prompt_count > 1 && self.selected_prompt > 0 => {
@@ -3029,6 +3085,7 @@ impl App {
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             KeyCode::Char(']')
                 if prompt_count > 1 && self.selected_prompt < prompt_count.saturating_sub(1) =>
@@ -3037,6 +3094,7 @@ impl App {
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             // < and > navigate between response variants
             KeyCode::Char('<') if response_count > 1 && self.selected_response > 0 => {
@@ -3058,6 +3116,7 @@ impl App {
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             KeyCode::End if example_count > 0 => {
                 self.selected_example = example_count.saturating_sub(1);
@@ -3066,6 +3125,7 @@ impl App {
                 self.selected_response = 0;
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
+                self.groundtruth_scroll_offset = 0;
             }
             // g opens goto step input
             KeyCode::Char('g') if example_count > 0 => {
@@ -5997,17 +6057,28 @@ fn render_examples_card(
             .take(max_lines.saturating_sub(2))
             .collect();
 
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("Q: ", Style::default().fg(NEON_YELLOW).bold()),
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Q: ", Style::default().fg(NEON_YELLOW).bold()),
+            Span::styled(
+                format!("{}...", prompt_preview),
+                Style::default().fg(Color::White),
+            ),
+        ])];
+        if let Some(gt) = example.groundtruth.as_ref().and_then(|g| g.first()) {
+            let gt_preview: String = gt.chars().take(50).collect();
+            lines.push(Line::from(vec![
+                Span::styled("GT: ", Style::default().fg(NEON_MAGENTA).bold()),
                 Span::styled(
-                    format!("{}...", prompt_preview),
+                    format!("{}...", gt_preview),
                     Style::default().fg(Color::White),
                 ),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled("A: ", Style::default().fg(NEON_GREEN).bold())),
-        ];
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "A: ",
+            Style::default().fg(NEON_GREEN).bold(),
+        )));
         for line in response_lines {
             lines.push(Line::from(Span::styled(
                 line,
@@ -6510,12 +6581,24 @@ fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, nam
             .and_then(|g| g.find_step(current_step))
             .and_then(|idx| run.examples.get(name).unwrap().load(idx));
 
-        let col_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(col_area);
-
         if let Some(ex) = example {
+            let has_gt = ex.groundtruth.is_some();
+            let col_chunks = if has_gt {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Percentage(30),
+                        Constraint::Percentage(35),
+                        Constraint::Percentage(35),
+                    ])
+                    .split(col_area)
+            } else {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                    .split(col_area)
+            };
+
             let prompt_text = ex
                 .prompts
                 .get(app.selected_prompt)
@@ -6541,6 +6624,32 @@ fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, nam
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .scroll((app.prompt_scroll_offset as u16, 0));
             frame.render_widget(prompt, col_chunks[0]);
+
+            let response_chunk_idx = if has_gt {
+                let gt_text = ex
+                    .groundtruth
+                    .as_ref()
+                    .and_then(|gt| gt.get(app.selected_prompt))
+                    .cloned()
+                    .unwrap_or_default();
+                let gt_block = Block::default()
+                    .title(Span::styled(
+                        "GROUNDTRUTH",
+                        Style::default().fg(NEON_MAGENTA).bold(),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(color));
+                let gt = Paragraph::new(gt_text)
+                    .style(Style::default().fg(Color::White))
+                    .block(gt_block)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((app.groundtruth_scroll_offset as u16, 0));
+                frame.render_widget(gt, col_chunks[1]);
+                2
+            } else {
+                1
+            };
 
             let response_text = ex
                 .responses
@@ -6598,7 +6707,7 @@ fn render_focused_compare_examples(app: &App, frame: &mut Frame, area: Rect, nam
                 .block(response_block)
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .scroll((app.response_scroll_offset as u16, 0));
-            frame.render_widget(response, col_chunks[1]);
+            frame.render_widget(response, col_chunks[response_chunk_idx]);
         } else {
             let block = Block::default()
                 .title(Line::from(vec![
@@ -6675,6 +6784,7 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                         app.focused_section,
                         app.prompt_scroll_offset,
                         app.response_scroll_offset,
+                        app.groundtruth_scroll_offset,
                     );
                 }
                 let prompt_count = example.map(|e| e.prompts.len()).unwrap_or(0);
@@ -6684,6 +6794,7 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                     .unwrap_or(0);
                 let focus_label = match app.focused_section {
                     FocusedSection::Prompt => "prompt",
+                    FocusedSection::Groundtruth => "groundtruth",
                     FocusedSection::Response => "response",
                 };
                 let mut footer_spans = vec![
@@ -6831,6 +6942,7 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
             app.focused_section,
             app.prompt_scroll_offset,
             app.response_scroll_offset,
+            app.groundtruth_scroll_offset,
             app.show_config,
             model_config.as_ref(),
             app.config_panel_scroll,
@@ -6844,6 +6956,7 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
             .unwrap_or(0);
         let focus_label = match app.focused_section {
             FocusedSection::Prompt => "prompt",
+            FocusedSection::Groundtruth => "groundtruth",
             FocusedSection::Response => "response",
         };
         let config_hint = if app.show_config { "hide" } else { "config" };
@@ -6931,6 +7044,7 @@ fn render_focused_evaluation(
     focused_section: FocusedSection,
     prompt_scroll_offset: usize,
     response_scroll_offset: usize,
+    groundtruth_scroll_offset: usize,
     show_model_config: bool,
     model_config: Option<&serde_json::Value>,
     config_panel_scroll: usize,
@@ -7231,14 +7345,27 @@ fn render_focused_evaluation(
         let examples_inner = examples_block.inner(h_chunks[1]);
         frame.render_widget(examples_block, h_chunks[1]);
 
-        // Split examples inner area into prompt and response
-        let example_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(examples_inner);
-
         // Get current example
         if let Some(example) = eval.examples.get(selected_example) {
+            let has_gt = example.groundtruth.is_some();
+
+            // Split examples inner area into prompt/groundtruth/response
+            let example_chunks = if has_gt {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Percentage(30),
+                        Constraint::Percentage(35),
+                        Constraint::Percentage(35),
+                    ])
+                    .split(examples_inner)
+            } else {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                    .split(examples_inner)
+            };
+
             // Get the prompt text
             let prompt_text = example
                 .prompts
@@ -7277,6 +7404,36 @@ fn render_focused_evaluation(
                     .scroll((prompt_scroll_offset as u16, 0)),
                 example_chunks[0],
             );
+
+            let response_chunk_idx = if has_gt {
+                let gt_text = example
+                    .groundtruth
+                    .as_ref()
+                    .and_then(|gt| gt.get(selected_prompt))
+                    .cloned()
+                    .unwrap_or_default();
+                let gt_focused = focused_section == FocusedSection::Groundtruth;
+                let gt_border_color = if gt_focused { NEON_CYAN } else { DIM_CYAN };
+                let gt_block = Block::default()
+                    .title(Span::styled(
+                        "GROUNDTRUTH ",
+                        Style::default().fg(NEON_MAGENTA).bold(),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(gt_border_color));
+                frame.render_widget(
+                    Paragraph::new(gt_text)
+                        .style(Style::default().fg(Color::White))
+                        .block(gt_block)
+                        .wrap(ratatui::widgets::Wrap { trim: false })
+                        .scroll((groundtruth_scroll_offset as u16, 0)),
+                    example_chunks[1],
+                );
+                2
+            } else {
+                1
+            };
 
             // Get responses for the selected prompt
             let responses_for_prompt = example
@@ -7370,7 +7527,7 @@ fn render_focused_evaluation(
                     .block(response_block)
                     .wrap(ratatui::widgets::Wrap { trim: false })
                     .scroll((response_scroll_offset as u16, 0)),
-                example_chunks[1],
+                example_chunks[response_chunk_idx],
             );
         }
     }
@@ -7389,12 +7546,24 @@ fn render_focused_example(
     focused_section: FocusedSection,
     prompt_scroll_offset: usize,
     response_scroll_offset: usize,
+    groundtruth_scroll_offset: usize,
 ) {
-    // Layout: prompt and response
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(area);
+    let has_gt = example.groundtruth.is_some();
+    let chunks = if has_gt {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(30),
+                Constraint::Percentage(35),
+                Constraint::Percentage(35),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(area)
+    };
 
     // Prompt title - show batch position if multiple prompts
     let prompt_focused = focused_section == FocusedSection::Prompt;
@@ -7441,6 +7610,35 @@ fn render_focused_example(
         .wrap(ratatui::widgets::Wrap { trim: false })
         .scroll((prompt_scroll_offset as u16, 0));
     frame.render_widget(prompt, chunks[0]);
+
+    let response_chunk_idx = if has_gt {
+        // Render groundtruth panel
+        let gt_text = example
+            .groundtruth
+            .as_ref()
+            .and_then(|gt| gt.get(selected_prompt))
+            .cloned()
+            .unwrap_or_default();
+        let gt_focused = focused_section == FocusedSection::Groundtruth;
+        let gt_border_color = if gt_focused { NEON_CYAN } else { DIM_CYAN };
+        let gt_block = Block::default()
+            .title(Span::styled(
+                "◆ GROUNDTRUTH ",
+                Style::default().fg(NEON_MAGENTA).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(gt_border_color));
+        let gt = Paragraph::new(gt_text)
+            .style(Style::default().fg(Color::White))
+            .block(gt_block)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((groundtruth_scroll_offset as u16, 0));
+        frame.render_widget(gt, chunks[1]);
+        2
+    } else {
+        1
+    };
 
     // Get responses for the selected prompt
     let responses_for_prompt = example
@@ -7534,7 +7732,7 @@ fn render_focused_example(
         )
         .wrap(ratatui::widgets::Wrap { trim: false })
         .scroll((response_scroll_offset as u16, 0));
-    frame.render_widget(response, chunks[1]);
+    frame.render_widget(response, chunks[response_chunk_idx]);
 }
 
 fn render_delete_confirm(app: &App, frame: &mut Frame) {
