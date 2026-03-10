@@ -1635,6 +1635,24 @@ impl App {
     fn current_example_has_groundtruth(&self) -> bool {
         let cards = self.active_cards();
         match cards.get(self.selected_card) {
+            Some(Card::Examples { name }) if self.compare_focused => {
+                let steps = self.compare_example_steps(name);
+                let step = steps.get(self.selected_example).copied();
+                step.map(|step| {
+                    self.compared_runs
+                        .iter()
+                        .filter_map(|&idx| self.runs.get(idx))
+                        .any(|run| {
+                            run.examples
+                                .get(name)
+                                .and_then(|g| g.find_step(step))
+                                .and_then(|idx| run.examples.get(name).unwrap().load(idx))
+                                .and_then(|ex| ex.groundtruth)
+                                .is_some()
+                        })
+                })
+                .unwrap_or(false)
+            }
             Some(Card::Examples { name }) => {
                 if let Some((ref cn, ci, ref ex)) = self.cached_example {
                     cn == name && ci == self.selected_example && ex.groundtruth.is_some()
@@ -1655,16 +1673,26 @@ impl App {
         }
     }
 
-    // Get max scroll offset for prompt/response in focused view
-    fn focused_max_scroll(&self, is_prompt: bool) -> usize {
+    // Get max scroll offset for a section in focused view
+    fn focused_max_scroll(&self, section: FocusedSection) -> usize {
         let cards = self.active_cards();
         let current_card = cards.get(self.selected_card);
+        let has_gt = self.current_example_has_groundtruth();
 
         let total_height = self.term_height.saturating_sub(6) as usize;
-        let visible_height = if is_prompt {
-            (total_height * 40 / 100).saturating_sub(2)
+        let visible_height = if has_gt {
+            match section {
+                FocusedSection::Prompt => (total_height * 30 / 100).saturating_sub(2),
+                FocusedSection::Groundtruth | FocusedSection::Response => {
+                    (total_height * 35 / 100).saturating_sub(2)
+                }
+            }
         } else {
-            (total_height * 60 / 100).saturating_sub(2)
+            match section {
+                FocusedSection::Prompt => (total_height * 40 / 100).saturating_sub(2),
+                FocusedSection::Response => (total_height * 60 / 100).saturating_sub(2),
+                FocusedSection::Groundtruth => 0,
+            }
         };
 
         let wrap_width = self.term_width.saturating_sub(4) as usize;
@@ -1673,17 +1701,24 @@ impl App {
             Some(Card::Examples { name }) => {
                 if let Some((ref cn, ci, ref ex)) = self.cached_example {
                     if cn == name && ci == self.selected_example {
-                        if is_prompt {
-                            ex.prompts
+                        match section {
+                            FocusedSection::Prompt => ex
+                                .prompts
                                 .get(self.selected_prompt)
                                 .cloned()
-                                .unwrap_or_default()
-                        } else {
-                            ex.responses
+                                .unwrap_or_default(),
+                            FocusedSection::Groundtruth => ex
+                                .groundtruth
+                                .as_ref()
+                                .and_then(|gt| gt.get(self.selected_prompt))
+                                .cloned()
+                                .unwrap_or_default(),
+                            FocusedSection::Response => ex
+                                .responses
                                 .get(self.selected_prompt)
                                 .and_then(|r| r.get(self.selected_response))
                                 .cloned()
-                                .unwrap_or_default()
+                                .unwrap_or_default(),
                         }
                     } else {
                         String::new()
@@ -1699,17 +1734,24 @@ impl App {
                 };
                 if let Some(eval) = eval {
                     if let Some(ex) = eval.examples.get(self.selected_example) {
-                        if is_prompt {
-                            ex.prompts
+                        match section {
+                            FocusedSection::Prompt => ex
+                                .prompts
                                 .get(self.selected_prompt)
                                 .cloned()
-                                .unwrap_or_default()
-                        } else {
-                            ex.responses
+                                .unwrap_or_default(),
+                            FocusedSection::Groundtruth => ex
+                                .groundtruth
+                                .as_ref()
+                                .and_then(|gt| gt.get(self.selected_prompt))
+                                .cloned()
+                                .unwrap_or_default(),
+                            FocusedSection::Response => ex
+                                .responses
                                 .get(self.selected_prompt)
                                 .and_then(|r| r.get(self.selected_response))
                                 .cloned()
-                                .unwrap_or_default()
+                                .unwrap_or_default(),
                         }
                     } else {
                         String::new()
@@ -2927,19 +2969,21 @@ impl App {
                 };
             }
             // k scrolls down, j scrolls up in the focused section
-            KeyCode::Char('k') => match self.focused_section {
-                FocusedSection::Prompt => {
-                    let max = self.focused_max_scroll(true);
-                    self.prompt_scroll_offset = (self.prompt_scroll_offset + 1).min(max);
+            KeyCode::Char('k') => {
+                let max = self.focused_max_scroll(self.focused_section);
+                match self.focused_section {
+                    FocusedSection::Prompt => {
+                        self.prompt_scroll_offset = (self.prompt_scroll_offset + 1).min(max);
+                    }
+                    FocusedSection::Groundtruth => {
+                        self.groundtruth_scroll_offset =
+                            (self.groundtruth_scroll_offset + 1).min(max);
+                    }
+                    FocusedSection::Response => {
+                        self.response_scroll_offset = (self.response_scroll_offset + 1).min(max);
+                    }
                 }
-                FocusedSection::Groundtruth => {
-                    self.groundtruth_scroll_offset += 1;
-                }
-                FocusedSection::Response => {
-                    let max = self.focused_max_scroll(false);
-                    self.response_scroll_offset = (self.response_scroll_offset + 1).min(max);
-                }
-            },
+            }
             KeyCode::Char('j') => match self.focused_section {
                 FocusedSection::Prompt => {
                     self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_sub(1);
@@ -2953,19 +2997,21 @@ impl App {
                 }
             },
             // PageDown/PageUp for faster scrolling
-            KeyCode::PageDown => match self.focused_section {
-                FocusedSection::Prompt => {
-                    let max = self.focused_max_scroll(true);
-                    self.prompt_scroll_offset = (self.prompt_scroll_offset + 10).min(max);
+            KeyCode::PageDown => {
+                let max = self.focused_max_scroll(self.focused_section);
+                match self.focused_section {
+                    FocusedSection::Prompt => {
+                        self.prompt_scroll_offset = (self.prompt_scroll_offset + 10).min(max);
+                    }
+                    FocusedSection::Groundtruth => {
+                        self.groundtruth_scroll_offset =
+                            (self.groundtruth_scroll_offset + 10).min(max);
+                    }
+                    FocusedSection::Response => {
+                        self.response_scroll_offset = (self.response_scroll_offset + 10).min(max);
+                    }
                 }
-                FocusedSection::Groundtruth => {
-                    self.groundtruth_scroll_offset += 10;
-                }
-                FocusedSection::Response => {
-                    let max = self.focused_max_scroll(false);
-                    self.response_scroll_offset = (self.response_scroll_offset + 10).min(max);
-                }
-            },
+            }
             KeyCode::PageUp => match self.focused_section {
                 FocusedSection::Prompt => {
                     self.prompt_scroll_offset = self.prompt_scroll_offset.saturating_sub(10);
