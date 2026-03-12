@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -150,7 +149,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
     };
     upload_bootstrap_script(&ssh_base, &script_opts, &mut log)?;
 
-    log.log("Exec into SSH session");
+    log.log("Launching SSH session");
     println!("Connecting to {}...", instance.display_name());
 
     let mut cmd = Command::new("ssh");
@@ -162,8 +161,25 @@ pub fn run(opts: RunOptions) -> Result<()> {
         .arg("bash")
         .arg("/tmp/extty_bootstrap.sh");
 
-    let err = cmd.exec();
-    bail!("Failed to exec ssh: {}", err);
+    let status = cmd
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context("Failed to launch ssh")?;
+
+    // Restore terminal state after SSH exits — SSH with -t (PTY) and
+    // remote tmux can leave the terminal with cursor hidden / raw mode.
+    let _ = Command::new("stty").arg("sane").status();
+    print!("\x1b[?25h");
+    let _ = std::io::stdout().flush();
+
+    log.log(&format!("SSH exited with status: {}", status));
+    if !status.success() {
+        bail!("SSH exited with status: {}", status);
+    }
+
+    Ok(())
 }
 
 fn parse_host_port(ip: &str) -> (String, Option<String>) {
