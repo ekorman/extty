@@ -5103,7 +5103,13 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                 }
             }
             Card::Checkpoints => {
-                render_checkpoints_card(frame, card_area, &run.checkpoints, is_selected);
+                render_checkpoints_card(
+                    frame,
+                    card_area,
+                    &run.checkpoints,
+                    &run.metrics,
+                    is_selected,
+                );
             }
             Card::Evaluation { .. } => {}
         }
@@ -6190,10 +6196,35 @@ fn format_size(size: u64) -> String {
     }
 }
 
+fn val_metrics_at_step(
+    metrics: &HashMap<String, Vec<MetricPoint>>,
+    step: u64,
+) -> Vec<(String, f64)> {
+    let mut results: Vec<(String, f64)> = metrics
+        .iter()
+        .filter(|(k, _)| k.starts_with("val"))
+        .filter_map(|(k, points)| {
+            let idx = points.partition_point(|p| p.step < step);
+            if idx < points.len() && points[idx].step == step {
+                let short = k
+                    .strip_prefix("val/")
+                    .or_else(|| k.strip_prefix("val_"))
+                    .unwrap_or(k);
+                Some((short.to_string(), points[idx].value))
+            } else {
+                None
+            }
+        })
+        .collect();
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    results
+}
+
 fn render_checkpoints_card(
     frame: &mut Frame,
     area: Rect,
     checkpoints: &[Checkpoint],
+    metrics: &HashMap<String, Vec<MetricPoint>>,
     selected: bool,
 ) {
     let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
@@ -6204,43 +6235,55 @@ fn render_checkpoints_card(
     };
 
     let max_lines = area.height.saturating_sub(3) as usize;
-    let content: Vec<Line> = checkpoints
-        .iter()
-        .take(max_lines)
-        .map(|ckpt| {
-            let status_icon = if ckpt.all_downloaded() {
-                "● "
-            } else {
-                "○ "
-            };
-            let status_color = if ckpt.all_downloaded() {
-                NEON_GREEN
-            } else {
-                Color::DarkGray
-            };
-            let mut spans = vec![
-                Span::styled(status_icon, Style::default().fg(status_color)),
-                Span::styled("step ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{}", ckpt.step),
-                    Style::default().fg(NEON_YELLOW).bold(),
-                ),
-            ];
-            if let Some(ts) = ckpt.timestamp {
-                spans.push(Span::styled(
-                    format!("  {}", ts.format("%Y-%m-%d %H:%M")),
-                    Style::default().fg(Color::DarkGray),
-                ));
+    let mut content: Vec<Line> = Vec::new();
+    for ckpt in checkpoints {
+        if content.len() >= max_lines {
+            break;
+        }
+        let status_icon = if ckpt.all_downloaded() {
+            "● "
+        } else {
+            "○ "
+        };
+        let status_color = if ckpt.all_downloaded() {
+            NEON_GREEN
+        } else {
+            Color::DarkGray
+        };
+        let mut spans = vec![
+            Span::styled(status_icon, Style::default().fg(status_color)),
+            Span::styled("step ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", ckpt.step),
+                Style::default().fg(NEON_YELLOW).bold(),
+            ),
+        ];
+        if let Some(ts) = ckpt.timestamp {
+            spans.push(Span::styled(
+                format!("  {}", ts.format("%Y-%m-%d %H:%M")),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(size) = ckpt.total_size_bytes() {
+            spans.push(Span::styled(
+                format!("  {}", format_size(size)),
+                Style::default().fg(NEON_GREEN),
+            ));
+        }
+        content.push(Line::from(spans));
+
+        let val = val_metrics_at_step(metrics, ckpt.step);
+        for (name, value) in &val {
+            if content.len() >= max_lines {
+                break;
             }
-            if let Some(size) = ckpt.total_size_bytes() {
-                spans.push(Span::styled(
-                    format!("  {}", format_size(size)),
-                    Style::default().fg(NEON_GREEN),
-                ));
-            }
-            Line::from(spans)
-        })
-        .collect();
+            content.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{}=", name), Style::default().fg(NEON_MAGENTA)),
+                Span::styled(format!("{:.4}", value), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
 
     let title = Line::from(vec![
         Span::styled("Checkpoints ", title_style),
@@ -6264,93 +6307,122 @@ fn render_focused_checkpoints(
     frame: &mut Frame,
     area: Rect,
     checkpoints: &[Checkpoint],
+    metrics: &HashMap<String, Vec<MetricPoint>>,
     selected_index: usize,
 ) {
     let visible_height = area.height as usize;
-    let scroll_offset = if selected_index >= visible_height {
-        selected_index - visible_height + 1
-    } else {
-        0
-    };
 
-    let lines: Vec<Line> = checkpoints
+    let line_counts: Vec<usize> = checkpoints
         .iter()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height)
-        .map(|(i, ckpt)| {
-            let is_selected = i == selected_index;
-            let cursor = if is_selected { "▶ " } else { "  " };
-            let status_icon = if ckpt.all_downloaded() {
-                "● "
-            } else {
-                "○ "
-            };
-            let status_color = if ckpt.all_downloaded() {
-                NEON_GREEN
-            } else {
-                Color::DarkGray
-            };
-
-            let mut spans = vec![
-                Span::styled(
-                    cursor,
-                    Style::default().fg(if is_selected {
-                        NEON_CYAN
-                    } else {
-                        Color::DarkGray
-                    }),
-                ),
-                Span::styled(status_icon, Style::default().fg(status_color)),
-                Span::styled("step ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{}", ckpt.step),
-                    Style::default().fg(NEON_YELLOW).bold(),
-                ),
-            ];
-            if let Some(ts) = ckpt.timestamp {
-                spans.push(Span::styled(
-                    format!("  {}", ts.format("%Y-%m-%d %H:%M")),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            if let Some(size) = ckpt.total_size_bytes() {
-                spans.push(Span::styled(
-                    format!("  {}", format_size(size)),
-                    Style::default().fg(NEON_GREEN),
-                ));
-            }
-            if !ckpt.files.is_empty() {
-                let file_info: Vec<String> = ckpt
-                    .files
-                    .iter()
-                    .map(|f| {
-                        let dl = if ckpt.downloaded_files.contains(&f.name) {
-                            "●"
-                        } else {
-                            "○"
-                        };
-                        let sz = f
-                            .size_bytes
-                            .map(|s| format!(" {}", format_size(s)))
-                            .unwrap_or_default();
-                        format!("{} {}{}", dl, f.name, sz)
-                    })
-                    .collect();
-                spans.push(Span::styled(
-                    format!("  [{}]", file_info.join(", ")),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-
-            let bg = if is_selected {
-                Color::Rgb(30, 30, 50)
-            } else {
-                Color::Reset
-            };
-            Line::from(spans).style(Style::default().bg(bg))
-        })
+        .map(|ckpt| 1 + val_metrics_at_step(metrics, ckpt.step).len())
         .collect();
+
+    let mut scroll_offset = 0;
+    let mut cumulative = 0;
+    for i in 0..checkpoints.len() {
+        let needed = line_counts[i..=selected_index.min(checkpoints.len() - 1)]
+            .iter()
+            .sum::<usize>();
+        if needed <= visible_height {
+            scroll_offset = i;
+            break;
+        }
+        cumulative += line_counts[i];
+        scroll_offset = i + 1;
+    }
+    let _ = cumulative;
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, ckpt) in checkpoints.iter().enumerate().skip(scroll_offset) {
+        if lines.len() >= visible_height {
+            break;
+        }
+        let is_selected = i == selected_index;
+        let cursor = if is_selected { "▶ " } else { "  " };
+        let status_icon = if ckpt.all_downloaded() {
+            "● "
+        } else {
+            "○ "
+        };
+        let status_color = if ckpt.all_downloaded() {
+            NEON_GREEN
+        } else {
+            Color::DarkGray
+        };
+
+        let mut spans = vec![
+            Span::styled(
+                cursor,
+                Style::default().fg(if is_selected {
+                    NEON_CYAN
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::styled(status_icon, Style::default().fg(status_color)),
+            Span::styled("step ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", ckpt.step),
+                Style::default().fg(NEON_YELLOW).bold(),
+            ),
+        ];
+        if let Some(ts) = ckpt.timestamp {
+            spans.push(Span::styled(
+                format!("  {}", ts.format("%Y-%m-%d %H:%M")),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(size) = ckpt.total_size_bytes() {
+            spans.push(Span::styled(
+                format!("  {}", format_size(size)),
+                Style::default().fg(NEON_GREEN),
+            ));
+        }
+        if !ckpt.files.is_empty() {
+            let file_info: Vec<String> = ckpt
+                .files
+                .iter()
+                .map(|f| {
+                    let dl = if ckpt.downloaded_files.contains(&f.name) {
+                        "●"
+                    } else {
+                        "○"
+                    };
+                    let sz = f
+                        .size_bytes
+                        .map(|s| format!(" {}", format_size(s)))
+                        .unwrap_or_default();
+                    format!("{} {}{}", dl, f.name, sz)
+                })
+                .collect();
+            spans.push(Span::styled(
+                format!("  [{}]", file_info.join(", ")),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        let bg = if is_selected {
+            Color::Rgb(30, 30, 50)
+        } else {
+            Color::Reset
+        };
+        lines.push(Line::from(spans).style(Style::default().bg(bg)));
+
+        let val = val_metrics_at_step(metrics, ckpt.step);
+        for (name, value) in &val {
+            if lines.len() >= visible_height {
+                break;
+            }
+            lines.push(
+                Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(format!("{}=", name), Style::default().fg(NEON_MAGENTA)),
+                    Span::styled(format!("{:.4}", value), Style::default().fg(Color::White)),
+                ])
+                .style(Style::default().bg(bg)),
+            );
+        }
+    }
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
@@ -6911,6 +6983,7 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                     frame,
                     chunks[0],
                     &run.checkpoints,
+                    &run.metrics,
                     app.selected_checkpoint,
                 );
             }
