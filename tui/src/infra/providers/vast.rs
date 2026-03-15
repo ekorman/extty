@@ -299,11 +299,19 @@ impl CloudProvider for VastProvider {
                 .offers
                 .iter()
                 .find(|o| o.geolocation.as_deref() == Some(region.as_str()))
-                .or_else(|| search_response.offers.first())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No offers found for {} in {} — the offer may have been taken",
+                        opts.instance_type,
+                        region
+                    )
+                })?
         } else {
-            search_response.offers.first()
-        }
-        .ok_or_else(|| anyhow!("No offers found for {}", opts.instance_type))?;
+            search_response
+                .offers
+                .first()
+                .ok_or_else(|| anyhow!("No offers found for {}", opts.instance_type))?
+        };
 
         let mut create_body = serde_json::json!({
             "client_id": "me",
