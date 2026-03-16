@@ -1377,7 +1377,7 @@ impl App {
         let grid_height = self.term_height.saturating_sub(5); // header + footer
 
         let config_panel_width = if self.view == View::Compare {
-            35u16 * self.compared_runs.len() as u16
+            40u16 * self.compared_runs.len() as u16
         } else {
             35u16
         };
@@ -5287,7 +5287,7 @@ fn render_compare_view(app: &mut App, frame: &mut Frame) {
         .compared_runs
         .iter()
         .any(|&ri| app.runs.get(ri).and_then(|r| r.config.as_ref()).is_some());
-    let config_width = 35u16;
+    let config_width = 40u16;
     let (grid_area, config_area) = if app.show_config && has_any_config {
         let h_chunks = Layout::default()
             .direction(Direction::Horizontal)
