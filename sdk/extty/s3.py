@@ -207,9 +207,9 @@ class S3Storage:
             self._maybe_flush()
 
     def _maybe_flush(self) -> None:
-        flush_interval = min(
-            self._buffer_max_seconds * (2**self._consecutive_failures),
-            self._max_backoff_seconds,
+        max_doublings = 4
+        flush_interval = self._buffer_max_seconds * (
+            2 ** min(self._consecutive_failures, max_doublings)
         )
         should_flush = (
             self._buffer_count >= self._buffer_max_count
@@ -443,6 +443,10 @@ class S3Storage:
     ) -> None:
         """
         Save a checkpoint to S3.
+
+        S3 upload errors are non-fatal: failures are logged as warnings
+        and the method returns without raising. The checkpoint may not
+        be persisted remotely in that case.
 
         Parameters
         ----------

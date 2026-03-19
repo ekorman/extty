@@ -1736,11 +1736,12 @@ class TestS3FailureTolerance:
         with pytest.raises(access_denied):
             storage._checkpoint_meta(42)
 
-    def test_flush_backoff_on_consecutive_failures(self) -> None:
-        """Consecutive failures increase the flush interval exponentially."""
+    def test_flush_backoff_defers_maybe_flush(self) -> None:
+        """After a failure, _maybe_flush skips until the backoff interval elapses."""
         client, _ = self._make_mock_s3_client()
         storage = self._make_storage(client)
         storage._buffer_max_seconds = 10.0
+        storage._buffer_max_count = 1000
 
         client.put_object.side_effect = BotoCoreError()
 
@@ -1748,11 +1749,19 @@ class TestS3FailureTolerance:
         storage.flush()
         assert storage._consecutive_failures == 1
 
-        storage.flush()
-        assert storage._consecutive_failures == 2
+        storage.log_metric("loss", 0.4, step=2)
 
-        expected_interval = min(10.0 * (2**2), storage._max_backoff_seconds)
-        assert expected_interval == 40.0
+        with mock.patch("extty.s3.time") as mock_time:
+            mock_time.time.return_value = storage._last_flush + 15.0
+            storage._maybe_flush()
+
+        assert storage._consecutive_failures == 1
+
+        with mock.patch("extty.s3.time") as mock_time:
+            mock_time.time.return_value = storage._last_flush + 25.0
+            storage._maybe_flush()
+
+        assert storage._consecutive_failures == 2
 
     def test_flush_backoff_resets_on_success(self) -> None:
         """Successful flush resets the backoff counter."""
