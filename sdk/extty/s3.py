@@ -14,6 +14,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+try:
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    _S3_ERRORS: tuple[type[Exception], ...] = (BotoCoreError, ClientError, OSError)
+except ImportError:
+    _S3_ERRORS = (OSError,)
+
 
 @dataclass
 class S3Config:
@@ -213,32 +220,42 @@ class S3Storage:
         if self._buffer_count == 0:
             return
 
+        failed_metrics: dict[str, list[tuple[int, float, float]]] = {}
         for name, values in self._metric_buffer.items():
             try:
                 self._upload_metrics(name, values)
-            except Exception:
+            except _S3_ERRORS:
                 logger.warning(
                     "Failed to upload metrics '%s' to S3", name, exc_info=True
                 )
+                failed_metrics[name] = values
         self._metric_buffer.clear()
+        self._metric_buffer.update(failed_metrics)
 
+        failed_examples: dict[str, list[dict[str, Any]]] = {}
         for name, records in self._example_buffer.items():
             try:
                 self._upload_examples(name, records)
-            except Exception:
+            except _S3_ERRORS:
                 logger.warning(
                     "Failed to upload examples '%s' to S3", name, exc_info=True
                 )
+                failed_examples[name] = records
         self._example_buffer.clear()
+        self._example_buffer.update(failed_examples)
 
         if self._system_buffer:
             try:
                 self._upload_system(self._system_buffer)
-            except Exception:
+                self._system_buffer.clear()
+            except _S3_ERRORS:
                 logger.warning("Failed to upload system metrics to S3", exc_info=True)
-            self._system_buffer.clear()
 
-        self._buffer_count = 0
+        self._buffer_count = (
+            sum(len(v) for v in self._metric_buffer.values())
+            + sum(len(v) for v in self._example_buffer.values())
+            + len(self._system_buffer)
+        )
         self._last_flush = time.time()
 
     def _upload_metrics(
@@ -398,7 +415,7 @@ class S3Storage:
                 Body=json.dumps(meta_dict, indent=2).encode("utf-8"),
                 ContentType="application/json",
             )
-        except Exception:
+        except _S3_ERRORS:
             logger.warning("Failed to write run metadata to S3", exc_info=True)
 
     def save_checkpoint(
@@ -516,7 +533,7 @@ class S3Storage:
                 finally:
                     for f in tmp_files:
                         os.unlink(f)
-        except Exception:
+        except _S3_ERRORS:
             logger.warning(
                 "Failed to save checkpoint (step %d) to S3", step, exc_info=True
             )
@@ -548,7 +565,7 @@ class S3Storage:
                 Body=json.dumps(existing, indent=2).encode("utf-8"),
                 ContentType="application/json",
             )
-        except Exception:
+        except _S3_ERRORS:
             logger.warning("Failed to update checkpoints index in S3", exc_info=True)
 
     def load_checkpoint(
@@ -652,11 +669,22 @@ class S3Storage:
         return result
 
     def _checkpoint_meta(self, step: int) -> dict[str, Any]:
-        """Fetch the meta entry for a given checkpoint step."""
+        """Fetch the meta entry for a given checkpoint step.
+
+        Falls back to fetching the per-step meta.json directly if the
+        checkpoint index is missing or outdated (e.g. due to a failed
+        index write).
+        """
         for entry in self.list_checkpoints():
             if entry.get("step") == step:
                 return entry
-        raise FileNotFoundError(f"Checkpoint step {step} not found.")
+
+        meta_key = self._s3_key("checkpoints", str(step), "meta.json")
+        try:
+            response = self._client.get_object(Bucket=self.config.bucket, Key=meta_key)
+            return json.loads(response["Body"].read().decode("utf-8"))
+        except Exception:
+            raise FileNotFoundError(f"Checkpoint step {step} not found.")
 
     def list_checkpoints(self) -> list[dict[str, Any]]:
         """
