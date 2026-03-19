@@ -5,11 +5,14 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -211,15 +214,28 @@ class S3Storage:
             return
 
         for name, values in self._metric_buffer.items():
-            self._upload_metrics(name, values)
+            try:
+                self._upload_metrics(name, values)
+            except Exception:
+                logger.warning(
+                    "Failed to upload metrics '%s' to S3", name, exc_info=True
+                )
         self._metric_buffer.clear()
 
         for name, records in self._example_buffer.items():
-            self._upload_examples(name, records)
+            try:
+                self._upload_examples(name, records)
+            except Exception:
+                logger.warning(
+                    "Failed to upload examples '%s' to S3", name, exc_info=True
+                )
         self._example_buffer.clear()
 
         if self._system_buffer:
-            self._upload_system(self._system_buffer)
+            try:
+                self._upload_system(self._system_buffer)
+            except Exception:
+                logger.warning("Failed to upload system metrics to S3", exc_info=True)
             self._system_buffer.clear()
 
         self._buffer_count = 0
@@ -375,12 +391,15 @@ class S3Storage:
 
     def write_meta(self, meta_dict: dict[str, Any]) -> None:
         key = self._s3_key("meta.json")
-        self._client.put_object(
-            Bucket=self.config.bucket,
-            Key=key,
-            Body=json.dumps(meta_dict, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
+        try:
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=key,
+                Body=json.dumps(meta_dict, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception:
+            logger.warning("Failed to write run metadata to S3", exc_info=True)
 
     def save_checkpoint(
         self,
@@ -413,72 +432,22 @@ class S3Storage:
 
         import tempfile
 
-        if path is not None:
-            file_size = os.path.getsize(path)
-            checkpoint_key = self._s3_key("checkpoints", str(step), "checkpoint.pt")
-            self._client.upload_file(
-                Filename=path,
-                Bucket=self.config.bucket,
-                Key=checkpoint_key,
-                ExtraArgs={"ContentType": "application/octet-stream"},
-            )
-
-            timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            meta_entry: dict[str, Any] = {
-                "step": step,
-                "timestamp": timestamp,
-                "files": [{"name": "checkpoint.pt", "size_bytes": file_size}],
-            }
-
-            meta_key = self._s3_key("checkpoints", str(step), "meta.json")
-            self._client.put_object(
-                Bucket=self.config.bucket,
-                Key=meta_key,
-                Body=json.dumps(meta_entry, indent=2).encode("utf-8"),
-                ContentType="application/json",
-            )
-            self._update_checkpoints_index(meta_entry)
-        else:
-            import torch
-
-            timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            files_meta: list[dict[str, Any]] = []
-            tmp_files: list[str] = []
-
-            try:
-                model_tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
-                tmp_files.append(model_tmp.name)
-                torch.save(state_dict, model_tmp.name)
-                model_tmp.close()
-
-                model_size = os.path.getsize(model_tmp.name)
+        try:
+            if path is not None:
+                file_size = os.path.getsize(path)
+                checkpoint_key = self._s3_key("checkpoints", str(step), "checkpoint.pt")
                 self._client.upload_file(
-                    Filename=model_tmp.name,
+                    Filename=path,
                     Bucket=self.config.bucket,
-                    Key=self._s3_key("checkpoints", str(step), "model.pt"),
+                    Key=checkpoint_key,
                     ExtraArgs={"ContentType": "application/octet-stream"},
                 )
-                files_meta.append({"name": "model.pt", "size_bytes": model_size})
 
-                if optimizer_state_dict is not None:
-                    opt_tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
-                    tmp_files.append(opt_tmp.name)
-                    torch.save(optimizer_state_dict, opt_tmp.name)
-                    opt_tmp.close()
-
-                    opt_size = os.path.getsize(opt_tmp.name)
-                    self._client.upload_file(
-                        Filename=opt_tmp.name,
-                        Bucket=self.config.bucket,
-                        Key=self._s3_key("checkpoints", str(step), "optimizer.pt"),
-                        ExtraArgs={"ContentType": "application/octet-stream"},
-                    )
-                    files_meta.append({"name": "optimizer.pt", "size_bytes": opt_size})
-
-                meta_entry = {
+                timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                meta_entry: dict[str, Any] = {
                     "step": step,
                     "timestamp": timestamp,
-                    "files": files_meta,
+                    "files": [{"name": "checkpoint.pt", "size_bytes": file_size}],
                 }
 
                 meta_key = self._s3_key("checkpoints", str(step), "meta.json")
@@ -489,9 +458,68 @@ class S3Storage:
                     ContentType="application/json",
                 )
                 self._update_checkpoints_index(meta_entry)
-            finally:
-                for f in tmp_files:
-                    os.unlink(f)
+            else:
+                import torch
+
+                timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                files_meta: list[dict[str, Any]] = []
+                tmp_files: list[str] = []
+
+                try:
+                    model_tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+                    tmp_files.append(model_tmp.name)
+                    torch.save(state_dict, model_tmp.name)
+                    model_tmp.close()
+
+                    model_size = os.path.getsize(model_tmp.name)
+                    self._client.upload_file(
+                        Filename=model_tmp.name,
+                        Bucket=self.config.bucket,
+                        Key=self._s3_key("checkpoints", str(step), "model.pt"),
+                        ExtraArgs={"ContentType": "application/octet-stream"},
+                    )
+                    files_meta.append({"name": "model.pt", "size_bytes": model_size})
+
+                    if optimizer_state_dict is not None:
+                        opt_tmp = tempfile.NamedTemporaryFile(
+                            suffix=".pt", delete=False
+                        )
+                        tmp_files.append(opt_tmp.name)
+                        torch.save(optimizer_state_dict, opt_tmp.name)
+                        opt_tmp.close()
+
+                        opt_size = os.path.getsize(opt_tmp.name)
+                        self._client.upload_file(
+                            Filename=opt_tmp.name,
+                            Bucket=self.config.bucket,
+                            Key=self._s3_key("checkpoints", str(step), "optimizer.pt"),
+                            ExtraArgs={"ContentType": "application/octet-stream"},
+                        )
+                        files_meta.append(
+                            {"name": "optimizer.pt", "size_bytes": opt_size}
+                        )
+
+                    meta_entry = {
+                        "step": step,
+                        "timestamp": timestamp,
+                        "files": files_meta,
+                    }
+
+                    meta_key = self._s3_key("checkpoints", str(step), "meta.json")
+                    self._client.put_object(
+                        Bucket=self.config.bucket,
+                        Key=meta_key,
+                        Body=json.dumps(meta_entry, indent=2).encode("utf-8"),
+                        ContentType="application/json",
+                    )
+                    self._update_checkpoints_index(meta_entry)
+                finally:
+                    for f in tmp_files:
+                        os.unlink(f)
+        except Exception:
+            logger.warning(
+                "Failed to save checkpoint (step %d) to S3", step, exc_info=True
+            )
 
     def _update_checkpoints_index(self, entry: dict[str, Any]) -> None:
         index_key = self._s3_key("checkpoints.json")
@@ -513,12 +541,15 @@ class S3Storage:
 
         existing.sort(key=lambda e: e["step"])
 
-        self._client.put_object(
-            Bucket=self.config.bucket,
-            Key=index_key,
-            Body=json.dumps(existing, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
+        try:
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=index_key,
+                Body=json.dumps(existing, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception:
+            logger.warning("Failed to update checkpoints index in S3", exc_info=True)
 
     def load_checkpoint(
         self,
