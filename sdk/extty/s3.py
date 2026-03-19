@@ -17,9 +17,9 @@ logger = logging.getLogger(__name__)
 try:
     from botocore.exceptions import BotoCoreError, ClientError
 
-    _S3_ERRORS: tuple[type[Exception], ...] = (BotoCoreError, ClientError, OSError)
+    _S3_ERRORS: tuple[type[Exception], ...] = (BotoCoreError, ClientError)
 except ImportError:
-    _S3_ERRORS = (OSError,)
+    _S3_ERRORS = ()
 
 
 @dataclass
@@ -132,6 +132,8 @@ class S3Storage:
     _last_flush: float = field(default_factory=time.time, repr=False)
     _buffer_max_count: int = 100
     _buffer_max_seconds: float = 30.0
+    _consecutive_failures: int = field(default=0, repr=False)
+    _max_backoff_seconds: float = 300.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
@@ -205,9 +207,13 @@ class S3Storage:
             self._maybe_flush()
 
     def _maybe_flush(self) -> None:
+        flush_interval = min(
+            self._buffer_max_seconds * (2**self._consecutive_failures),
+            self._max_backoff_seconds,
+        )
         should_flush = (
             self._buffer_count >= self._buffer_max_count
-            or (time.time() - self._last_flush) >= self._buffer_max_seconds
+            or (time.time() - self._last_flush) >= flush_interval
         )
         if should_flush:
             self._flush_unlocked()
@@ -220,6 +226,8 @@ class S3Storage:
         if self._buffer_count == 0:
             return
 
+        had_failure = False
+
         failed_metrics: dict[str, list[tuple[int, float, float]]] = {}
         for name, values in self._metric_buffer.items():
             try:
@@ -229,6 +237,7 @@ class S3Storage:
                     "Failed to upload metrics '%s' to S3", name, exc_info=True
                 )
                 failed_metrics[name] = values
+                had_failure = True
         self._metric_buffer.clear()
         self._metric_buffer.update(failed_metrics)
 
@@ -241,6 +250,7 @@ class S3Storage:
                     "Failed to upload examples '%s' to S3", name, exc_info=True
                 )
                 failed_examples[name] = records
+                had_failure = True
         self._example_buffer.clear()
         self._example_buffer.update(failed_examples)
 
@@ -250,6 +260,12 @@ class S3Storage:
                 self._system_buffer.clear()
             except _S3_ERRORS:
                 logger.warning("Failed to upload system metrics to S3", exc_info=True)
+                had_failure = True
+
+        if had_failure:
+            self._consecutive_failures += 1
+        else:
+            self._consecutive_failures = 0
 
         self._buffer_count = (
             sum(len(v) for v in self._metric_buffer.values())
@@ -683,7 +699,7 @@ class S3Storage:
         try:
             response = self._client.get_object(Bucket=self.config.bucket, Key=meta_key)
             return json.loads(response["Body"].read().decode("utf-8"))
-        except Exception:
+        except self._client.exceptions.NoSuchKey:
             raise FileNotFoundError(f"Checkpoint step {step} not found.")
 
     def list_checkpoints(self) -> list[dict[str, Any]]:

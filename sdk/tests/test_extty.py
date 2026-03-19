@@ -19,6 +19,7 @@ from extty.storage import (
     generate_random_name,
     sanitize_metric_name,
 )
+from botocore.exceptions import BotoCoreError
 from extty.s3 import S3Config, S3Storage
 
 
@@ -1536,7 +1537,7 @@ class TestS3FailureTolerance:
         client, _ = self._make_mock_s3_client()
         storage = self._make_storage(client)
 
-        client.put_object.side_effect = OSError("Connection refused")
+        client.put_object.side_effect = BotoCoreError()
 
         storage.log_metric("loss", 0.5, step=1)
         storage._buffer_max_count = 1
@@ -1553,7 +1554,7 @@ class TestS3FailureTolerance:
         storage.log_metric("loss", 0.5, step=1)
         storage.log_metric("loss", 0.4, step=2)
 
-        client.put_object.side_effect = OSError("Connection refused")
+        client.put_object.side_effect = BotoCoreError()
         storage.flush()
 
         assert "loss" in storage._metric_buffer
@@ -1566,7 +1567,7 @@ class TestS3FailureTolerance:
 
         storage.log_example("outputs", {"text": "hello"}, step=1)
 
-        client.put_object.side_effect = OSError("Connection refused")
+        client.put_object.side_effect = BotoCoreError()
         storage.flush()
 
         assert "outputs" in storage._example_buffer
@@ -1578,7 +1579,7 @@ class TestS3FailureTolerance:
 
         storage.log_system(4.0, 16.0)
 
-        client.put_object.side_effect = OSError("Connection refused")
+        client.put_object.side_effect = BotoCoreError()
         storage.flush()
 
         assert len(storage._system_buffer) == 1
@@ -1591,7 +1592,7 @@ class TestS3FailureTolerance:
         storage.log_metric("loss", 0.5, step=1)
         storage.log_metric("loss", 0.4, step=2)
 
-        client.put_object.side_effect = OSError("Connection refused")
+        client.put_object.side_effect = BotoCoreError()
         storage.flush()
 
         assert "loss" in storage._metric_buffer
@@ -1623,7 +1624,7 @@ class TestS3FailureTolerance:
         client, _ = self._make_mock_s3_client()
         storage = self._make_storage(client)
 
-        client.put_object.side_effect = OSError("Connection refused")
+        client.put_object.side_effect = BotoCoreError()
 
         with caplog.at_level(logging.WARNING, logger="extty.s3"):
             storage.write_meta({"project": "test", "status": "running"})
@@ -1637,7 +1638,7 @@ class TestS3FailureTolerance:
         fake_file = tmp_path / "model.pt"
         fake_file.write_bytes(b"fake model data")
 
-        client.upload_file.side_effect = OSError("Connection refused")
+        client.upload_file.side_effect = BotoCoreError()
 
         with caplog.at_level(logging.WARNING, logger="extty.s3"):
             storage.save_checkpoint(step=100, path=str(fake_file))
@@ -1648,7 +1649,7 @@ class TestS3FailureTolerance:
         client, _ = self._make_mock_s3_client()
         storage = self._make_storage(client)
 
-        client.put_object.side_effect = OSError("Connection refused")
+        client.put_object.side_effect = BotoCoreError()
 
         with caplog.at_level(logging.WARNING, logger="extty.s3"):
             storage._update_checkpoints_index(
@@ -1705,7 +1706,7 @@ class TestS3FailureTolerance:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise OSError("first call fails")
+                raise BotoCoreError()
             return original_put(**kwargs)
 
         client.put_object.side_effect = fail_first_put
@@ -1715,3 +1716,61 @@ class TestS3FailureTolerance:
         assert "loss" in storage._metric_buffer
         system_key = "test/runs/myproject/run-001/system.csv"
         assert system_key in stored
+
+    def test_save_checkpoint_propagates_local_fs_errors(self, tmp_path) -> None:
+        """Local filesystem errors (e.g. missing file) should NOT be swallowed."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        with pytest.raises(FileNotFoundError):
+            storage.save_checkpoint(step=100, path="/nonexistent/model.pt")
+
+    def test_checkpoint_meta_fallback_propagates_non_404_errors(self) -> None:
+        """AccessDenied or other S3 errors should propagate, not become FileNotFoundError."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        access_denied = type("AccessDenied", (Exception,), {})
+        client.get_object.side_effect = access_denied("forbidden")
+
+        with pytest.raises(access_denied):
+            storage._checkpoint_meta(42)
+
+    def test_flush_backoff_on_consecutive_failures(self) -> None:
+        """Consecutive failures increase the flush interval exponentially."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+        storage._buffer_max_seconds = 10.0
+
+        client.put_object.side_effect = BotoCoreError()
+
+        storage.log_metric("loss", 0.5, step=1)
+        storage.flush()
+        assert storage._consecutive_failures == 1
+
+        storage.flush()
+        assert storage._consecutive_failures == 2
+
+        expected_interval = min(10.0 * (2**2), storage._max_backoff_seconds)
+        assert expected_interval == 40.0
+
+    def test_flush_backoff_resets_on_success(self) -> None:
+        """Successful flush resets the backoff counter."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        client.put_object.side_effect = BotoCoreError()
+        storage.log_metric("loss", 0.5, step=1)
+        storage.flush()
+        storage.flush()
+        assert storage._consecutive_failures == 2
+
+        original_put = lambda Bucket, Key, Body, ContentType=None: stored.__setitem__(  # noqa: E731
+            Key, Body if isinstance(Body, bytes) else Body.encode("utf-8")
+        )
+        client.put_object.side_effect = original_put
+        client.get_object.side_effect = lambda Bucket, Key: (_ for _ in ()).throw(
+            client.exceptions.NoSuchKey({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        )
+        storage.flush()
+        assert storage._consecutive_failures == 0
