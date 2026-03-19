@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -18,6 +19,7 @@ from extty.storage import (
     generate_random_name,
     sanitize_metric_name,
 )
+from botocore.exceptions import BotoCoreError
 from extty.s3 import S3Config, S3Storage
 
 
@@ -1482,3 +1484,302 @@ class TestRunDataReading:
 
             run = extty.get_run("proj", "run-1")
             assert run.duration_seconds is None
+
+
+class TestS3FailureTolerance:
+    """Tests that S3 write failures are non-fatal and properly handled."""
+
+    def _make_mock_s3_client(
+        self, stored: dict[str, bytes] | None = None
+    ) -> tuple[mock.MagicMock, dict[str, bytes]]:
+        if stored is None:
+            stored = {}
+        client = mock.MagicMock()
+
+        def put_object(Bucket, Key, Body, ContentType=None):
+            if isinstance(Body, str):
+                Body = Body.encode("utf-8")
+            stored[Key] = Body
+
+        def get_object(Bucket, Key):
+            if Key in stored:
+                body = mock.MagicMock()
+                body.read.return_value = stored[Key]
+                return {"Body": body}
+            raise client.exceptions.NoSuchKey(
+                {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+            )
+
+        def upload_file(Filename, Bucket, Key, ExtraArgs=None):
+            with open(Filename, "rb") as f:
+                stored[Key] = f.read()
+
+        client.put_object.side_effect = put_object
+        client.get_object.side_effect = get_object
+        client.upload_file.side_effect = upload_file
+        client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+        return client, stored
+
+    def _make_storage(
+        self,
+        client: mock.MagicMock,
+        bucket: str = "test-bucket",
+        prefix: str = "test",
+        project: str = "myproject",
+        run_name: str = "run-001",
+    ) -> S3Storage:
+        config = S3Config(bucket=bucket, prefix=prefix)
+        with mock.patch("boto3.client", return_value=client):
+            storage = S3Storage(config, project, run_name)
+        return storage
+
+    def test_flush_does_not_raise_on_upload_failure(self, caplog) -> None:
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        client.put_object.side_effect = BotoCoreError()
+
+        storage.log_metric("loss", 0.5, step=1)
+        storage._buffer_max_count = 1
+
+        with caplog.at_level(logging.WARNING, logger="extty.s3"):
+            storage.flush()
+
+        assert "Failed to upload metrics 'loss' to S3" in caplog.text
+
+    def test_failed_metrics_retained_in_buffer(self) -> None:
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        storage.log_metric("loss", 0.5, step=1)
+        storage.log_metric("loss", 0.4, step=2)
+
+        client.put_object.side_effect = BotoCoreError()
+        storage.flush()
+
+        assert "loss" in storage._metric_buffer
+        assert len(storage._metric_buffer["loss"]) == 2
+        assert storage._buffer_count == 2
+
+    def test_failed_examples_retained_in_buffer(self) -> None:
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        storage.log_example("outputs", {"text": "hello"}, step=1)
+
+        client.put_object.side_effect = BotoCoreError()
+        storage.flush()
+
+        assert "outputs" in storage._example_buffer
+        assert len(storage._example_buffer["outputs"]) == 1
+
+    def test_failed_system_metrics_retained_in_buffer(self) -> None:
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        storage.log_system(4.0, 16.0)
+
+        client.put_object.side_effect = BotoCoreError()
+        storage.flush()
+
+        assert len(storage._system_buffer) == 1
+
+    def test_no_data_loss_after_transient_failure(self) -> None:
+        """S3 fails on first flush, recovers on second — all data arrives."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        storage.log_metric("loss", 0.5, step=1)
+        storage.log_metric("loss", 0.4, step=2)
+
+        client.put_object.side_effect = BotoCoreError()
+        storage.flush()
+
+        assert "loss" in storage._metric_buffer
+
+        storage.log_metric("loss", 0.3, step=3)
+
+        original_put = lambda Bucket, Key, Body, ContentType=None: stored.__setitem__(  # noqa: E731
+            Key, Body if isinstance(Body, bytes) else Body.encode("utf-8")
+        )
+        client.put_object.side_effect = original_put
+        client.get_object.side_effect = lambda Bucket, Key: (_ for _ in ()).throw(
+            client.exceptions.NoSuchKey({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        )
+        storage.flush()
+
+        assert "loss" not in storage._metric_buffer
+        assert storage._buffer_count == 0
+
+        metrics_key = "test/runs/myproject/run-001/metrics/loss.csv"
+        assert metrics_key in stored
+        csv_content = stored[metrics_key].decode("utf-8")
+        lines = csv_content.strip().split("\n")
+        assert len(lines) == 4
+        data_lines = lines[1:]
+        steps = [line.split(",")[0] for line in data_lines]
+        assert steps == ["1", "2", "3"]
+
+    def test_write_meta_does_not_raise(self, caplog) -> None:
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        client.put_object.side_effect = BotoCoreError()
+
+        with caplog.at_level(logging.WARNING, logger="extty.s3"):
+            storage.write_meta({"project": "test", "status": "running"})
+
+        assert "Failed to write run metadata to S3" in caplog.text
+
+    def test_save_checkpoint_does_not_raise(self, tmp_path, caplog) -> None:
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        fake_file = tmp_path / "model.pt"
+        fake_file.write_bytes(b"fake model data")
+
+        client.upload_file.side_effect = BotoCoreError()
+
+        with caplog.at_level(logging.WARNING, logger="extty.s3"):
+            storage.save_checkpoint(step=100, path=str(fake_file))
+
+        assert "Failed to save checkpoint (step 100) to S3" in caplog.text
+
+    def test_update_checkpoints_index_does_not_raise(self, caplog) -> None:
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        client.put_object.side_effect = BotoCoreError()
+
+        with caplog.at_level(logging.WARNING, logger="extty.s3"):
+            storage._update_checkpoints_index(
+                {"step": 1, "timestamp": "now", "files": []}
+            )
+
+        assert "Failed to update checkpoints index in S3" in caplog.text
+
+    def test_programming_errors_still_propagate(self) -> None:
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        storage.log_metric("loss", 0.5, step=1)
+
+        client.put_object.side_effect = TypeError("bad argument")
+
+        with pytest.raises(TypeError, match="bad argument"):
+            storage.flush()
+
+    def test_checkpoint_meta_fallback_on_missing_index(self) -> None:
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        meta_entry = {
+            "step": 42,
+            "timestamp": "2024-01-01",
+            "files": [{"name": "model.pt", "size_bytes": 100}],
+        }
+        meta_key = "test/runs/myproject/run-001/checkpoints/42/meta.json"
+        stored[meta_key] = json.dumps(meta_entry).encode("utf-8")
+
+        result = storage._checkpoint_meta(42)
+        assert result["step"] == 42
+        assert result["files"][0]["name"] == "model.pt"
+
+    def test_checkpoint_meta_fallback_raises_when_both_missing(self) -> None:
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        with pytest.raises(FileNotFoundError, match="Checkpoint step 99 not found"):
+            storage._checkpoint_meta(99)
+
+    def test_partial_flush_failure_does_not_block_other_uploads(self) -> None:
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        storage.log_metric("loss", 0.5, step=1)
+        storage.log_system(4.0, 16.0)
+
+        call_count = 0
+        original_put = client.put_object.side_effect
+
+        def fail_first_put(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise BotoCoreError()
+            return original_put(**kwargs)
+
+        client.put_object.side_effect = fail_first_put
+
+        storage.flush()
+
+        assert "loss" in storage._metric_buffer
+        system_key = "test/runs/myproject/run-001/system.csv"
+        assert system_key in stored
+
+    def test_save_checkpoint_propagates_local_fs_errors(self, tmp_path) -> None:
+        """Local filesystem errors (e.g. missing file) should NOT be swallowed."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        with pytest.raises(FileNotFoundError):
+            storage.save_checkpoint(step=100, path="/nonexistent/model.pt")
+
+    def test_checkpoint_meta_fallback_propagates_non_404_errors(self) -> None:
+        """AccessDenied or other S3 errors should propagate, not become FileNotFoundError."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        access_denied = type("AccessDenied", (Exception,), {})
+        client.get_object.side_effect = access_denied("forbidden")
+
+        with pytest.raises(access_denied):
+            storage._checkpoint_meta(42)
+
+    def test_flush_backoff_defers_maybe_flush(self) -> None:
+        """After a failure, _maybe_flush skips until the backoff interval elapses."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+        storage._buffer_max_seconds = 10.0
+        storage._buffer_max_count = 1000
+
+        client.put_object.side_effect = BotoCoreError()
+
+        storage.log_metric("loss", 0.5, step=1)
+        storage.flush()
+        assert storage._consecutive_failures == 1
+
+        storage.log_metric("loss", 0.4, step=2)
+
+        with mock.patch("extty.s3.time") as mock_time:
+            mock_time.time.return_value = storage._last_flush + 15.0
+            storage._maybe_flush()
+
+        assert storage._consecutive_failures == 1
+
+        with mock.patch("extty.s3.time") as mock_time:
+            mock_time.time.return_value = storage._last_flush + 25.0
+            storage._maybe_flush()
+
+        assert storage._consecutive_failures == 2
+
+    def test_flush_backoff_resets_on_success(self) -> None:
+        """Successful flush resets the backoff counter."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(client)
+
+        client.put_object.side_effect = BotoCoreError()
+        storage.log_metric("loss", 0.5, step=1)
+        storage.flush()
+        storage.flush()
+        assert storage._consecutive_failures == 2
+
+        original_put = lambda Bucket, Key, Body, ContentType=None: stored.__setitem__(  # noqa: E731
+            Key, Body if isinstance(Body, bytes) else Body.encode("utf-8")
+        )
+        client.put_object.side_effect = original_put
+        client.get_object.side_effect = lambda Bucket, Key: (_ for _ in ()).throw(
+            client.exceptions.NoSuchKey({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        )
+        storage.flush()
+        assert storage._consecutive_failures == 0
