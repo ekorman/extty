@@ -285,6 +285,7 @@ struct App {
     filter_modal_key: String,
     search_query: String,
     search_editing: bool,
+    hide_completed: bool,
 }
 
 impl App {
@@ -398,6 +399,7 @@ impl App {
             filter_modal_key: String::new(),
             search_query: String::new(),
             search_editing: false,
+            hide_completed: false,
         }
     }
 
@@ -417,6 +419,9 @@ impl App {
         let search_lower = self.search_query.to_lowercase();
 
         for (i, run) in self.runs.iter().enumerate() {
+            if self.hide_completed && !run.is_running() {
+                continue;
+            }
             if !self.config_filters.is_empty() && !run_matches_filters(run, &self.config_filters) {
                 continue;
             }
@@ -2463,6 +2468,11 @@ impl App {
                 self.selected_list_item = 0;
                 self.list_state.select(Some(0));
             }
+            KeyCode::Char('H') => {
+                self.hide_completed = !self.hide_completed;
+                self.selected_list_item = 0;
+                self.list_state.select(Some(0));
+            }
             KeyCode::Char('/') => {
                 self.search_editing = true;
             }
@@ -2575,8 +2585,9 @@ impl App {
             }
             KeyCode::Char('[') => {
                 let prev = (0..self.selected_run).rev().find(|&i| {
-                    self.config_filters.is_empty()
-                        || run_matches_filters(&self.runs[i], &self.config_filters)
+                    (!self.hide_completed || self.runs[i].is_running())
+                        && (self.config_filters.is_empty()
+                            || run_matches_filters(&self.runs[i], &self.config_filters))
                 });
                 if let Some(idx) = prev {
                     self.selected_run = idx;
@@ -2589,8 +2600,9 @@ impl App {
             }
             KeyCode::Char(']') => {
                 let next = (self.selected_run + 1..self.runs.len()).find(|&i| {
-                    self.config_filters.is_empty()
-                        || run_matches_filters(&self.runs[i], &self.config_filters)
+                    (!self.hide_completed || self.runs[i].is_running())
+                        && (self.config_filters.is_empty()
+                            || run_matches_filters(&self.runs[i], &self.config_filters))
                 });
                 if let Some(idx) = next {
                     self.selected_run = idx;
@@ -4304,6 +4316,7 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
 
                     let matching = |r: &&Run| {
                         r.project.as_deref().unwrap_or("(no project)") == name
+                            && (!app.hide_completed || r.is_running())
                             && (app.config_filters.is_empty()
                                 || run_matches_filters(r, &app.config_filters))
                     };
@@ -4433,6 +4446,14 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
         title_spans.push(Span::styled(status.clone(), Style::default().fg(color)));
     }
 
+    if app.hide_completed {
+        title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        title_spans.push(Span::styled(
+            "running only",
+            Style::default().fg(NEON_GREEN),
+        ));
+    }
+
     if !app.config_filters.is_empty() {
         title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
         let filter_str = app
@@ -4533,7 +4554,17 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
         Span::styled("] filter  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("/", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] search", Style::default().fg(Color::DarkGray)),
+        Span::styled("] search  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("H", Style::default().fg(NEON_YELLOW)),
+        Span::styled(
+            if app.hide_completed {
+                "] show all"
+            } else {
+                "] running only"
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     if !app.config_filters.is_empty() {
         help_spans.extend(vec![
