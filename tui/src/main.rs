@@ -625,7 +625,13 @@ impl App {
                     .download_run(&project, &name, &runs_dir, false, false)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(false) => {
+                        let _ = tx.send(S3PullMessage::Done(format!(
+                            "{}/{} already completed",
+                            project, name
+                        )));
+                    }
+                    Ok(true) => {
                         let _ =
                             tx.send(S3PullMessage::Done(format!("Pulled {}/{}", project, name)));
                     }
@@ -758,6 +764,7 @@ impl App {
                     }
                 };
                 let runs_dir = runs_dir();
+                let mut skipped = 0usize;
                 for (i, (project, name)) in runs.iter().enumerate() {
                     let _ = tx.send(S3PullMessage::Pulling(format!(
                         "Pulling {}/{} ({}/{})...",
@@ -766,15 +773,27 @@ impl App {
                         i + 1,
                         count
                     )));
-                    if let Err(e) = client
+                    match client
                         .download_run(project, name, &runs_dir, false, false)
                         .await
                     {
-                        let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
-                        return;
+                        Ok(false) => skipped += 1,
+                        Ok(true) => {}
+                        Err(e) => {
+                            let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
+                            return;
+                        }
                     }
                 }
-                let _ = tx.send(S3PullMessage::Done(format!("Pulled {} runs", count)));
+                let msg = if skipped > 0 {
+                    format!(
+                        "Pulled {} runs ({} skipped, already completed)",
+                        count, skipped
+                    )
+                } else {
+                    format!("Pulled {} runs", count)
+                };
+                let _ = tx.send(S3PullMessage::Done(msg));
             });
         });
     }
@@ -830,6 +849,7 @@ impl App {
                 }
                 let count = remote_runs.len();
                 let runs_dir = runs_dir();
+                let mut skipped = 0usize;
                 for (i, rr) in remote_runs.iter().enumerate() {
                     let _ = tx.send(S3PullMessage::Pulling(format!(
                         "Pulling {}/{} ({}/{})...",
@@ -838,18 +858,27 @@ impl App {
                         i + 1,
                         count
                     )));
-                    if let Err(e) = client
+                    match client
                         .download_run(&project, &rr.name, &runs_dir, false, false)
                         .await
                     {
-                        let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
-                        return;
+                        Ok(false) => skipped += 1,
+                        Ok(true) => {}
+                        Err(e) => {
+                            let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
+                            return;
+                        }
                     }
                 }
-                let _ = tx.send(S3PullMessage::Done(format!(
-                    "Pulled {} runs for {}",
-                    count, project
-                )));
+                let msg = if skipped > 0 {
+                    format!(
+                        "Pulled {} runs for {} ({} skipped, already completed)",
+                        count, project, skipped
+                    )
+                } else {
+                    format!("Pulled {} runs for {}", count, project)
+                };
+                let _ = tx.send(S3PullMessage::Done(msg));
             });
         });
     }
@@ -914,7 +943,13 @@ impl App {
                     .download_run(&project, &name, &runs_dir, false, false)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(false) => {
+                        let _ = tx.send(S3PullMessage::Done(format!(
+                            "{}/{} already completed",
+                            project, name
+                        )));
+                    }
+                    Ok(true) => {
                         let _ =
                             tx.send(S3PullMessage::Done(format!("Pulled {}/{}", project, name)));
                     }

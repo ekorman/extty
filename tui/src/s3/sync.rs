@@ -159,6 +159,8 @@ impl S3Client {
         Ok(projects)
     }
 
+    /// Downloads a run from S3. Returns `Ok(true)` if files were downloaded,
+    /// or `Ok(false)` if the run was skipped because it is already completed locally.
     pub async fn download_run(
         &self,
         project: &str,
@@ -166,9 +168,19 @@ impl S3Client {
         dest: &Path,
         force: bool,
         dry_run: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let prefix = self.s3_prefix(&format!("runs/{}/{}/", project, run));
         let run_dir = dest.join(project).join(run);
+
+        if !force && !dry_run {
+            let meta_path = run_dir.join("meta.json");
+            if let Ok(content) = fs::read(&meta_path)
+                && let Ok(meta) = serde_json::from_slice::<MetaJson>(&content)
+                && meta.status.as_deref() == Some("completed")
+            {
+                return Ok(false);
+            }
+        }
 
         if dry_run {
             println!(
@@ -177,7 +189,7 @@ impl S3Client {
                 run,
                 run_dir.display()
             );
-            return Ok(());
+            return Ok(true);
         }
 
         fs::create_dir_all(&run_dir)?;
@@ -224,7 +236,7 @@ impl S3Client {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn download_file(&self, key: &str, local_path: &Path, force: bool) -> Result<()> {
@@ -535,7 +547,8 @@ impl S3Client {
         local_dir: &Path,
         dry_run: bool,
     ) -> Result<()> {
-        self.download_run(project, run, local_dir, false, dry_run)
+        let _ = self
+            .download_run(project, run, local_dir, false, dry_run)
             .await?;
         self.upload_run(project, run, local_dir, false, dry_run)
             .await?;
