@@ -2876,6 +2876,11 @@ impl App {
             KeyCode::Char('K') if self.show_config => {
                 self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
             }
+            KeyCode::Char('S') => {
+                self.show_system_metrics = !self.show_system_metrics;
+                self.selected_card = 0;
+                self.scroll_offset = 0;
+            }
             _ => {}
         }
     }
@@ -5479,6 +5484,11 @@ fn render_compare_view(app: &mut App, frame: &mut Frame) {
     }
 
     let config_hint = if app.show_config { "hide" } else { "config" };
+    let sys_hint = if app.show_system_metrics {
+        "train"
+    } else {
+        "system"
+    };
     let footer = Line::from(vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
@@ -5489,6 +5499,12 @@ fn render_compare_view(app: &mut App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_CYAN)),
         Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("S", Style::default().fg(NEON_CYAN)),
+        Span::styled(
+            format!("] {}  ", sys_hint),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("c", Style::default().fg(NEON_CYAN)),
         Span::styled(
