@@ -26,8 +26,6 @@ class ArtifactMeta:
         Human-readable description.
     content_type : str
         Either "file" or "directory".
-    tags : list[str]
-        Tags for categorization.
     created_at : str
         ISO timestamp of initial upload.
     updated_at : str
@@ -43,7 +41,6 @@ class ArtifactMeta:
     name: str
     description: str
     content_type: str
-    tags: list[str]
     created_at: str
     updated_at: str
     total_size_bytes: int
@@ -55,7 +52,6 @@ class ArtifactMeta:
             "name": self.name,
             "description": self.description,
             "content_type": self.content_type,
-            "tags": self.tags,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "total_size_bytes": self.total_size_bytes,
@@ -69,7 +65,6 @@ class ArtifactMeta:
             name=d["name"],
             description=d.get("description", ""),
             content_type=d.get("content_type", "file"),
-            tags=d.get("tags", []),
             created_at=d.get("created_at", ""),
             updated_at=d.get("updated_at", ""),
             total_size_bytes=d.get("total_size_bytes", 0),
@@ -161,7 +156,6 @@ def save_artifact(
     path: str | Path,
     *,
     description: str = "",
-    tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     s3_config: S3Config | None = None,
 ) -> ArtifactMeta:
@@ -176,8 +170,6 @@ def save_artifact(
         Local file or directory to upload.
     description : str
         Human-readable description.
-    tags : list[str], optional
-        Tags for categorization.
     metadata : dict[str, Any], optional
         User-defined metadata (arbitrary JSON-serializable dict).
     s3_config : S3Config, optional
@@ -192,7 +184,6 @@ def save_artifact(
     client = _build_client(config)
     prefix = _artifacts_prefix(config)
     path = Path(path)
-    tags = tags or []
     metadata = metadata or {}
 
     if not path.exists():
@@ -222,7 +213,6 @@ def save_artifact(
         name=name,
         description=description,
         content_type=content_type,
-        tags=tags,
         created_at=created_at,
         updated_at=now,
         total_size_bytes=size,
@@ -428,7 +418,6 @@ def delete_artifact(
         name=name,
         description="",
         content_type="file",
-        tags=[],
         created_at="",
         updated_at="",
         total_size_bytes=0,

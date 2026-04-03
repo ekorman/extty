@@ -1433,7 +1433,6 @@ pub struct Artifact {
     pub name: String,
     pub description: String,
     pub content_type: String,
-    pub tags: Vec<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub total_size_bytes: Option<u64>,
@@ -1460,8 +1459,6 @@ struct ArtifactMeta {
     description: String,
     #[serde(default = "default_content_type")]
     content_type: String,
-    #[serde(default)]
-    tags: Vec<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
     total_size_bytes: Option<u64>,
@@ -1511,7 +1508,6 @@ pub fn load_artifacts_from_cache() -> Vec<Artifact> {
             name: meta.name,
             description: meta.description,
             content_type: meta.content_type,
-            tags: meta.tags,
             created_at: meta.created_at,
             updated_at: meta.updated_at,
             total_size_bytes: meta.total_size_bytes,

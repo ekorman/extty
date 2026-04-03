@@ -8522,17 +8522,12 @@ fn render_artifacts_list(app: &mut App, frame: &mut Frame) {
                 "📄"
             };
             let size = artifact.display_size();
-            let tags_str = if artifact.tags.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", artifact.tags.join(", "))
-            };
             let desc = if artifact.description.is_empty() {
                 String::new()
             } else {
                 format!("  — {}", artifact.description)
             };
-            let text = format!("{} {}  ({}){}{}", icon, artifact.name, size, tags_str, desc);
+            let text = format!("{} {}  ({}){}", icon, artifact.name, size, desc);
 
             let style = if is_selected {
                 Style::default().fg(NEON_CYAN)
@@ -8641,17 +8636,6 @@ fn render_artifact_detail(app: &App, frame: &mut Frame) {
         Line::from(vec![
             Span::styled("Size:         ", Style::default().fg(DIM_CYAN)),
             Span::styled(artifact.display_size(), Style::default().fg(NEON_YELLOW)),
-        ]),
-        Line::from(vec![
-            Span::styled("Tags:         ", Style::default().fg(DIM_CYAN)),
-            Span::styled(
-                if artifact.tags.is_empty() {
-                    "—".to_string()
-                } else {
-                    artifact.tags.join(", ")
-                },
-                Style::default().fg(NEON_MAGENTA),
-            ),
         ]),
         Line::from(vec![
             Span::styled("Created:      ", Style::default().fg(DIM_CYAN)),
