@@ -201,6 +201,7 @@ struct App {
     show_config: bool,
     config_panel_scroll: usize,
     show_delete_confirm: bool,
+    show_complete_confirm: bool,
     pending_delete_run: Option<usize>, // Index into runs vector of run to delete
     pending_delete_model: Option<usize>, // Index into models vector of model to delete
     pending_delete_eval: Option<usize>, // Index into model_evaluations of eval to delete
@@ -321,6 +322,7 @@ impl App {
             show_config: false,
             config_panel_scroll: 0,
             show_delete_confirm: false,
+            show_complete_confirm: false,
             pending_delete_run: None,
             pending_delete_model: None,
             pending_delete_eval: None,
@@ -1884,6 +1886,10 @@ impl App {
             self.handle_terminate_confirm_key(code);
             return;
         }
+        if self.show_complete_confirm {
+            self.handle_complete_confirm_key(code);
+            return;
+        }
 
         if let Some(ref mut input) = self.goto_step_input {
             match code {
@@ -2694,11 +2700,7 @@ impl App {
             KeyCode::Char('m')
                 if !self.runs.is_empty() && self.runs[self.selected_run].is_running() =>
             {
-                let run = &mut self.runs[self.selected_run];
-                if mark_run_completed(&run.path).is_ok() {
-                    run.status = data::RunStatus::Completed;
-                    run.end_time = Some(chrono::Local::now());
-                }
+                self.show_complete_confirm = true;
             }
             KeyCode::Char('M') if !self.runs.is_empty() => {
                 let project = self.runs[self.selected_run]
@@ -3256,6 +3258,23 @@ impl App {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.show_terminate_confirm = false;
                 self.pending_terminate_instance = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_complete_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let run = &mut self.runs[self.selected_run];
+                if mark_run_completed(&run.path).is_ok() {
+                    run.status = data::RunStatus::Completed;
+                    run.end_time = Some(chrono::Local::now());
+                }
+                self.show_complete_confirm = false;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.show_complete_confirm = false;
             }
             _ => {}
         }
@@ -4321,6 +4340,9 @@ fn render(app: &mut App, frame: &mut Frame) {
     }
     if app.show_terminate_confirm {
         render_terminate_confirm(app, frame);
+    }
+    if app.show_complete_confirm {
+        render_complete_confirm(app, frame);
     }
     if app.pull_run_modal_open {
         render_pull_run_modal(app, frame);
@@ -9448,6 +9470,62 @@ fn render_terminate_confirm(app: &App, frame: &mut Frame) {
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(NEON_MAGENTA))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center);
+
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn render_complete_confirm(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let run_name = app
+        .runs
+        .get(app.selected_run)
+        .map(|r| r.name.as_str())
+        .unwrap_or("unknown");
+
+    let area = frame.area();
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 6u16;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Mark ", Style::default().fg(Color::White)),
+            Span::styled(run_name, Style::default().fg(NEON_CYAN).bold()),
+            Span::styled(" as complete? (y/n)", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("y", Style::default().fg(NEON_GREEN)),
+            Span::styled("] Yes  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("n", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("] No  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(Color::Gray)),
+            Span::styled("] Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(
+            " CONFIRM COMPLETE ",
+            Style::default().fg(NEON_CYAN).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_CYAN))
         .style(Style::default().bg(Color::Black));
 
     let paragraph = Paragraph::new(text)
