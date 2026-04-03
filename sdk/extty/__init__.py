@@ -21,6 +21,14 @@ from extty.storage import (
     generate_random_name,
     get_runs_dir,
 )
+from extty.artifact import (
+    ArtifactMeta,
+    delete_artifact,
+    get_artifact,
+    list_artifacts,
+    load_artifact,
+    save_artifact,
+)
 from extty.s3 import S3Config
 
 __all__ = [
@@ -47,6 +55,12 @@ __all__ = [
     "SystemMetricPoint",
     "ExampleRecord",
     "has_active_run",
+    "ArtifactMeta",
+    "save_artifact",
+    "list_artifacts",
+    "load_artifact",
+    "get_artifact",
+    "delete_artifact",
 ]
 
 # Version is managed by setuptools_scm

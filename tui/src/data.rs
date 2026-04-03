@@ -243,6 +243,14 @@ fn models_dir() -> PathBuf {
         .join("models")
 }
 
+// Get the directory where artifact metadata is cached
+pub fn artifacts_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".extty")
+        .join("artifacts")
+}
+
 // Load all runs with only metadata (no metrics/examples/checkpoints)
 pub fn load_runs_lightweight() -> Vec<Run> {
     let mut runs = load_runs_from_dir_lightweight(&runs_dir());
@@ -1412,4 +1420,113 @@ pub fn save_run_notes(notes: &HashMap<String, String>) {
     if let Ok(json) = serde_json::to_string(notes) {
         let _ = fs::write(&path, json);
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArtifactFile {
+    pub path: String,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Artifact {
+    pub name: String,
+    pub description: String,
+    pub content_type: String,
+    pub tags: Vec<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub total_size_bytes: Option<u64>,
+    pub files: Vec<ArtifactFile>,
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl Artifact {
+    pub fn display_size(&self) -> String {
+        match self.total_size_bytes {
+            Some(b) if b >= 1_073_741_824 => format!("{:.1} GB", b as f64 / 1_073_741_824.0),
+            Some(b) if b >= 1_048_576 => format!("{:.1} MB", b as f64 / 1_048_576.0),
+            Some(b) if b >= 1024 => format!("{:.1} KB", b as f64 / 1024.0),
+            Some(b) => format!("{} B", b),
+            None => "—".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactMeta {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "default_content_type")]
+    content_type: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    total_size_bytes: Option<u64>,
+    #[serde(default)]
+    files: Vec<ArtifactFileMeta>,
+    #[serde(default)]
+    metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+fn default_content_type() -> String {
+    "file".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactFileMeta {
+    path: String,
+    size_bytes: Option<u64>,
+}
+
+pub fn load_artifacts_from_cache() -> Vec<Artifact> {
+    let dir = artifacts_dir();
+    if !dir.exists() {
+        return vec![];
+    }
+
+    let mut artifacts = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return vec![];
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let meta_path = path.join("meta.json");
+        if !meta_path.exists() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<ArtifactMeta>(&content) else {
+            continue;
+        };
+        artifacts.push(Artifact {
+            name: meta.name,
+            description: meta.description,
+            content_type: meta.content_type,
+            tags: meta.tags,
+            created_at: meta.created_at,
+            updated_at: meta.updated_at,
+            total_size_bytes: meta.total_size_bytes,
+            files: meta
+                .files
+                .into_iter()
+                .map(|f| ArtifactFile {
+                    path: f.path,
+                    size_bytes: f.size_bytes,
+                })
+                .collect(),
+            metadata: meta.metadata,
+        });
+    }
+
+    artifacts.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    artifacts
 }

@@ -22,6 +22,11 @@ def get_models_dir() -> Path:
     return Path.home() / ".extty" / "models"
 
 
+def get_artifacts_dir() -> Path:
+    """Get the default artifacts directory (~/.extty/artifacts/)."""
+    return Path.home() / ".extty" / "artifacts"
+
+
 @dataclass(frozen=True)
 class MetricPoint:
     """A single metric data point."""

@@ -41,10 +41,10 @@ mod infra;
 mod run;
 mod s3;
 use data::{
-    Checkpoint, Evaluation, Example, ExampleGroup, MetricPoint, Model, Reward, Run,
-    delete_evaluation, delete_model, load_all_evaluations, load_models, load_run_notes,
-    load_runs_lightweight, load_starred_runs, mark_run_completed, save_run_notes,
-    save_starred_runs,
+    Artifact, Checkpoint, Evaluation, Example, ExampleGroup, MetricPoint, Model, Reward, Run,
+    artifacts_dir, delete_evaluation, delete_model, load_all_evaluations,
+    load_artifacts_from_cache, load_models, load_run_notes, load_runs_lightweight,
+    load_starred_runs, mark_run_completed, save_run_notes, save_starred_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, ScriptOptions,
@@ -67,6 +67,7 @@ enum S3PullMessage {
 enum ViewMode {
     Runs,
     Models,
+    Artifacts,
     Infra,
 }
 
@@ -82,6 +83,7 @@ enum View {
     InfraList,
     InfraConfig,
     S3Config,
+    ArtifactDetail,
 }
 
 // Which panel has focus in the Infra dashboard
@@ -287,6 +289,10 @@ struct App {
     search_query: String,
     search_editing: bool,
     hide_completed: bool,
+    // Artifacts
+    artifacts: Vec<Artifact>,
+    selected_artifact: usize,
+    artifact_detail_scroll: usize,
 }
 
 impl App {
@@ -402,6 +408,9 @@ impl App {
             search_query: String::new(),
             search_editing: false,
             hide_completed: false,
+            artifacts: load_artifacts_from_cache(),
+            selected_artifact: 0,
+            artifact_detail_scroll: 0,
         }
     }
 
@@ -553,6 +562,62 @@ impl App {
         self.selected_model_list_item = self
             .selected_model_list_item
             .min(entries.len().saturating_sub(1));
+    }
+
+    fn refresh_artifacts(&mut self) {
+        self.artifacts = load_artifacts_from_cache();
+        self.selected_artifact = self
+            .selected_artifact
+            .min(self.artifacts.len().saturating_sub(1));
+    }
+
+    fn start_s3_pull_artifacts(&mut self) {
+        if self.s3_pull_rx.is_some() {
+            return;
+        }
+
+        let config = match s3::load_config() {
+            Ok(Some(config)) => config,
+            _ => {
+                self.s3_pull_status = Some("S3 not configured".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.s3_pull_rx = Some(rx);
+        self.s3_pull_status = Some("Pulling artifacts...".to_string());
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(S3PullMessage::Error(format!("Runtime error: {}", e)));
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                let client = match s3::S3Client::new(config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                        return;
+                    }
+                };
+                let dest = artifacts_dir();
+                let _ = tx.send(S3PullMessage::Pulling("Pulling artifacts...".to_string()));
+                match client.download_all_artifact_metas(&dest).await {
+                    Ok(count) => {
+                        let _ =
+                            tx.send(S3PullMessage::Done(format!("Pulled {} artifact(s)", count)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
+                    }
+                }
+            });
+        });
     }
 
     fn ensure_run_loaded(&mut self, idx: usize) {
@@ -1668,9 +1733,13 @@ impl App {
             View::Focused => match self.view_mode {
                 ViewMode::Runs => self.cards(),
                 ViewMode::Models => self.model_cards(),
-                ViewMode::Infra => vec![],
+                ViewMode::Artifacts | ViewMode::Infra => vec![],
             },
-            View::ConfigFull | View::InfraList | View::InfraConfig | View::S3Config => vec![],
+            View::ConfigFull
+            | View::InfraList
+            | View::InfraConfig
+            | View::S3Config
+            | View::ArtifactDetail => vec![],
         }
     }
 
@@ -1704,7 +1773,7 @@ impl App {
             }
             Some(Card::Evaluation { name }) => {
                 let eval = match self.view_mode {
-                    ViewMode::Runs | ViewMode::Infra => None,
+                    ViewMode::Runs | ViewMode::Artifacts | ViewMode::Infra => None,
                     ViewMode::Models => self.get_model_evaluation(name),
                 };
                 eval.and_then(|e| e.examples.get(self.selected_example))
@@ -1771,7 +1840,7 @@ impl App {
             }
             Some(Card::Evaluation { name }) => {
                 let eval = match self.view_mode {
-                    ViewMode::Runs | ViewMode::Infra => None,
+                    ViewMode::Runs | ViewMode::Artifacts | ViewMode::Infra => None,
                     ViewMode::Models => self.get_model_evaluation(name),
                 };
                 if let Some(eval) = eval {
@@ -1921,8 +1990,7 @@ impl App {
                                     _ => vec![],
                                 }
                             }
-                            ViewMode::Models => vec![],
-                            ViewMode::Infra => vec![],
+                            ViewMode::Models | ViewMode::Artifacts | ViewMode::Infra => vec![],
                         }
                     };
 
@@ -1977,6 +2045,7 @@ impl App {
             View::List => match self.view_mode {
                 ViewMode::Runs => self.handle_list_key(code),
                 ViewMode::Models => self.handle_model_list_key(code),
+                ViewMode::Artifacts => self.handle_artifacts_list_key(code),
                 ViewMode::Infra => self.handle_infra_list_key(code, modifiers),
             },
             View::RunDetail => {
@@ -1996,6 +2065,7 @@ impl App {
             View::InfraList => self.handle_infra_list_key(code, modifiers),
             View::InfraConfig => self.handle_infra_config_key(code),
             View::S3Config => self.handle_s3_config_key(code),
+            View::ArtifactDetail => self.handle_artifact_detail_key(code),
         }
     }
 
@@ -2388,6 +2458,9 @@ impl App {
                 self.selected_card = 0;
                 self.scroll_offset = 0;
             }
+            KeyCode::Char('a') => {
+                self.view_mode = ViewMode::Artifacts;
+            }
             KeyCode::Char('i') => {
                 self.view_mode = ViewMode::Infra;
                 self.view = View::InfraList;
@@ -2538,6 +2611,9 @@ impl App {
                 self.view_mode = ViewMode::Runs;
                 self.selected_card = 0;
                 self.scroll_offset = 0;
+            }
+            KeyCode::Char('a') => {
+                self.view_mode = ViewMode::Artifacts;
             }
             KeyCode::Char('i') => {
                 self.view_mode = ViewMode::Infra;
@@ -2897,7 +2973,7 @@ impl App {
             match self.view_mode {
                 ViewMode::Runs => (self.card_count(), self.cards()),
                 ViewMode::Models => (self.model_card_count(), self.model_cards()),
-                ViewMode::Infra => (0, vec![]),
+                ViewMode::Artifacts | ViewMode::Infra => (0, vec![]),
             }
         };
         let current_card = cards.get(self.selected_card);
@@ -2917,7 +2993,7 @@ impl App {
                 .map(|e| e.len())
                 .unwrap_or(0),
             Some(Card::Evaluation { name }) => match self.view_mode {
-                ViewMode::Runs | ViewMode::Infra => 0,
+                ViewMode::Runs | ViewMode::Artifacts | ViewMode::Infra => 0,
                 ViewMode::Models => self
                     .get_model_evaluation(name)
                     .map(|e| e.examples.len())
@@ -3000,6 +3076,7 @@ impl App {
                     self.view = match self.view_mode {
                         ViewMode::Runs => View::RunDetail,
                         ViewMode::Models => View::ModelDetail,
+                        ViewMode::Artifacts => View::List,
                         ViewMode::Infra => View::InfraList,
                     };
                 }
@@ -3280,6 +3357,57 @@ impl App {
         }
     }
 
+    fn handle_artifacts_list_key(&mut self, code: KeyCode) {
+        let count = self.artifacts.len();
+
+        match code {
+            KeyCode::Char('r') => {
+                self.view_mode = ViewMode::Runs;
+            }
+            KeyCode::Char('m') => {
+                self.view_mode = ViewMode::Models;
+            }
+            KeyCode::Char('i') => {
+                self.view_mode = ViewMode::Infra;
+                self.view = View::InfraList;
+                self.refresh_infra();
+                self.refresh_infra_types();
+            }
+            KeyCode::Up if self.selected_artifact > 0 => {
+                self.selected_artifact -= 1;
+            }
+            KeyCode::Down if self.selected_artifact < count.saturating_sub(1) => {
+                self.selected_artifact += 1;
+            }
+            KeyCode::Enter if count > 0 => {
+                self.artifact_detail_scroll = 0;
+                self.view = View::ArtifactDetail;
+            }
+            KeyCode::Char('p') => {
+                self.start_s3_pull_artifacts();
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.should_quit = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_artifact_detail_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.view = View::List;
+            }
+            KeyCode::Up => {
+                self.artifact_detail_scroll = self.artifact_detail_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.artifact_detail_scroll += 1;
+            }
+            _ => {}
+        }
+    }
+
     fn handle_infra_list_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         if self.add_machine_open {
             self.handle_add_machine_key(code);
@@ -3301,6 +3429,13 @@ impl App {
         match code {
             KeyCode::Char('r') => {
                 self.view_mode = ViewMode::Runs;
+                self.view = View::List;
+            }
+            KeyCode::Char('a')
+                if !(self.infra_active_panel == InfraPanel::Instances
+                    && self.selected_infra_provider == Provider::Local) =>
+            {
+                self.view_mode = ViewMode::Artifacts;
                 self.view = View::List;
             }
             KeyCode::Char('m') => {
@@ -3936,6 +4071,7 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
                         app.s3_pull_time = Some(Instant::now());
                         app.s3_pull_rx = None;
                         app.refresh_runs();
+                        app.refresh_artifacts();
                         if let Some(run) = app.runs.get(app.selected_run) {
                             let path = run.path.clone();
                             if let Some(updated) = data::reload_run(&path) {
@@ -4323,6 +4459,7 @@ fn render(app: &mut App, frame: &mut Frame) {
         View::List => match app.view_mode {
             ViewMode::Runs => render_runs_list(app, frame),
             ViewMode::Models => render_models_list(app, frame),
+            ViewMode::Artifacts => render_artifacts_list(app, frame),
             ViewMode::Infra => render_infra_dashboard(app, frame),
         },
         View::RunDetail => render_run_detail(app, frame),
@@ -4333,6 +4470,7 @@ fn render(app: &mut App, frame: &mut Frame) {
         View::InfraList => render_infra_dashboard(app, frame),
         View::InfraConfig => render_infra_config(app, frame),
         View::S3Config => render_s3_config(app, frame),
+        View::ArtifactDetail => render_artifact_detail(app, frame),
     }
 
     if app.show_delete_confirm {
@@ -4490,6 +4628,8 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("Models", Style::default().fg(Color::DarkGray)),
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Artifacts", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("Infra", Style::default().fg(Color::DarkGray)),
         Span::styled(" ", Style::default()),
     ];
@@ -4556,6 +4696,9 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("m", Style::default().fg(NEON_YELLOW)),
         Span::styled("] models  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("a", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] artifacts  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("i", Style::default().fg(NEON_YELLOW)),
         Span::styled("] infra  ", Style::default().fg(Color::DarkGray)),
@@ -4727,6 +4870,8 @@ fn render_models_list(app: &App, frame: &mut Frame) {
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("[Models]", Style::default().fg(NEON_CYAN).bold()),
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Artifacts", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("Infra", Style::default().fg(Color::DarkGray)),
         Span::styled(" ", Style::default()),
     ]);
@@ -4748,6 +4893,9 @@ fn render_models_list(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("r", Style::default().fg(NEON_YELLOW)),
         Span::styled("] runs  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("a", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] artifacts  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("i", Style::default().fg(NEON_YELLOW)),
         Span::styled("] infra  ", Style::default().fg(Color::DarkGray)),
@@ -6652,7 +6800,7 @@ fn render_focused(app: &App, frame: &mut Frame) {
         match app.view_mode {
             ViewMode::Runs => render_focused_run(app, frame, area),
             ViewMode::Models => render_focused_model(app, frame, area),
-            ViewMode::Infra => {}
+            ViewMode::Artifacts | ViewMode::Infra => {}
         }
     }
 
@@ -8359,6 +8507,250 @@ fn render_filter_modal(app: &App, frame: &mut Frame) {
     frame.render_widget(paragraph, popup_area);
 }
 
+fn render_artifacts_list(app: &mut App, frame: &mut Frame) {
+    let area = frame.area();
+
+    let items: Vec<ListItem> = app
+        .artifacts
+        .iter()
+        .enumerate()
+        .map(|(i, artifact)| {
+            let is_selected = i == app.selected_artifact;
+            let icon = if artifact.content_type == "directory" {
+                "📁"
+            } else {
+                "📄"
+            };
+            let size = artifact.display_size();
+            let tags_str = if artifact.tags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", artifact.tags.join(", "))
+            };
+            let desc = if artifact.description.is_empty() {
+                String::new()
+            } else {
+                format!("  — {}", artifact.description)
+            };
+            let text = format!("{} {}  ({}){}{}", icon, artifact.name, size, tags_str, desc);
+
+            let style = if is_selected {
+                Style::default().fg(NEON_CYAN)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(Line::from(Span::styled(text, style)))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.selected_artifact));
+
+    let mut title_spans = vec![
+        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+        Span::styled("Runs", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Models", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("[Artifacts]", Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Infra", Style::default().fg(Color::DarkGray)),
+        Span::styled(" ", Style::default()),
+    ];
+    if let Some(status) = &app.s3_pull_status {
+        let color = if status.starts_with("Pull failed") || status.starts_with("S3 not") {
+            NEON_MAGENTA
+        } else if status.starts_with("Pulled") {
+            NEON_GREEN
+        } else {
+            NEON_YELLOW
+        };
+        title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        title_spans.push(Span::styled(status.clone(), Style::default().fg(color)));
+    }
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(Line::from(title_spans))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIM_CYAN)),
+        )
+        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, area, &mut state);
+
+    let help = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("r", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] runs  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("m", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] models  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("i", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] infra  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+        Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Enter", Style::default().fg(NEON_CYAN)),
+        Span::styled("] details  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("p", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] pull from S3", Style::default().fg(Color::DarkGray)),
+    ]);
+    let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
+    frame.render_widget(Paragraph::new(help), help_area);
+}
+
+fn render_artifact_detail(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+
+    let Some(artifact) = app.artifacts.get(app.selected_artifact) else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(area);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("Name:         ", Style::default().fg(DIM_CYAN)),
+            Span::styled(&artifact.name, Style::default().fg(NEON_CYAN).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled("Description:  ", Style::default().fg(DIM_CYAN)),
+            Span::styled(
+                if artifact.description.is_empty() {
+                    "—"
+                } else {
+                    &artifact.description
+                },
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Type:         ", Style::default().fg(DIM_CYAN)),
+            Span::styled(&artifact.content_type, Style::default().fg(NEON_GREEN)),
+        ]),
+        Line::from(vec![
+            Span::styled("Size:         ", Style::default().fg(DIM_CYAN)),
+            Span::styled(artifact.display_size(), Style::default().fg(NEON_YELLOW)),
+        ]),
+        Line::from(vec![
+            Span::styled("Tags:         ", Style::default().fg(DIM_CYAN)),
+            Span::styled(
+                if artifact.tags.is_empty() {
+                    "—".to_string()
+                } else {
+                    artifact.tags.join(", ")
+                },
+                Style::default().fg(NEON_MAGENTA),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Created:      ", Style::default().fg(DIM_CYAN)),
+            Span::styled(
+                artifact.created_at.as_deref().unwrap_or("—"),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Updated:      ", Style::default().fg(DIM_CYAN)),
+            Span::styled(
+                artifact.updated_at.as_deref().unwrap_or("—"),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ];
+
+    if let Some(metadata) = &artifact.metadata
+        && !metadata.is_empty()
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Metadata",
+            Style::default().fg(NEON_CYAN).bold(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(60),
+            Style::default().fg(DIM_CYAN),
+        )));
+        for (key, value) in metadata {
+            let val_str = match value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}: ", key), Style::default().fg(DIM_CYAN)),
+                Span::styled(val_str, Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("Files ({})", artifact.files.len()),
+        Style::default().fg(NEON_CYAN).bold(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "─".repeat(60),
+        Style::default().fg(DIM_CYAN),
+    )));
+
+    for file in &artifact.files {
+        let size_str = match file.size_bytes {
+            Some(b) if b >= 1_048_576 => format!("{:.1} MB", b as f64 / 1_048_576.0),
+            Some(b) if b >= 1024 => format!("{:.1} KB", b as f64 / 1024.0),
+            Some(b) => format!("{} B", b),
+            None => "—".to_string(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(&file.path, Style::default().fg(Color::White)),
+            Span::styled(
+                format!("  ({})", size_str),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    let visible_height = chunks[0].height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll = app.artifact_detail_scroll.min(max_scroll);
+
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+            Span::styled("Artifact: ", Style::default().fg(DIM_CYAN)),
+            Span::styled(&artifact.name, Style::default().fg(NEON_CYAN).bold()),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll as u16, 0));
+
+    frame.render_widget(paragraph, chunks[0]);
+
+    let footer = Line::from(vec![
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("Esc", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+        Span::styled("] scroll", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(footer), chunks[1]);
+}
+
 fn render_infra_dashboard(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
@@ -8412,6 +8804,8 @@ fn render_infra_provider_tabs(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled("Runs", Style::default().fg(Color::DarkGray)),
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("Models", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
+        Span::styled("Artifacts", Style::default().fg(Color::DarkGray)),
         Span::styled(" | ", Style::default().fg(DIM_CYAN)),
         Span::styled("[Infra]", Style::default().fg(NEON_CYAN).bold()),
         Span::styled("   Provider: ", Style::default().fg(Color::DarkGray)),

@@ -710,6 +710,84 @@ struct MetaJson {
     other: HashMap<String, serde_json::Value>,
 }
 
+pub struct RemoteArtifact {
+    pub name: String,
+}
+
+impl S3Client {
+    pub async fn list_artifacts(&self) -> Result<Vec<RemoteArtifact>> {
+        let prefix = self.s3_prefix("artifacts/");
+        let mut artifacts = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.config.bucket)
+                .prefix(&prefix)
+                .delimiter("/");
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request.send().await.context("Failed to list artifacts")?;
+
+            for cp in response.common_prefixes() {
+                if let Some(prefix_str) = cp.prefix() {
+                    let name = prefix_str
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        artifacts.push(RemoteArtifact { name });
+                    }
+                }
+            }
+
+            if response.is_truncated() == Some(true) {
+                continuation_token = response.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(artifacts)
+    }
+
+    pub async fn download_artifact_meta(&self, name: &str, dest: &Path) -> Result<()> {
+        let key = self.s3_prefix(&format!("artifacts/{}/meta.json", name));
+        let artifact_dir = dest.join(name);
+        fs::create_dir_all(&artifact_dir)?;
+
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(&key)
+            .send()
+            .await
+            .context("Failed to download artifact meta")?;
+
+        let body = response.body.collect().await?.into_bytes();
+        fs::write(artifact_dir.join("meta.json"), &body)?;
+
+        Ok(())
+    }
+
+    pub async fn download_all_artifact_metas(&self, dest: &Path) -> Result<usize> {
+        let artifacts = self.list_artifacts().await?;
+        let count = artifacts.len();
+        for artifact in artifacts {
+            self.download_artifact_meta(&artifact.name, dest).await?;
+        }
+        Ok(count)
+    }
+}
+
 fn merge_meta_bytes(local: &[u8], remote: &[u8]) -> Result<Vec<u8>> {
     let local_meta: MetaJson = serde_json::from_slice(local)?;
     let remote_meta: MetaJson = serde_json::from_slice(remote)?;
