@@ -758,33 +758,166 @@ impl S3Client {
         Ok(artifacts)
     }
 
-    pub async fn download_artifact_meta(&self, name: &str, dest: &Path) -> Result<()> {
+    pub async fn download_artifact_meta(&self, name: &str, dest: &Path) -> Result<bool> {
         let key = self.s3_prefix(&format!("artifacts/{}/meta.json", name));
-        let artifact_dir = dest.join(name);
-        fs::create_dir_all(&artifact_dir)?;
 
-        let response = self
+        let response = match self
             .client
             .get_object()
             .bucket(&self.config.bucket)
             .key(&key)
             .send()
             .await
-            .context("Failed to download artifact meta")?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if e.as_service_error()
+                    .map(|se| se.is_no_such_key())
+                    .unwrap_or(false)
+                {
+                    return Ok(false);
+                }
+                return Err(e).context("Failed to download artifact meta");
+            }
+        };
 
         let body = response.body.collect().await?.into_bytes();
+        let artifact_dir = dest.join(name);
+        fs::create_dir_all(&artifact_dir)?;
         fs::write(artifact_dir.join("meta.json"), &body)?;
 
-        Ok(())
+        Ok(true)
     }
 
     pub async fn download_all_artifact_metas(&self, dest: &Path) -> Result<usize> {
         let artifacts = self.list_artifacts().await?;
-        let count = artifacts.len();
+        let mut count = 0;
         for artifact in artifacts {
-            self.download_artifact_meta(&artifact.name, dest).await?;
+            if let Ok(true) = self.download_artifact_meta(&artifact.name, dest).await {
+                count += 1;
+            }
         }
         Ok(count)
+    }
+
+    pub async fn delete_artifact(&self, name: &str) -> Result<()> {
+        let prefix = self.s3_prefix(&format!("artifacts/{}/", name));
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.config.bucket)
+                .prefix(&prefix);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Failed to list artifact objects for deletion")?;
+
+            let keys: Vec<String> = response
+                .contents()
+                .iter()
+                .filter_map(|obj| obj.key().map(|k| k.to_string()))
+                .collect();
+
+            for chunk in keys.chunks(1000) {
+                let objects: Vec<_> = chunk
+                    .iter()
+                    .map(|key| {
+                        aws_sdk_s3::types::ObjectIdentifier::builder()
+                            .key(key)
+                            .build()
+                            .unwrap()
+                    })
+                    .collect();
+
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(objects))
+                    .build()?;
+
+                self.client
+                    .delete_objects()
+                    .bucket(&self.config.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .context("Failed to delete artifact objects")?;
+            }
+
+            if response.is_truncated() == Some(true) {
+                continuation_token = response.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn download_artifact_data(&self, name: &str, dest: &Path) -> Result<u64> {
+        let prefix = self.s3_prefix(&format!("artifacts/{}/data/", name));
+        let artifact_data_dir = dest.join(name).join("data");
+        fs::create_dir_all(&artifact_data_dir)?;
+
+        let mut downloaded: u64 = 0;
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.config.bucket)
+                .prefix(&prefix);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .context("Failed to list artifact data")?;
+
+            for object in response.contents() {
+                if let Some(key) = object.key() {
+                    let relative_path = key.strip_prefix(&prefix).unwrap_or(key);
+                    if relative_path.is_empty() {
+                        continue;
+                    }
+
+                    let local_path = artifact_data_dir.join(relative_path);
+                    if let Some(parent) = local_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+
+                    let resp = self
+                        .client
+                        .get_object()
+                        .bucket(&self.config.bucket)
+                        .key(key)
+                        .send()
+                        .await?;
+
+                    let body = resp.body.collect().await?.into_bytes();
+                    downloaded += body.len() as u64;
+                    fs::write(&local_path, &body)?;
+                }
+            }
+
+            if response.is_truncated() == Some(true) {
+                continuation_token = response.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(downloaded)
     }
 }
 

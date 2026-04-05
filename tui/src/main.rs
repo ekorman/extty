@@ -293,6 +293,7 @@ struct App {
     artifacts: Vec<Artifact>,
     selected_artifact: usize,
     artifact_detail_scroll: usize,
+    pending_delete_artifact: bool,
 }
 
 impl App {
@@ -411,6 +412,7 @@ impl App {
             artifacts: load_artifacts_from_cache(),
             selected_artifact: 0,
             artifact_detail_scroll: 0,
+            pending_delete_artifact: false,
         }
     }
 
@@ -614,6 +616,123 @@ impl App {
                     }
                     Err(e) => {
                         let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
+                    }
+                }
+            });
+        });
+    }
+
+    fn start_s3_delete_artifact(&mut self) {
+        if self.s3_pull_rx.is_some() {
+            return;
+        }
+
+        let Some(artifact) = self.artifacts.get(self.selected_artifact) else {
+            return;
+        };
+
+        let config = match s3::load_config() {
+            Ok(Some(config)) => config,
+            _ => {
+                self.s3_pull_status = Some("S3 not configured".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        let name = artifact.name.clone();
+        let local_dir = artifacts_dir().join(&name);
+
+        let (tx, rx) = mpsc::channel();
+        self.s3_pull_rx = Some(rx);
+        self.s3_pull_status = Some(format!("Deleting {}...", name));
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(S3PullMessage::Error(format!("Runtime error: {}", e)));
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                let client = match s3::S3Client::new(config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                        return;
+                    }
+                };
+                match client.delete_artifact(&name).await {
+                    Ok(()) => {
+                        let _ = std::fs::remove_dir_all(&local_dir);
+                        let _ = tx.send(S3PullMessage::Done(format!("Deleted {}", name)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("Delete failed: {}", e)));
+                    }
+                }
+            });
+        });
+    }
+
+    fn start_s3_download_artifact(&mut self) {
+        if self.s3_pull_rx.is_some() {
+            return;
+        }
+
+        let Some(artifact) = self.artifacts.get(self.selected_artifact) else {
+            return;
+        };
+
+        let config = match s3::load_config() {
+            Ok(Some(config)) => config,
+            _ => {
+                self.s3_pull_status = Some("S3 not configured".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        let name = artifact.name.clone();
+        let (tx, rx) = mpsc::channel();
+        self.s3_pull_rx = Some(rx);
+        self.s3_pull_status = Some(format!("Downloading {}...", name));
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(S3PullMessage::Error(format!("Runtime error: {}", e)));
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                let client = match s3::S3Client::new(config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                        return;
+                    }
+                };
+                let dest = artifacts_dir();
+                let _ = tx.send(S3PullMessage::Pulling(format!("Downloading {}...", name)));
+                match client.download_artifact_data(&name, &dest).await {
+                    Ok(bytes) => {
+                        let size = if bytes >= 1_048_576 {
+                            format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+                        } else if bytes >= 1024 {
+                            format!("{:.1} KB", bytes as f64 / 1024.0)
+                        } else {
+                            format!("{} B", bytes)
+                        };
+                        let _ = tx.send(S3PullMessage::Done(format!(
+                            "Downloaded {} ({})",
+                            name, size
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("Download failed: {}", e)));
                     }
                 }
             });
@@ -2433,16 +2552,25 @@ impl App {
                     self.refresh_models();
                     self.selected_card = self.selected_card.saturating_sub(1);
                 }
+                if self.pending_delete_artifact {
+                    self.start_s3_delete_artifact();
+                    self.refresh_artifacts();
+                    if self.view == View::ArtifactDetail {
+                        self.view = View::List;
+                    }
+                }
                 self.show_delete_confirm = false;
                 self.pending_delete_run = None;
                 self.pending_delete_model = None;
                 self.pending_delete_eval = None;
+                self.pending_delete_artifact = false;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.show_delete_confirm = false;
                 self.pending_delete_run = None;
                 self.pending_delete_model = None;
                 self.pending_delete_eval = None;
+                self.pending_delete_artifact = false;
             }
             _ => {}
         }
@@ -3386,8 +3514,12 @@ impl App {
             KeyCode::Char('p') => {
                 self.start_s3_pull_artifacts();
             }
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.should_quit = true;
+            KeyCode::Char('d') if count > 0 => {
+                self.start_s3_download_artifact();
+            }
+            KeyCode::Char('D') if count > 0 => {
+                self.pending_delete_artifact = true;
+                self.show_delete_confirm = true;
             }
             _ => {}
         }
@@ -3403,6 +3535,13 @@ impl App {
             }
             KeyCode::Down => {
                 self.artifact_detail_scroll += 1;
+            }
+            KeyCode::Char('d') => {
+                self.start_s3_download_artifact();
+            }
+            KeyCode::Char('D') => {
+                self.pending_delete_artifact = true;
+                self.show_delete_confirm = true;
             }
             _ => {}
         }
@@ -8130,6 +8269,13 @@ fn render_delete_confirm(app: &App, frame: &mut Frame) {
             .map(|e| e.name.as_str())
             .unwrap_or("unknown");
         ("evaluation", name)
+    } else if app.pending_delete_artifact {
+        let name = app
+            .artifacts
+            .get(app.selected_artifact)
+            .map(|a| a.name.as_str())
+            .unwrap_or("unknown");
+        ("artifact", name)
     } else {
         ("item", "unknown")
     };
@@ -8595,7 +8741,13 @@ fn render_artifacts_list(app: &mut App, frame: &mut Frame) {
         Span::styled("] details  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("p", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] pull from S3", Style::default().fg(Color::DarkGray)),
+        Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("d", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] download  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("D", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] delete", Style::default().fg(Color::DarkGray)),
     ]);
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
@@ -8730,7 +8882,13 @@ fn render_artifact_detail(app: &App, frame: &mut Frame) {
         Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-        Span::styled("] scroll", Style::default().fg(Color::DarkGray)),
+        Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("d", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] download  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("D", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] delete", Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(footer), chunks[1]);
 }
