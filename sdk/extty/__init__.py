@@ -7,6 +7,7 @@ import warnings
 from datetime import datetime
 
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import Any, Callable, ParamSpec, TypeVar
 
 from extty.example import BatchExample, Example
@@ -27,7 +28,7 @@ from extty.artifact import (
     get_artifact,
     list_artifacts,
     load_artifact,
-    save_artifact,
+    save_artifact as _save_artifact_raw,
 )
 from extty.s3 import S3Config
 
@@ -294,6 +295,51 @@ def finish() -> None:
         raise RuntimeError("No active run to finish.")
     _active_run.finish()
     _active_run = None
+
+
+def save_artifact(
+    name: str,
+    path: str | Path,
+    *,
+    description: str = "",
+    metadata: dict[str, Any] | None = None,
+    s3_config: S3Config | None = None,
+) -> ArtifactMeta:
+    """
+    Save an artifact to S3.
+
+    If an active run exists, the artifact is automatically associated
+    with it.
+
+    Parameters
+    ----------
+    name : str
+        Unique name for this artifact.
+    path : str or Path
+        Local file or directory to upload.
+    description : str
+        Human-readable description.
+    metadata : dict[str, Any], optional
+        User-defined metadata (arbitrary JSON-serializable dict).
+    s3_config : S3Config, optional
+        S3 configuration. Loaded from environment if not provided.
+
+    Returns
+    -------
+    ArtifactMeta
+        Metadata for the saved artifact.
+    """
+    run_project = _active_run.project if _active_run is not None else None
+    run_name = _active_run.name if _active_run is not None else None
+    return _save_artifact_raw(
+        name,
+        path,
+        description=description,
+        metadata=metadata,
+        s3_config=s3_config,
+        run_project=run_project,
+        run_name=run_name,
+    )
 
 
 P = ParamSpec("P")

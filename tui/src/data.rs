@@ -1438,6 +1438,8 @@ pub struct Artifact {
     pub total_size_bytes: Option<u64>,
     pub files: Vec<ArtifactFile>,
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub run_project: Option<String>,
+    pub run_name: Option<String>,
 }
 
 impl Artifact {
@@ -1466,6 +1468,8 @@ struct ArtifactMeta {
     files: Vec<ArtifactFileMeta>,
     #[serde(default)]
     metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    run_project: Option<String>,
+    run_name: Option<String>,
 }
 
 fn default_content_type() -> String {
@@ -1520,6 +1524,8 @@ pub fn load_artifacts_from_cache() -> Vec<Artifact> {
                 })
                 .collect(),
             metadata: meta.metadata,
+            run_project: meta.run_project,
+            run_name: meta.run_name,
         });
     }
 

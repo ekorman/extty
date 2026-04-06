@@ -160,6 +160,7 @@ enum Card {
     Examples { name: String },
     Evaluation { name: String },
     Checkpoints,
+    Artifacts,
 }
 
 // Represents an item in the hierarchical list view (runs)
@@ -1743,6 +1744,17 @@ impl App {
         self.models.get(self.selected_model)
     }
 
+    fn run_artifacts(&self, run: &Run) -> Vec<&Artifact> {
+        let run_project = run.project.as_deref().unwrap_or("");
+        self.artifacts
+            .iter()
+            .filter(|a| {
+                a.run_project.as_deref() == Some(run_project)
+                    && a.run_name.as_deref() == Some(&run.name)
+            })
+            .collect()
+    }
+
     fn cards(&self) -> Vec<Card> {
         let Some(run) = self.current_run() else {
             return vec![];
@@ -1775,6 +1787,10 @@ impl App {
 
             if !run.checkpoints.is_empty() {
                 cards.push(Card::Checkpoints);
+            }
+
+            if !self.run_artifacts(run).is_empty() {
+                cards.push(Card::Artifacts);
             }
         }
 
@@ -1869,7 +1885,13 @@ impl App {
         let Some(run) = self.current_run() else {
             return 0;
         };
-        run.metrics.len() + run.examples.len() + if run.checkpoints.is_empty() { 0 } else { 1 }
+        let has_checkpoints = if run.checkpoints.is_empty() { 0 } else { 1 };
+        let has_artifacts = if self.run_artifacts(run).is_empty() {
+            0
+        } else {
+            1
+        };
+        run.metrics.len() + run.examples.len() + has_checkpoints + has_artifacts
     }
 
     fn model_card_count(&self) -> usize {
@@ -3638,6 +3660,25 @@ impl App {
                 self.pending_delete_artifact = true;
                 self.show_delete_confirm = true;
             }
+            KeyCode::Char('g') => {
+                if let Some(artifact) = self.artifacts.get(self.selected_artifact)
+                    && let (Some(proj), Some(rn)) = (&artifact.run_project, &artifact.run_name)
+                {
+                    let target_display = format!("{}/{}", proj, rn);
+                    if let Some(idx) = self
+                        .runs
+                        .iter()
+                        .position(|r| r.display_name() == target_display)
+                    {
+                        self.selected_run = idx;
+                        self.ensure_run_loaded(idx);
+                        self.view_mode = ViewMode::Runs;
+                        self.view = View::RunDetail;
+                        self.scroll_offset = 0;
+                        self.selected_card = 0;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -5243,6 +5284,18 @@ fn render_run_detail(app: &mut App, frame: &mut Frame) {
             Style::default().fg(Color::DarkGray),
         ));
     }
+    let artifact_count = app.run_artifacts(run).len();
+    if artifact_count > 0 {
+        header_spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
+        header_spans.push(Span::styled(
+            format!("{}", artifact_count),
+            Style::default().fg(NEON_YELLOW),
+        ));
+        header_spans.push(Span::styled(
+            " artifacts",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     header_spans.push(Span::styled(
         &scroll_indicator,
         Style::default().fg(NEON_MAGENTA),
@@ -5586,9 +5639,57 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                     is_selected,
                 );
             }
+            Card::Artifacts => {
+                let run_artifacts = app.run_artifacts(run);
+                render_artifacts_card(frame, card_area, &run_artifacts, is_selected);
+            }
             Card::Evaluation { .. } => {}
         }
     }
+}
+
+fn render_artifacts_card(frame: &mut Frame, area: Rect, artifacts: &[&Artifact], selected: bool) {
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" Artifacts ({})", artifacts.len()),
+            title_style,
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let max_lines = inner.height as usize;
+    let lines: Vec<Line> = artifacts
+        .iter()
+        .take(max_lines)
+        .map(|a| {
+            let icon = if a.content_type == "directory" {
+                "📁"
+            } else {
+                "📄"
+            };
+            Line::from(vec![
+                Span::styled(format!("{} ", icon), Style::default()),
+                Span::styled(&a.name, Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("  ({})", a.display_size()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_comparison_chart(
@@ -7497,8 +7598,70 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
             ]);
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
+        Card::Artifacts => {
+            if let Some(run) = app.current_run() {
+                let run_artifacts = app.run_artifacts(run);
+                render_focused_artifacts(frame, chunks[0], &run_artifacts);
+            }
+            let footer = Line::from(vec![
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+                Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}/{}", app.selected_card + 1, cards.len()),
+                    Style::default().fg(NEON_GREEN),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(footer), chunks[1]);
+        }
         Card::Evaluation { .. } => {}
     }
+}
+
+fn render_focused_artifacts(frame: &mut Frame, area: Rect, artifacts: &[&Artifact]) {
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
+            Span::styled(
+                format!("Artifacts ({})", artifacts.len()),
+                Style::default().fg(NEON_CYAN).bold(),
+            ),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_CYAN));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for artifact in artifacts {
+        let icon = if artifact.content_type == "directory" {
+            "📁"
+        } else {
+            "📄"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", icon), Style::default()),
+            Span::styled(&artifact.name, Style::default().fg(NEON_CYAN).bold()),
+            Span::styled(
+                format!("  ({})", artifact.display_size()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        if !artifact.description.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(&artifact.description, Style::default().fg(Color::White)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
@@ -8804,7 +8967,11 @@ fn render_artifacts_list(app: &mut App, frame: &mut Frame) {
             } else {
                 format!("  — {}", artifact.description)
             };
-            let text = format!("{} {}  ({}){}", icon, artifact.name, size, desc);
+            let run_ref = match (&artifact.run_project, &artifact.run_name) {
+                (Some(proj), Some(rn)) => format!("  [run: {}/{}]", proj, rn),
+                _ => String::new(),
+            };
+            let text = format!("{} {}  ({}){}{}", icon, artifact.name, size, desc, run_ref);
 
             let style = if is_selected {
                 Style::default().fg(NEON_CYAN)
@@ -8936,6 +9103,16 @@ fn render_artifact_detail(app: &App, frame: &mut Frame) {
         ]),
     ];
 
+    if let (Some(proj), Some(rn)) = (&artifact.run_project, &artifact.run_name) {
+        lines.push(Line::from(vec![
+            Span::styled("Run:          ", Style::default().fg(DIM_CYAN)),
+            Span::styled(
+                format!("{}/{}", proj, rn),
+                Style::default().fg(NEON_MAGENTA),
+            ),
+        ]));
+    }
+
     if let Some(metadata) = &artifact.metadata
         && !metadata.is_empty()
     {
@@ -9007,7 +9184,7 @@ fn render_artifact_detail(app: &App, frame: &mut Frame) {
 
     frame.render_widget(paragraph, chunks[0]);
 
-    let footer = Line::from(vec![
+    let mut footer_spans = vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Esc", Style::default().fg(NEON_YELLOW)),
         Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
@@ -9020,8 +9197,17 @@ fn render_artifact_detail(app: &App, frame: &mut Frame) {
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("D", Style::default().fg(NEON_YELLOW)),
         Span::styled("] delete", Style::default().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(footer), chunks[1]);
+    ];
+    if artifact.run_project.is_some() && artifact.run_name.is_some() {
+        footer_spans.push(Span::styled("  ", Style::default()));
+        footer_spans.push(Span::styled("[", Style::default().fg(DIM_CYAN)));
+        footer_spans.push(Span::styled("g", Style::default().fg(NEON_YELLOW)));
+        footer_spans.push(Span::styled(
+            "] go to run",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(footer_spans)), chunks[1]);
 }
 
 fn render_infra_dashboard(app: &mut App, frame: &mut Frame) {

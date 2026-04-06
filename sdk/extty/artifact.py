@@ -36,6 +36,10 @@ class ArtifactMeta:
         List of file entries, each with "path" and "size_bytes" keys.
     metadata : dict[str, Any]
         User-defined metadata (arbitrary JSON-serializable dict).
+    run_project : str or None
+        Project name of the run that produced this artifact, if any.
+    run_name : str or None
+        Run name that produced this artifact, if any.
     """
 
     name: str
@@ -46,9 +50,11 @@ class ArtifactMeta:
     total_size_bytes: int
     files: list[dict[str, Any]]
     metadata: dict[str, Any]
+    run_project: str | None = None
+    run_name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "content_type": self.content_type,
@@ -58,6 +64,11 @@ class ArtifactMeta:
             "files": self.files,
             "metadata": self.metadata,
         }
+        if self.run_project is not None:
+            d["run_project"] = self.run_project
+        if self.run_name is not None:
+            d["run_name"] = self.run_name
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ArtifactMeta:
@@ -70,6 +81,8 @@ class ArtifactMeta:
             total_size_bytes=d.get("total_size_bytes", 0),
             files=d.get("files", []),
             metadata=d.get("metadata", {}),
+            run_project=d.get("run_project"),
+            run_name=d.get("run_name"),
         )
 
 
@@ -158,6 +171,8 @@ def save_artifact(
     description: str = "",
     metadata: dict[str, Any] | None = None,
     s3_config: S3Config | None = None,
+    run_project: str | None = None,
+    run_name: str | None = None,
 ) -> ArtifactMeta:
     """
     Upload a file or directory to S3 as an artifact.
@@ -174,6 +189,10 @@ def save_artifact(
         User-defined metadata (arbitrary JSON-serializable dict).
     s3_config : S3Config, optional
         S3 configuration. Loaded from environment if not provided.
+    run_project : str, optional
+        Project name of the run that produced this artifact.
+    run_name : str, optional
+        Run name that produced this artifact.
 
     Returns
     -------
@@ -218,6 +237,8 @@ def save_artifact(
         total_size_bytes=size,
         files=files,
         metadata=metadata,
+        run_project=run_project,
+        run_name=run_name,
     )
 
     client.put_object(

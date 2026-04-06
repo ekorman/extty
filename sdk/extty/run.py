@@ -5,6 +5,7 @@ import os
 import subprocess
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from extty.storage import (
@@ -15,6 +16,7 @@ from extty.storage import (
 )
 from extty.system_monitor import SystemMonitor
 from extty.s3 import S3Config, S3Storage
+from extty.artifact import ArtifactMeta, save_artifact as _save_artifact
 
 
 class StorageSink(Protocol):
@@ -316,6 +318,46 @@ class Run:
                 "Set EXTTY_S3_BUCKET or provide s3_config to load checkpoints."
             )
         return self._s3_storage.load_checkpoint(step, load_optimizer=load_optimizer)
+
+    def save_artifact(
+        self,
+        name: str,
+        path: str | Path,
+        *,
+        description: str = "",
+        metadata: dict[str, Any] | None = None,
+        s3_config: S3Config | None = None,
+    ) -> ArtifactMeta:
+        """
+        Save an artifact associated with this run.
+
+        Parameters
+        ----------
+        name : str
+            Unique name for this artifact.
+        path : str or Path
+            Local file or directory to upload.
+        description : str
+            Human-readable description.
+        metadata : dict[str, Any], optional
+            User-defined metadata (arbitrary JSON-serializable dict).
+        s3_config : S3Config, optional
+            S3 configuration. Loaded from environment if not provided.
+
+        Returns
+        -------
+        ArtifactMeta
+            Metadata for the saved artifact.
+        """
+        return _save_artifact(
+            name,
+            path,
+            description=description,
+            metadata=metadata,
+            s3_config=s3_config,
+            run_project=self.project,
+            run_name=self.name,
+        )
 
     def finish(self) -> None:
         """
