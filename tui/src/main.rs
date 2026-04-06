@@ -294,6 +294,7 @@ struct App {
     selected_artifact: usize,
     artifact_detail_scroll: usize,
     pending_delete_artifact: bool,
+    pending_delete_checkpoint: bool,
 }
 
 impl App {
@@ -413,6 +414,7 @@ impl App {
             selected_artifact: 0,
             artifact_detail_scroll: 0,
             pending_delete_artifact: false,
+            pending_delete_checkpoint: false,
         }
     }
 
@@ -667,6 +669,83 @@ impl App {
                     Ok(()) => {
                         let _ = std::fs::remove_dir_all(&local_dir);
                         let _ = tx.send(S3PullMessage::Done(format!("Deleted {}", name)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("Delete failed: {}", e)));
+                    }
+                }
+            });
+        });
+    }
+
+    fn start_s3_delete_checkpoint(&mut self) {
+        if self.s3_pull_rx.is_some() {
+            return;
+        }
+
+        let Some(run) = self.current_run() else {
+            return;
+        };
+
+        let Some(ckpt) = run.checkpoints.get(self.selected_checkpoint) else {
+            return;
+        };
+
+        let config = match s3::load_config() {
+            Ok(Some(config)) => config,
+            _ => {
+                self.s3_pull_status = Some("S3 not configured".to_string());
+                self.s3_pull_time = Some(Instant::now());
+                return;
+            }
+        };
+
+        let step = ckpt.step;
+        let project = run.project.clone().unwrap_or_default();
+        let run_name = run.name.clone();
+        let run_path = run.path.clone();
+
+        let (tx, rx) = mpsc::channel();
+        self.s3_pull_rx = Some(rx);
+        self.s3_pull_status = Some(format!("Deleting checkpoint step {}...", step));
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(S3PullMessage::Error(format!("Runtime error: {}", e)));
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                let client = match s3::S3Client::new(config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(S3PullMessage::Error(format!("S3 error: {}", e)));
+                        return;
+                    }
+                };
+                match client.delete_checkpoint(&project, &run_name, step).await {
+                    Ok(()) => {
+                        let local_dir = run_path.join("checkpoints").join(step.to_string());
+                        let _ = std::fs::remove_dir_all(&local_dir);
+
+                        let ckpt_json = run_path.join("checkpoints.json");
+                        if let Ok(content) = std::fs::read_to_string(&ckpt_json)
+                            && let Ok(mut entries) =
+                                serde_json::from_str::<Vec<serde_json::Value>>(&content)
+                        {
+                            entries
+                                .retain(|e| e.get("step").and_then(|v| v.as_u64()) != Some(step));
+                            if let Ok(updated) = serde_json::to_string_pretty(&entries) {
+                                let _ = std::fs::write(&ckpt_json, updated);
+                            }
+                        }
+
+                        let _ = tx.send(S3PullMessage::Done(format!(
+                            "Deleted checkpoint step {}",
+                            step
+                        )));
                     }
                     Err(e) => {
                         let _ = tx.send(S3PullMessage::Error(format!("Delete failed: {}", e)));
@@ -2559,11 +2638,22 @@ impl App {
                         self.view = View::List;
                     }
                 }
+                if self.pending_delete_checkpoint {
+                    self.start_s3_delete_checkpoint();
+                    self.refresh_runs();
+                    self.selected_checkpoint = self.selected_checkpoint.min(
+                        self.current_run()
+                            .map(|r| r.checkpoints.len())
+                            .unwrap_or(0)
+                            .saturating_sub(1),
+                    );
+                }
                 self.show_delete_confirm = false;
                 self.pending_delete_run = None;
                 self.pending_delete_model = None;
                 self.pending_delete_eval = None;
                 self.pending_delete_artifact = false;
+                self.pending_delete_checkpoint = false;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.show_delete_confirm = false;
@@ -2571,6 +2661,7 @@ impl App {
                 self.pending_delete_model = None;
                 self.pending_delete_eval = None;
                 self.pending_delete_artifact = false;
+                self.pending_delete_checkpoint = false;
             }
             _ => {}
         }
@@ -3342,6 +3433,10 @@ impl App {
                         self.checkpoint_download_modal = true;
                     }
                 }
+            }
+            KeyCode::Char('D') if checkpoint_count > 0 => {
+                self.pending_delete_checkpoint = true;
+                self.show_delete_confirm = true;
             }
             // Shift+Up/Down jump 10 examples at a time
             KeyCode::Up if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
@@ -7395,7 +7490,10 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("[", Style::default().fg(DIM_CYAN)),
                 Span::styled("p", Style::default().fg(NEON_CYAN)),
-                Span::styled("] download", Style::default().fg(Color::DarkGray)),
+                Span::styled("] download  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("D", Style::default().fg(NEON_YELLOW)),
+                Span::styled("] delete", Style::default().fg(Color::DarkGray)),
             ]);
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
@@ -8276,6 +8374,39 @@ fn render_delete_confirm(app: &App, frame: &mut Frame) {
             .map(|a| a.name.as_str())
             .unwrap_or("unknown");
         ("artifact", name)
+    } else if app.pending_delete_checkpoint {
+        let step_str = app
+            .current_run()
+            .and_then(|r| r.checkpoints.get(app.selected_checkpoint))
+            .map(|c| c.step.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let label = format!("step {}", step_str);
+        let area = frame.area();
+        let popup_width = 60u16.min(area.width.saturating_sub(4));
+        let popup_height = 7u16;
+        let x = (area.width.saturating_sub(popup_width)) / 2;
+        let y = (area.height.saturating_sub(popup_height)) / 2;
+        let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+        let text = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Delete checkpoint ", Style::default().fg(Color::White)),
+                Span::styled(&label, Style::default().fg(NEON_YELLOW).bold()),
+                Span::styled("? (y/n)", Style::default().fg(Color::White)),
+            ]),
+        ];
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(NEON_MAGENTA))
+            .title(Span::styled(
+                " Confirm Delete ",
+                Style::default().fg(NEON_MAGENTA).bold(),
+            ));
+        let paragraph = Paragraph::new(text).block(block);
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(paragraph, popup_area);
+        return;
     } else {
         ("item", "unknown")
     };
