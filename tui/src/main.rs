@@ -9125,16 +9125,8 @@ fn render_artifact_detail(app: &App, frame: &mut Frame) {
             "─".repeat(60),
             Style::default().fg(DIM_CYAN),
         )));
-        for (key, value) in metadata {
-            let val_str = match value {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {}: ", key), Style::default().fg(DIM_CYAN)),
-                Span::styled(val_str, Style::default().fg(Color::White)),
-            ]));
-        }
+        let obj = serde_json::Value::Object(metadata.clone());
+        render_json_value_full(&obj, 1, &mut lines);
     }
 
     lines.push(Line::from(""));
