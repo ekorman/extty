@@ -706,6 +706,41 @@ class S3Storage:
         except self._client.exceptions.NoSuchKey:
             raise FileNotFoundError(f"Checkpoint step {step} not found.")
 
+    def delete_checkpoint(self, step: int) -> None:
+        """
+        Delete a checkpoint from S3.
+
+        Removes all objects under the checkpoint's S3 prefix and updates
+        the checkpoints index.
+
+        Parameters
+        ----------
+        step : int
+            The training step to delete.
+        """
+        prefix = self._s3_key("checkpoints", str(step), "")
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.config.bucket, Prefix=prefix):
+            objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+            if objects:
+                self._client.delete_objects(
+                    Bucket=self.config.bucket, Delete={"Objects": objects}
+                )
+
+        index_key = self._s3_key("checkpoints.json")
+        try:
+            response = self._client.get_object(Bucket=self.config.bucket, Key=index_key)
+            existing = json.loads(response["Body"].read().decode("utf-8"))
+            updated = [cp for cp in existing if cp.get("step") != step]
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=index_key,
+                Body=json.dumps(updated, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception:
+            pass
+
     def list_checkpoints(self) -> list[dict[str, Any]]:
         """
         List all checkpoints for this run.
