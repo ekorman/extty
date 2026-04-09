@@ -3,6 +3,7 @@
 import copy
 import dataclasses
 import functools
+import os
 import warnings
 from datetime import datetime
 
@@ -13,7 +14,7 @@ from typing import Any, Callable, ParamSpec, TypeVar
 from extty.example import BatchExample, Example
 from extty.compare import compare, config_diff, plot_metric, reduce_metric
 from extty.query import RunData, get_run, get_runs
-from extty.run import Run
+from extty.run import NoOpRun, Run
 from extty.storage import (
     ExampleRecord,
     MetricPoint,
@@ -56,6 +57,7 @@ __all__ = [
     "SystemMetricPoint",
     "ExampleRecord",
     "has_active_run",
+    "NoOpRun",
     "ArtifactMeta",
     "save_artifact",
     "list_artifacts",
@@ -78,15 +80,32 @@ def has_active_run() -> bool:
     return _active_run is not None
 
 
+def _is_main_process(rank: int | None) -> bool:
+    if rank is not None:
+        return rank == 0
+    env_rank = os.environ.get("RANK")
+    if env_rank is not None:
+        try:
+            return int(env_rank) == 0
+        except ValueError:
+            return True
+    return True
+
+
 def init(
     project: str,
     *,
     name: str | None = None,
     config: dict[str, Any] | None = None,
     system_metrics: bool = True,
+    rank: int | None = None,
 ) -> Run:
     """
     Initialize a new experiment run.
+
+    On non-main processes in distributed training (detected via the RANK
+    environment variable or the explicit ``rank`` parameter), returns a
+    :class:`NoOpRun` that silently discards all operations.
 
     Parameters
     ----------
@@ -98,24 +117,32 @@ def init(
         Hyperparameters and configuration to log.
     system_metrics : bool, default True
         Whether to automatically collect system metrics (RAM, GPU).
+    rank : int, optional
+        Explicit process rank. When provided, overrides the RANK environment
+        variable. Only rank 0 creates a real run.
 
     Returns
     -------
     Run
-        The initialized run object.
+        The initialized run object (or :class:`NoOpRun` on non-main processes).
     """
     global _active_run
     if _active_run is not None:
         _active_run.finish()
-    _active_run = Run(
-        project,
-        name=name,
-        config=config,
-        system_metrics=system_metrics,
-    )
-    print(
-        f"extty initialized with run {project}/{_active_run.name}, writing to {_active_run.run_dir}"
-    )
+
+    if _is_main_process(rank):
+        _active_run = Run(
+            project,
+            name=name,
+            config=config,
+            system_metrics=system_metrics,
+        )
+        print(
+            f"extty initialized with run {project}/{_active_run.name}, writing to {_active_run.run_dir}"
+        )
+    else:
+        _active_run = NoOpRun(project, name=name, config=config)
+
     return _active_run
 
 
@@ -329,6 +356,10 @@ def save_artifact(
     ArtifactMeta
         Metadata for the saved artifact.
     """
+    if isinstance(_active_run, NoOpRun):
+        return _active_run.save_artifact(
+            name, path, description=description, metadata=metadata, s3_config=s3_config
+        )
     run_project = _active_run.project if _active_run is not None else None
     run_name = _active_run.name if _active_run is not None else None
     return _save_artifact_raw(

@@ -1783,3 +1783,113 @@ class TestS3FailureTolerance:
         )
         storage.flush()
         assert storage._consecutive_failures == 0
+
+
+class TestDistributedInit:
+    def test_rank_env_nonzero_returns_noop(self, tmp_path: Path) -> None:
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+                run = extty.init("test-project", name="dist-test", system_metrics=False)
+                assert isinstance(run, extty.NoOpRun)
+                extty.finish()
+        assert not (tmp_path / "runs").exists()
+
+    def test_rank_env_zero_returns_real_run(self, tmp_path: Path) -> None:
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+                run = extty.init(
+                    "test-project", name="rank0-test", system_metrics=False
+                )
+                assert not isinstance(run, extty.NoOpRun)
+                assert isinstance(run, extty.Run)
+                extty.finish()
+
+    def test_no_rank_env_returns_real_run(self, tmp_path: Path) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RANK", None)
+            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+                run = extty.init(
+                    "test-project", name="norank-test", system_metrics=False
+                )
+                assert not isinstance(run, extty.NoOpRun)
+                extty.finish()
+
+    def test_explicit_rank_overrides_env(self, tmp_path: Path) -> None:
+        with mock.patch.dict(os.environ, {"RANK": "0"}):
+            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+                run = extty.init(
+                    "test-project", name="override-test", system_metrics=False, rank=3
+                )
+                assert isinstance(run, extty.NoOpRun)
+                extty.finish()
+
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+                run = extty.init(
+                    "test-project", name="override-test2", system_metrics=False, rank=0
+                )
+                assert not isinstance(run, extty.NoOpRun)
+                extty.finish()
+
+    def test_noop_run_log_does_not_crash(self) -> None:
+        from extty.run import NoOpRun
+
+        run = NoOpRun("proj", name="test")
+        run.log({"loss": 0.5, "acc": 0.9}, step=0)
+
+    def test_noop_run_finish_does_not_crash(self) -> None:
+        from extty.run import NoOpRun
+
+        run = NoOpRun("proj", name="test")
+        run.finish()
+
+    def test_noop_run_save_checkpoint_does_not_crash(self) -> None:
+        from extty.run import NoOpRun
+
+        run = NoOpRun("proj", name="test")
+        run.save_checkpoint(step=0)
+
+    def test_noop_run_load_checkpoint_raises(self) -> None:
+        from extty.run import NoOpRun
+
+        run = NoOpRun("proj", name="test")
+        with pytest.raises(RuntimeError, match="no-op run"):
+            run.load_checkpoint(step=0)
+
+    def test_noop_run_context_manager(self) -> None:
+        from extty.run import NoOpRun
+
+        with NoOpRun("proj", name="ctx-test") as run:
+            run.log({"x": 1}, step=0)
+
+    def test_noop_run_properties(self) -> None:
+        from extty.run import NoOpRun
+
+        run = NoOpRun("proj", name="my-name", config={"lr": 0.01})
+        assert run.project == "proj"
+        assert run.name == "my-name"
+        assert run.config == {"lr": 0.01}
+        assert run.run_dir == ""
+
+    def test_noop_run_no_directories_created(self, tmp_path: Path) -> None:
+        from extty.run import NoOpRun
+
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            run = NoOpRun("proj", name="no-dir-test")
+            run.log({"x": 1}, step=0)
+            run.finish()
+        assert not (tmp_path / "runs").exists()
+
+    def test_module_log_and_finish_with_noop(self, tmp_path: Path) -> None:
+        with mock.patch.dict(os.environ, {"RANK": "2"}):
+            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+                extty.init("test-project", name="module-noop", system_metrics=False)
+                extty.log({"loss": 0.5}, step=0)
+                extty.finish()
+        assert not (tmp_path / "runs").exists()
+
+    def test_has_active_run_true_for_noop(self) -> None:
+        with mock.patch.dict(os.environ, {"RANK": "1"}):
+            extty.init("test-project", name="active-check", system_metrics=False)
+            assert extty.has_active_run()
+            extty.finish()

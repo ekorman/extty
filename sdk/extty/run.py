@@ -410,3 +410,85 @@ class Run:
         if isinstance(primary, RunStorage):
             return str(primary.run_dir)
         return ""
+
+
+class NoOpRun(Run):
+    """A run that silently discards all operations.
+
+    Used on non-main processes in distributed training to prevent
+    phantom runs while keeping the API functional.
+    """
+
+    def __init__(
+        self,
+        project: str,
+        *,
+        name: str | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        self.project = project
+        self.name = name or generate_random_name()
+        self.config = config or {}
+        self._finished = False
+        self._lock = threading.Lock()
+        self._system_monitor = None
+        self._s3_storage = None
+
+    def log(self, metrics: dict[str, Any], *, step: int) -> None:
+        pass
+
+    def save_checkpoint(
+        self,
+        step: int,
+        *,
+        path: str | None = None,
+        state_dict: Any = None,
+        optimizer_state_dict: Any = None,
+    ) -> None:
+        pass
+
+    def load_checkpoint(
+        self,
+        step: int,
+        load_optimizer: bool = True,
+    ) -> dict[str, Any]:
+        raise RuntimeError(
+            "Cannot load checkpoints from a no-op run. "
+            "Load checkpoints on the main process (rank 0) only."
+        )
+
+    def save_artifact(
+        self,
+        name: str,
+        path: str | Path,
+        *,
+        description: str = "",
+        metadata: dict[str, Any] | None = None,
+        s3_config: S3Config | None = None,
+    ) -> ArtifactMeta:
+        return ArtifactMeta(
+            name=name,
+            description=description,
+            content_type="file",
+            created_at="",
+            updated_at="",
+            total_size_bytes=0,
+            files=[],
+            metadata=metadata or {},
+            run_project=self.project,
+            run_name=self.name,
+        )
+
+    def finish(self) -> None:
+        with self._lock:
+            self._finished = True
+
+    @property
+    def run_dir(self) -> str:
+        return ""
+
+    def __enter__(self) -> NoOpRun:
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.finish()
