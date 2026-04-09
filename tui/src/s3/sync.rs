@@ -917,6 +917,24 @@ impl S3Client {
             }
         }
 
+        let index_key = self.s3_prefix(&format!("runs/{}/{}/checkpoints.json", project, run));
+        if let Ok(Some(content)) = self.get_object_content(&index_key).await
+            && let Ok(mut entries) = serde_json::from_slice::<Vec<serde_json::Value>>(&content)
+        {
+            entries.retain(|e| e.get("step").and_then(|v| v.as_u64()) != Some(step));
+            let updated =
+                serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
+            let _ = self
+                .client
+                .put_object()
+                .bucket(&self.config.bucket)
+                .key(&index_key)
+                .body(updated.into_bytes().into())
+                .content_type("application/json")
+                .send()
+                .await;
+        }
+
         Ok(())
     }
 
