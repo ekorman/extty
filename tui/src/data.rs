@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use chrono::{DateTime, Local};
 use serde::Deserialize;
@@ -213,6 +213,33 @@ impl Run {
             None => self.name.clone(),
         }
     }
+
+    pub fn last_modified(&self) -> Option<SystemTime> {
+        let metrics_dir = self.path.join("metrics");
+        if !metrics_dir.exists() {
+            return None;
+        }
+        latest_mtime_recursive(&metrics_dir)
+    }
+}
+
+fn latest_mtime_recursive(dir: &Path) -> Option<SystemTime> {
+    let mut latest: Option<SystemTime> = None;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let candidate = if path.is_dir() {
+            latest_mtime_recursive(&path)
+        } else {
+            entry.metadata().ok().and_then(|m| m.modified().ok())
+        };
+        if let Some(t) = candidate {
+            latest = Some(latest.map_or(t, |cur| cur.max(t)));
+        }
+    }
+    latest
 }
 
 #[derive(Debug, Deserialize)]

@@ -3,7 +3,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::{
@@ -5191,6 +5191,26 @@ fn render_models_list(app: &App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(help), help_area);
 }
 
+fn format_time_ago(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{}s ago", secs),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => {
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            if m == 0 {
+                format!("{}h ago", h)
+            } else {
+                format!("{}h {}m ago", h, m)
+            }
+        }
+        _ => {
+            let d = secs / 86400;
+            format!("{}d ago", d)
+        }
+    }
+}
+
 fn render_run_detail(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
@@ -5310,6 +5330,16 @@ fn render_run_detail(app: &mut App, frame: &mut Frame) {
         };
         header_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
         header_spans.push(Span::styled(status.clone(), Style::default().fg(color)));
+    }
+    if let Some(elapsed) = run
+        .last_modified()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+    {
+        header_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        header_spans.push(Span::styled(
+            format!("updated {}", format_time_ago(elapsed.as_secs())),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     if let Some(note) = app.run_notes.get(&run.display_name()) {
         let display_note = if note.len() > 60 {
