@@ -163,6 +163,12 @@ enum Card {
     Artifacts,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum XAxis {
+    Step,
+    Timestamp,
+}
+
 // Represents an item in the hierarchical list view (runs)
 #[derive(Clone, Debug)]
 enum ListEntry {
@@ -281,6 +287,7 @@ struct App {
     checkpoint_download_selected: usize,
     checkpoint_download_step: u64,
     show_system_metrics: bool,
+    timestamp_x_metrics: HashSet<String>,
     config_filters: Vec<(String, String)>,
     filter_modal_open: bool,
     filter_modal_phase: FilterPhase,
@@ -402,6 +409,7 @@ impl App {
             checkpoint_download_selected: 0,
             checkpoint_download_step: 0,
             show_system_metrics: false,
+            timestamp_x_metrics: HashSet::new(),
             config_filters: Vec::new(),
             filter_modal_open: false,
             filter_modal_phase: FilterPhase::default(),
@@ -1755,6 +1763,20 @@ impl App {
             .collect()
     }
 
+    fn chart_x_axis(&self, metric_name: &str) -> XAxis {
+        if self.timestamp_x_metrics.contains(metric_name) {
+            XAxis::Timestamp
+        } else {
+            XAxis::Step
+        }
+    }
+
+    fn toggle_chart_x_axis(&mut self, metric_name: &str) {
+        if !self.timestamp_x_metrics.remove(metric_name) {
+            self.timestamp_x_metrics.insert(metric_name.to_string());
+        }
+    }
+
     fn cards(&self) -> Vec<Card> {
         let Some(run) = self.current_run() else {
             return vec![];
@@ -3014,6 +3036,12 @@ impl App {
                 self.selected_card = 0;
                 self.scroll_offset = 0;
             }
+            KeyCode::Char('t') => {
+                if let Some(Card::Chart { name }) = self.cards().get(self.selected_card) {
+                    let name = name.clone();
+                    self.toggle_chart_x_axis(&name);
+                }
+            }
             KeyCode::Char('m')
                 if !self.runs.is_empty() && self.runs[self.selected_run].is_running() =>
             {
@@ -3200,6 +3228,12 @@ impl App {
                 self.selected_card = 0;
                 self.scroll_offset = 0;
             }
+            KeyCode::Char('t') => {
+                if let Some(Card::Chart { name }) = self.compare_cards().get(self.selected_card) {
+                    let name = name.clone();
+                    self.toggle_chart_x_axis(&name);
+                }
+            }
             _ => {}
         }
     }
@@ -3324,6 +3358,12 @@ impl App {
                 self.prompt_scroll_offset = 0;
                 self.response_scroll_offset = 0;
                 self.groundtruth_scroll_offset = 0;
+            }
+            KeyCode::Char('t') => {
+                if let Some(Card::Chart { name }) = current_card {
+                    let name = name.clone();
+                    self.toggle_chart_x_axis(&name);
+                }
             }
             // Tab cycles focus: Prompt → Groundtruth → Response (skip Groundtruth when absent)
             KeyCode::Tab => {
@@ -5425,6 +5465,20 @@ fn render_run_detail(app: &mut App, frame: &mut Frame) {
             ),
         ]);
     }
+    if let Some(Card::Chart { name }) = cards.get(app.selected_card) {
+        let t_hint = match app.chart_x_axis(name) {
+            XAxis::Step => "time x",
+            XAxis::Timestamp => "step x",
+        };
+        footer_spans.extend([
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("t", Style::default().fg(NEON_CYAN)),
+            Span::styled(
+                format!("] {}  ", t_hint),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
     if app.show_config {
         footer_spans.extend([
             Span::styled("[", Style::default().fg(DIM_CYAN)),
@@ -5652,7 +5706,8 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
         match card {
             Card::Chart { name } => {
                 if let Some(points) = run.metrics.get(name) {
-                    render_chart(frame, card_area, name, points, is_selected);
+                    let x_axis = app.chart_x_axis(name);
+                    render_chart(frame, card_area, name, points, is_selected, x_axis);
                 }
             }
             Card::Examples { name } => {
@@ -5728,6 +5783,7 @@ fn render_comparison_chart(
     title: &str,
     run_data: &[CompareRunData],
     selected: bool,
+    x_axis: XAxis,
 ) {
     use ratatui::symbols::Marker;
     use ratatui::widgets::{Axis, Chart, Dataset, GraphType, LegendPosition};
@@ -5742,9 +5798,14 @@ fn render_comparison_chart(
     let non_empty: Vec<&CompareRunData> =
         run_data.iter().filter(|(_, _, d)| !d.is_empty()).collect();
 
+    let display_title = match x_axis {
+        XAxis::Step => title.to_string(),
+        XAxis::Timestamp => format!("{} (time)", title),
+    };
+
     if non_empty.is_empty() {
         let block = Block::default()
-            .title(Span::styled(title, title_style))
+            .title(Span::styled(display_title.clone(), title_style))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
@@ -5802,11 +5863,12 @@ fn render_comparison_chart(
     let axis_style = Style::default().fg(DIM_CYAN);
     let label_style = Style::default().fg(Color::DarkGray);
 
+    let x_span = x_max - x_min;
     let num_x_ticks = 5;
     let x_labels: Vec<Span> = (0..num_x_ticks)
         .map(|i| {
-            let v = x_min + (x_max - x_min) * i as f64 / (num_x_ticks - 1) as f64;
-            Span::styled(format!("{:.0}", v), label_style)
+            let v = x_min + x_span * i as f64 / (num_x_ticks - 1) as f64;
+            Span::styled(format_x_label(v, x_span, x_axis), label_style)
         })
         .collect();
 
@@ -5821,7 +5883,7 @@ fn render_comparison_chart(
     let chart = Chart::new(datasets)
         .block(
             Block::default()
-                .title(Span::styled(title, title_style))
+                .title(Span::styled(display_title, title_style))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(border_color)),
@@ -5936,6 +5998,7 @@ fn render_compare_view(app: &mut App, frame: &mut Frame) {
 
         match card {
             Card::Chart { name } => {
+                let x_axis = app.chart_x_axis(name);
                 let run_data: Vec<CompareRunData> = app
                     .compared_runs
                     .iter()
@@ -5946,12 +6009,12 @@ fn render_compare_view(app: &mut App, frame: &mut Frame) {
                         let data: Vec<(f64, f64)> = run
                             .metrics
                             .get(name)
-                            .map(|pts| pts.iter().map(|p| (p.step as f64, p.value)).collect())
+                            .map(|pts| points_to_xy(pts, x_axis))
                             .unwrap_or_default();
                         Some((run.display_name(), color, data))
                     })
                     .collect();
-                render_comparison_chart(frame, card_area, name, &run_data, is_selected);
+                render_comparison_chart(frame, card_area, name, &run_data, is_selected, x_axis);
             }
             Card::Examples { name } => {
                 render_compare_examples_card(frame, card_area, name, app, is_selected);
@@ -6024,7 +6087,7 @@ fn render_compare_view(app: &mut App, frame: &mut Frame) {
     } else {
         "system"
     };
-    let footer = Line::from(vec![
+    let mut footer_spans: Vec<Span> = vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
         Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
@@ -6040,6 +6103,22 @@ fn render_compare_view(app: &mut App, frame: &mut Frame) {
             format!("] {}  ", sys_hint),
             Style::default().fg(Color::DarkGray),
         ),
+    ];
+    if let Some(Card::Chart { name }) = cards.get(app.selected_card) {
+        let t_hint = match app.chart_x_axis(name) {
+            XAxis::Step => "time x",
+            XAxis::Timestamp => "step x",
+        };
+        footer_spans.extend([
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("t", Style::default().fg(NEON_CYAN)),
+            Span::styled(
+                format!("] {}  ", t_hint),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+    footer_spans.extend([
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("c", Style::default().fg(NEON_CYAN)),
         Span::styled(
@@ -6050,7 +6129,7 @@ fn render_compare_view(app: &mut App, frame: &mut Frame) {
         Span::styled("p", Style::default().fg(NEON_CYAN)),
         Span::styled("] pull", Style::default().fg(Color::DarkGray)),
     ]);
-    frame.render_widget(Paragraph::new(footer), chunks[2]);
+    frame.render_widget(Paragraph::new(Line::from(footer_spans)), chunks[2]);
 }
 
 fn render_compare_examples_card(
@@ -6597,12 +6676,67 @@ fn lttb_downsample(data: &[(f64, f64)], threshold: usize) -> Vec<(f64, f64)> {
     sampled
 }
 
+fn points_to_xy(points: &[MetricPoint], x_axis: XAxis) -> Vec<(f64, f64)> {
+    match x_axis {
+        XAxis::Step => points.iter().map(|p| (p.step as f64, p.value)).collect(),
+        XAxis::Timestamp => {
+            let first_ts = points.first().map(|p| p.timestamp).unwrap_or(0.0);
+            points
+                .iter()
+                .map(|p| (p.timestamp - first_ts, p.value))
+                .collect()
+        }
+    }
+}
+
+fn format_x_label(value: f64, span: f64, x_axis: XAxis) -> String {
+    match x_axis {
+        XAxis::Step => format!("{:.0}", value),
+        XAxis::Timestamp => format_duration_label(value, span),
+    }
+}
+
+fn format_duration_label(seconds: f64, span: f64) -> String {
+    let span = span.max(1e-9);
+    let s = seconds.max(0.0);
+    if span < 120.0 {
+        format!("{}s", s.round() as i64)
+    } else if span < 600.0 {
+        let m = (s / 60.0).floor() as i64;
+        let rem = (s - (m as f64) * 60.0).round() as i64;
+        if rem == 0 {
+            format!("{}m", m)
+        } else {
+            format!("{}m{}s", m, rem)
+        }
+    } else if span < 7200.0 {
+        format!("{}m", (s / 60.0).round() as i64)
+    } else if span < 172800.0 {
+        let h = (s / 3600.0).floor() as i64;
+        let rem_m = ((s - (h as f64) * 3600.0) / 60.0).round() as i64;
+        if rem_m == 0 {
+            format!("{}h", h)
+        } else {
+            format!("{}h{}m", h, rem_m)
+        }
+    } else {
+        let d = (s / 86400.0).floor() as i64;
+        let rem_h = ((s - (d as f64) * 86400.0) / 3600.0).round() as i64;
+        if rem_h == 0 {
+            format!("{}d", d)
+        } else {
+            format!("{}d{}h", d, rem_h)
+        }
+    }
+}
+
 fn render_chart(
     frame: &mut Frame,
     area: Rect,
     title: &str,
     points: &[MetricPoint],
     selected: bool,
+    x_axis: XAxis,
 ) {
     use ratatui::symbols::Marker;
     use ratatui::widgets::{Axis, Chart, Dataset, GraphType};
@@ -6614,9 +6748,14 @@ fn render_chart(
         Style::default().fg(NEON_GREEN)
     };
 
+    let display_title = match x_axis {
+        XAxis::Step => title.to_string(),
+        XAxis::Timestamp => format!("{} (time)", title),
+    };
+
     if points.is_empty() {
         let block = Block::default()
-            .title(Span::styled(title, title_style))
+            .title(Span::styled(display_title, title_style))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
@@ -6631,7 +6770,7 @@ fn render_chart(
         return;
     }
 
-    let raw_data: Vec<(f64, f64)> = points.iter().map(|p| (p.step as f64, p.value)).collect();
+    let raw_data: Vec<(f64, f64)> = points_to_xy(points, x_axis);
     let max_points = (area.width as usize) * 2;
     let data = lttb_downsample(&raw_data, max_points);
 
@@ -6657,11 +6796,12 @@ fn render_chart(
     let axis_style = Style::default().fg(DIM_CYAN);
     let label_style = Style::default().fg(Color::DarkGray);
 
+    let x_span = x_max - x_min;
     let num_x_ticks = 5;
     let x_labels: Vec<Span> = (0..num_x_ticks)
         .map(|i| {
-            let v = x_min + (x_max - x_min) * i as f64 / (num_x_ticks - 1) as f64;
-            Span::styled(format!("{:.0}", v), label_style)
+            let v = x_min + x_span * i as f64 / (num_x_ticks - 1) as f64;
+            Span::styled(format_x_label(v, x_span, x_axis), label_style)
         })
         .collect();
 
@@ -6676,7 +6816,7 @@ fn render_chart(
     let chart = Chart::new(vec![dataset])
         .block(
             Block::default()
-                .title(Span::styled(title, title_style))
+                .title(Span::styled(display_title, title_style))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(border_color)),
@@ -7205,6 +7345,7 @@ fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
 
     match card {
         Card::Chart { name } => {
+            let x_axis = app.chart_x_axis(name);
             let run_data: Vec<CompareRunData> = app
                 .compared_runs
                 .iter()
@@ -7215,12 +7356,12 @@ fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
                     let data: Vec<(f64, f64)> = run
                         .metrics
                         .get(name)
-                        .map(|pts| pts.iter().map(|p| (p.step as f64, p.value)).collect())
+                        .map(|pts| points_to_xy(pts, x_axis))
                         .unwrap_or_default();
                     Some((run.display_name(), color, data))
                 })
                 .collect();
-            render_comparison_chart(frame, chunks[0], name, &run_data, true);
+            render_comparison_chart(frame, chunks[0], name, &run_data, true, x_axis);
         }
         Card::Examples { name } => {
             render_focused_compare_examples(app, frame, chunks[0], name);
@@ -7483,7 +7624,8 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
     match card {
         Card::Chart { name } => {
             if let Some(points) = run.metrics.get(name) {
-                render_chart(frame, chunks[0], name, points, true);
+                let x_axis = app.chart_x_axis(name);
+                render_chart(frame, chunks[0], name, points, true, x_axis);
             }
             let footer = Line::from(vec![
                 Span::styled("[", Style::default().fg(DIM_CYAN)),

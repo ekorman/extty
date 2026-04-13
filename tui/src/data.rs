@@ -11,6 +11,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone)]
 pub struct MetricPoint {
     pub step: u64,
+    pub timestamp: f64,
     pub value: f64,
 }
 
@@ -808,7 +809,6 @@ fn load_metrics_recursive(
 #[derive(Debug, Deserialize)]
 struct MetricRow {
     step: u64,
-    #[allow(dead_code)]
     timestamp: f64,
     value: f64,
 }
@@ -822,6 +822,7 @@ fn load_metric_csv(path: &PathBuf) -> Result<Vec<MetricPoint>, csv::Error> {
         let row: MetricRow = result?;
         points.push(MetricPoint {
             step: row.step,
+            timestamp: row.timestamp,
             value: row.value,
         });
     }
@@ -872,6 +873,7 @@ fn load_system_metrics(run_path: &Path) -> HashMap<String, Vec<MetricPoint>> {
         };
         ram_used.push(MetricPoint {
             step: elapsed_min,
+            timestamp: row.timestamp,
             value: ram_pct,
         });
 
@@ -882,11 +884,13 @@ fn load_system_metrics(run_path: &Path) -> HashMap<String, Vec<MetricPoint>> {
         };
         gpu_mem_used.push(MetricPoint {
             step: elapsed_min,
+            timestamp: row.timestamp,
             value: gpu_mem_pct,
         });
 
         gpu_util.push(MetricPoint {
             step: elapsed_min,
+            timestamp: row.timestamp,
             value: row.gpu_util_pct,
         });
     }
