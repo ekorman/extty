@@ -4842,7 +4842,7 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
                         "running...".to_string()
                     } else {
                         run.end_time
-                            .map(|t| t.format("%H:%M").to_string())
+                            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                             .unwrap_or_else(|| "—".to_string())
                     };
 
