@@ -42,9 +42,10 @@ mod run;
 mod s3;
 use data::{
     Artifact, Checkpoint, Evaluation, Example, ExampleGroup, MetricPoint, Model, Reward, Run,
-    artifacts_dir, delete_evaluation, delete_model, load_all_evaluations,
+    artifacts_dir, delete_evaluation, delete_model, load_all_evaluations, load_archived_projects,
     load_artifacts_from_cache, load_models, load_run_notes, load_runs_lightweight,
-    load_starred_runs, mark_run_completed, save_run_notes, save_starred_runs,
+    load_starred_runs, mark_run_completed, save_archived_projects, save_run_notes,
+    save_starred_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, ScriptOptions,
@@ -297,6 +298,8 @@ struct App {
     search_query: String,
     search_editing: bool,
     hide_completed: bool,
+    archived_projects: HashSet<String>,
+    show_archived: bool,
     // Artifacts
     artifacts: Vec<Artifact>,
     selected_artifact: usize,
@@ -419,6 +422,8 @@ impl App {
             search_query: String::new(),
             search_editing: false,
             hide_completed: false,
+            archived_projects: load_archived_projects(),
+            show_archived: false,
             artifacts: load_artifacts_from_cache(),
             selected_artifact: 0,
             artifact_detail_scroll: 0,
@@ -456,6 +461,9 @@ impl App {
                 .project
                 .clone()
                 .unwrap_or_else(|| "(no project)".to_string());
+            if !self.show_archived && self.archived_projects.contains(&project) {
+                continue;
+            }
             projects.entry(project).or_default().push(i);
         }
 
@@ -2850,6 +2858,21 @@ impl App {
                 self.selected_list_item = 0;
                 self.list_state.select(Some(0));
             }
+            KeyCode::Char('A') => {
+                if let Some(ListEntry::Project { name }) = entries.get(self.selected_list_item) {
+                    if !self.archived_projects.remove(name) {
+                        self.archived_projects.insert(name.clone());
+                    }
+                    save_archived_projects(&self.archived_projects);
+                    self.selected_list_item = 0;
+                    self.list_state.select(Some(0));
+                }
+            }
+            KeyCode::Char('.') => {
+                self.show_archived = !self.show_archived;
+                self.selected_list_item = 0;
+                self.list_state.select(Some(0));
+            }
             KeyCode::Char('/') => {
                 self.search_editing = true;
             }
@@ -4828,6 +4851,7 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
                 ListEntry::Project { name } => {
                     let is_expanded = app.expanded_projects.contains(name);
                     let icon = if is_expanded { "▼ " } else { "▶ " };
+                    let is_archived = app.archived_projects.contains(name);
 
                     let matching = |r: &&Run| {
                         r.project.as_deref().unwrap_or("(no project)") == name
@@ -4840,20 +4864,29 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
 
                     let name_style = if is_selected {
                         Style::default().fg(NEON_MAGENTA).bold()
+                    } else if is_archived {
+                        Style::default().fg(Color::DarkGray).bold()
                     } else if has_running {
                         Style::default().fg(NEON_GREEN).bold()
                     } else {
                         Style::default().fg(NEON_CYAN).bold()
                     };
 
-                    ListItem::new(Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(icon, Style::default().fg(NEON_MAGENTA)),
                         Span::styled(name.clone(), name_style),
                         Span::styled(
                             format!("  ({} runs)", run_count),
                             Style::default().fg(Color::DarkGray),
                         ),
-                    ]))
+                    ];
+                    if is_archived {
+                        spans.push(Span::styled(
+                            "  [archived]",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    ListItem::new(Line::from(spans))
                 }
                 ListEntry::Run { run_index } => {
                     let run = &app.runs[*run_index];
@@ -4971,6 +5004,14 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
         ));
     }
 
+    if app.show_archived {
+        title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        title_spans.push(Span::styled(
+            "showing archived",
+            Style::default().fg(NEON_YELLOW),
+        ));
+    }
+
     if !app.config_filters.is_empty() {
         title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
         let filter_str = app
@@ -5082,6 +5123,19 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
                 "] show all"
             } else {
                 "] running only"
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("  [", Style::default().fg(DIM_CYAN)),
+        Span::styled("A", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] archive  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled(".", Style::default().fg(NEON_YELLOW)),
+        Span::styled(
+            if app.show_archived {
+                "] hide archived"
+            } else {
+                "] show archived"
             },
             Style::default().fg(Color::DarkGray),
         ),
