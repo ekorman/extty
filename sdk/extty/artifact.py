@@ -348,10 +348,19 @@ def get_artifact(
     return meta
 
 
+def _local_cache_valid(local_dir: Path, files: list[dict[str, Any]]) -> bool:
+    for f in files:
+        p = local_dir / f["path"]
+        if not p.exists() or p.stat().st_size != f["size_bytes"]:
+            return False
+    return True
+
+
 def load_artifact(
     name: str,
     dest: str | Path | None = None,
     *,
+    cache: bool = False,
     s3_config: S3Config | None = None,
 ) -> bytes | Path:
     """
@@ -367,6 +376,12 @@ def load_artifact(
     dest : str or Path, optional
         Directory to download into. If omitted, single-file artifacts are
         returned as bytes; directory artifacts are cached locally.
+    cache : bool, optional
+        If True, download into the default local artifacts directory and skip
+        the download on subsequent calls when local files match the artifact
+        metadata by size. Single-file artifacts are still returned as bytes
+        (read from the local copy); directory artifacts return the cache path.
+        Mutually exclusive with ``dest``.
     s3_config : S3Config, optional
         S3 configuration. Loaded from environment if not provided.
 
@@ -376,6 +391,9 @@ def load_artifact(
         File contents as bytes (single file, no dest), or path to
         downloaded file/directory.
     """
+    if cache and dest is not None:
+        raise ValueError("cache=True is only valid when dest is None")
+
     config = _resolve_config(s3_config)
     client = _build_client(config)
     prefix = _artifacts_prefix(config)
@@ -383,6 +401,22 @@ def load_artifact(
     meta = _get_existing_meta(client, config.bucket, prefix, name)
     if meta is None:
         raise KeyError(f"Artifact '{name}' not found")
+
+    if cache:
+        from extty.storage import get_artifacts_dir
+
+        local_dir = get_artifacts_dir() / name / "data"
+        if not _local_cache_valid(local_dir, meta.files):
+            local_dir.mkdir(parents=True, exist_ok=True)
+            for file_entry in meta.files:
+                s3_key = f"{prefix}/{name}/data/{file_entry['path']}"
+                local_path = local_dir / file_entry["path"]
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                client.download_file(config.bucket, s3_key, str(local_path))
+
+        if meta.content_type == "file":
+            return (local_dir / meta.files[0]["path"]).read_bytes()
+        return local_dir
 
     if meta.content_type == "file" and dest is None:
         file_entry = meta.files[0]
