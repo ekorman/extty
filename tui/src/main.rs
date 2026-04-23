@@ -306,6 +306,8 @@ struct App {
     artifact_detail_scroll: usize,
     pending_delete_artifact: bool,
     pending_delete_checkpoint: bool,
+    help_overlay_open: bool,
+    help_overlay_scroll: u16,
 }
 
 impl App {
@@ -429,6 +431,8 @@ impl App {
             artifact_detail_scroll: 0,
             pending_delete_artifact: false,
             pending_delete_checkpoint: false,
+            help_overlay_open: false,
+            help_overlay_scroll: 0,
         }
     }
 
@@ -2137,6 +2141,29 @@ impl App {
             return;
         }
 
+        if self.help_overlay_open {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                    self.help_overlay_open = false;
+                    self.help_overlay_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_overlay_scroll = self.help_overlay_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_overlay_scroll = self.help_overlay_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.help_overlay_scroll = self.help_overlay_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    self.help_overlay_scroll = self.help_overlay_scroll.saturating_add(10);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.filter_modal_open {
             self.handle_filter_modal_key(code);
             return;
@@ -2288,6 +2315,16 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        if code == KeyCode::Char('?')
+            && !self.add_machine_open
+            && !self.launch_confirming
+            && !self.launch_selecting_region
+        {
+            self.help_overlay_open = true;
+            self.help_overlay_scroll = 0;
             return;
         }
 
@@ -4835,6 +4872,9 @@ fn render(app: &mut App, frame: &mut Frame) {
     if app.checkpoint_download_modal {
         render_checkpoint_download_modal(app, frame);
     }
+    if app.help_overlay_open {
+        render_help_overlay(app, frame);
+    }
 }
 
 fn render_runs_list(app: &mut App, frame: &mut Frame) {
@@ -5050,103 +5090,36 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
 
     let mut help_spans = vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("m", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] models  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("a", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] artifacts  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("i", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] infra  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-        Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter", Style::default().fg(NEON_CYAN)),
+        Span::styled("] open  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Tab", Style::default().fg(NEON_CYAN)),
         Span::styled("] expand  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Enter", Style::default().fg(NEON_CYAN)),
-        Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Space", Style::default().fg(NEON_CYAN)),
         Span::styled("] compare  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("s", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] star  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("/", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] search  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("n", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] note  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("f", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] filter  ", Style::default().fg(Color::DarkGray)),
     ];
-    if !app.compared_runs.is_empty() {
-        help_spans.extend(vec![
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("Esc", Style::default().fg(NEON_CYAN)),
-            Span::styled(
-                format!("] clear {}  ", app.compared_runs.len()),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-    }
     if app.compared_runs.len() >= 2 {
         help_spans.extend(vec![
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("v", Style::default().fg(NEON_YELLOW)),
             Span::styled(
-                format!("] view {} runs  ", app.compared_runs.len()),
+                format!("] view {}  ", app.compared_runs.len()),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
     }
     help_spans.extend(vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("p", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("P", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] pull by name  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("d", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("M", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] move  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("f", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] filter  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("/", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] search  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("H", Style::default().fg(NEON_YELLOW)),
-        Span::styled(
-            if app.hide_completed {
-                "] show all"
-            } else {
-                "] running only"
-            },
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled("  [", Style::default().fg(DIM_CYAN)),
-        Span::styled("A", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] archive  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled(".", Style::default().fg(NEON_YELLOW)),
-        Span::styled(
-            if app.show_archived {
-                "] hide archived"
-            } else {
-                "] show archived"
-            },
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("?", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] help", Style::default().fg(Color::DarkGray)),
     ]);
-    if !app.config_filters.is_empty() {
-        help_spans.extend(vec![
-            Span::styled("  [", Style::default().fg(DIM_CYAN)),
-            Span::styled("F", Style::default().fg(NEON_YELLOW)),
-            Span::styled("] clear filters", Style::default().fg(Color::DarkGray)),
-        ]);
-    }
     let help = Line::from(help_spans);
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
@@ -5260,26 +5233,14 @@ fn render_models_list(app: &App, frame: &mut Frame) {
 
     let help = Line::from(vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("r", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] runs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("a", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] artifacts  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("i", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] infra  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-        Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter", Style::default().fg(NEON_CYAN)),
+        Span::styled("] open  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Tab", Style::default().fg(NEON_CYAN)),
         Span::styled("] expand  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Enter", Style::default().fg(NEON_CYAN)),
-        Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("d", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] delete", Style::default().fg(Color::DarkGray)),
+        Span::styled("?", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] help", Style::default().fg(Color::DarkGray)),
     ]);
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
@@ -5483,26 +5444,11 @@ fn render_run_detail(app: &mut App, frame: &mut Frame) {
         Span::styled("Enter", Style::default().fg(NEON_GREEN)),
         Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("d", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("M", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] move  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("c", Style::default().fg(NEON_CYAN)),
         Span::styled(
             format!("] {}  ", config_hint),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("C", Style::default().fg(NEON_CYAN)),
-        Span::styled("] full config  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("p", Style::default().fg(NEON_CYAN)),
-        Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("n", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] note  ", Style::default().fg(Color::DarkGray)),
     ];
     if has_sys_metrics {
         let sys_hint = if app.show_system_metrics {
@@ -5552,9 +5498,12 @@ fn render_run_detail(app: &mut App, frame: &mut Frame) {
         Span::styled("[]", Style::default().fg(NEON_YELLOW)),
         Span::styled("] run ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}/{}", app.selected_run + 1, app.runs.len()),
+            format!("{}/{}  ", app.selected_run + 1, app.runs.len()),
             Style::default().fg(NEON_YELLOW),
         ),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("?", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] help", Style::default().fg(Color::DarkGray)),
     ]);
     let footer = Line::from(footer_spans);
     frame.render_widget(Paragraph::new(footer), chunks[2]);
@@ -5652,9 +5601,6 @@ fn render_model_detail(app: &mut App, frame: &mut Frame) {
         Span::styled("Enter", Style::default().fg(NEON_GREEN)),
         Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("d", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] delete  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("c", Style::default().fg(NEON_CYAN)),
         Span::styled(
             format!("] {}  ", config_hint),
@@ -5664,9 +5610,12 @@ fn render_model_detail(app: &mut App, frame: &mut Frame) {
         Span::styled("[]", Style::default().fg(NEON_YELLOW)),
         Span::styled("] model ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}/{}", app.selected_model + 1, app.models.len()),
+            format!("{}/{}  ", app.selected_model + 1, app.models.len()),
             Style::default().fg(NEON_YELLOW),
         ),
+        Span::styled("[", Style::default().fg(DIM_CYAN)),
+        Span::styled("?", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] help", Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
@@ -6369,17 +6318,11 @@ fn render_config_full(app: &App, frame: &mut Frame) {
         Span::styled("q", Style::default().fg(NEON_MAGENTA)),
         Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-        Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("y", Style::default().fg(NEON_GREEN)),
         Span::styled("] copy value  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Y", Style::default().fg(NEON_GREEN)),
-        Span::styled("] copy all  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("PgUp/PgDn", Style::default().fg(NEON_CYAN)),
-        Span::styled("] page", Style::default().fg(Color::DarkGray)),
+        Span::styled("?", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] help", Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(footer), chunks[1]);
 }
@@ -7447,15 +7390,15 @@ fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
                     format!("{}/{}", app.selected_example + 1, steps.len()),
                     Style::default().fg(NEON_GREEN),
                 ),
-                Span::styled("  [", Style::default().fg(DIM_CYAN)),
-                Span::styled("g", Style::default().fg(NEON_CYAN)),
-                Span::styled("] goto  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[", Style::default().fg(DIM_CYAN)),
-                Span::styled("End", Style::default().fg(NEON_CYAN)),
-                Span::styled("] latest", Style::default().fg(Color::DarkGray)),
             ]);
         }
     }
+
+    footer_spans.extend(vec![
+        Span::styled("  [", Style::default().fg(DIM_CYAN)),
+        Span::styled("?", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] help", Style::default().fg(Color::DarkGray)),
+    ]);
 
     let footer = Line::from(footer_spans);
     frame.render_widget(Paragraph::new(footer), chunks[1]);
@@ -7689,9 +7632,12 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled("←→", Style::default().fg(NEON_CYAN)),
                 Span::styled("] card ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("{}/{}", app.selected_card + 1, cards.len()),
+                    format!("{}/{}  ", app.selected_card + 1, cards.len()),
                     Style::default().fg(NEON_GREEN),
                 ),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("?", Style::default().fg(NEON_YELLOW)),
+                Span::styled("] help", Style::default().fg(Color::DarkGray)),
             ]);
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
@@ -7741,9 +7687,6 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                     ),
                     Span::styled("  ", Style::default()),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("j/k", Style::default().fg(NEON_CYAN)),
-                    Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("Tab", Style::default().fg(NEON_CYAN)),
                     Span::styled("] focus:", Style::default().fg(Color::DarkGray)),
                     Span::styled(focus_label, Style::default().fg(NEON_GREEN)),
@@ -7755,12 +7698,6 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                         format!("{}/{}", app.selected_example + 1, group.len()),
                         Style::default().fg(NEON_YELLOW),
                     ),
-                    Span::styled("  [", Style::default().fg(DIM_CYAN)),
-                    Span::styled("g", Style::default().fg(NEON_CYAN)),
-                    Span::styled("] goto  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("End", Style::default().fg(NEON_CYAN)),
-                    Span::styled("] latest", Style::default().fg(Color::DarkGray)),
                 ];
                 if prompt_count > 1 {
                     footer_spans.extend(vec![
@@ -7786,6 +7723,12 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                         ),
                     ]);
                 }
+                footer_spans.extend(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("?", Style::default().fg(NEON_YELLOW)),
+                    Span::styled("] help", Style::default().fg(Color::DarkGray)),
+                ]);
                 let footer = Line::from(footer_spans);
                 frame.render_widget(Paragraph::new(footer), chunks[1]);
             }
@@ -7808,19 +7751,15 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled("←→", Style::default().fg(NEON_CYAN)),
                 Span::styled("] card ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("{}/{}", app.selected_card + 1, cards.len()),
+                    format!("{}/{}  ", app.selected_card + 1, cards.len()),
                     Style::default().fg(NEON_GREEN),
                 ),
-                Span::styled("  ", Style::default()),
-                Span::styled("[", Style::default().fg(DIM_CYAN)),
-                Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-                Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("[", Style::default().fg(DIM_CYAN)),
                 Span::styled("p", Style::default().fg(NEON_CYAN)),
                 Span::styled("] download  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("[", Style::default().fg(DIM_CYAN)),
-                Span::styled("D", Style::default().fg(NEON_YELLOW)),
-                Span::styled("] delete", Style::default().fg(Color::DarkGray)),
+                Span::styled("?", Style::default().fg(NEON_YELLOW)),
+                Span::styled("] help", Style::default().fg(Color::DarkGray)),
             ]);
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
@@ -7837,9 +7776,12 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                 Span::styled("←→", Style::default().fg(NEON_CYAN)),
                 Span::styled("] card ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("{}/{}", app.selected_card + 1, cards.len()),
+                    format!("{}/{}  ", app.selected_card + 1, cards.len()),
                     Style::default().fg(NEON_GREEN),
                 ),
+                Span::styled("[", Style::default().fg(DIM_CYAN)),
+                Span::styled("?", Style::default().fg(NEON_YELLOW)),
+                Span::styled("] help", Style::default().fg(Color::DarkGray)),
             ]);
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
@@ -7975,9 +7917,6 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
                 format!("] {}  ", config_hint),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("j/k", Style::default().fg(NEON_CYAN)),
-            Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
         ];
         if example_count > 0 {
             footer_spans.extend(vec![
@@ -7993,12 +7932,6 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
                     format!("{}/{}", app.selected_example + 1, example_count),
                     Style::default().fg(NEON_YELLOW),
                 ),
-                Span::styled("  [", Style::default().fg(DIM_CYAN)),
-                Span::styled("g", Style::default().fg(NEON_CYAN)),
-                Span::styled("] goto  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[", Style::default().fg(DIM_CYAN)),
-                Span::styled("End", Style::default().fg(NEON_CYAN)),
-                Span::styled("] latest", Style::default().fg(Color::DarkGray)),
             ]);
             if prompt_count > 1 {
                 footer_spans.extend(vec![
@@ -8025,6 +7958,12 @@ fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
                 ]);
             }
         }
+        footer_spans.extend(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("?", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] help", Style::default().fg(Color::DarkGray)),
+        ]);
         let footer = Line::from(footer_spans);
         frame.render_widget(Paragraph::new(footer), chunks[2]);
     }
@@ -9150,8 +9089,8 @@ fn render_filter_modal(app: &App, frame: &mut Frame) {
     }
 
     let footer = match app.filter_modal_phase {
-        FilterPhase::KeySelect => "[Enter] select  [Esc] close  [↑↓] nav",
-        FilterPhase::ValueSelect => "[Enter] select  [Esc] back  [↑↓] nav",
+        FilterPhase::KeySelect => "[Enter] select  [Esc] close",
+        FilterPhase::ValueSelect => "[Enter] select  [Esc] back",
     };
     text.push(Line::from(""));
     text.push(Line::from(Span::styled(
@@ -9170,6 +9109,257 @@ fn render_filter_modal(app: &App, frame: &mut Frame) {
         .style(Style::default().bg(Color::Black));
 
     let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+    let global: Vec<(&str, &str)> = vec![("?", "toggle this help"), ("Ctrl-C", "quit")];
+
+    let sections: Vec<(&str, Vec<(&str, &str)>)> = match (app.view, app.view_mode) {
+        (View::List, ViewMode::Runs) => vec![
+            (
+                "Navigation",
+                vec![
+                    ("↑↓", "move selection"),
+                    ("Tab", "expand/collapse project"),
+                    ("Enter", "open run"),
+                    ("m / a / i", "models / artifacts / infra"),
+                ],
+            ),
+            (
+                "Compare",
+                vec![
+                    ("Space", "toggle run in comparison"),
+                    ("v", "view comparison"),
+                    ("Esc", "clear comparison"),
+                ],
+            ),
+            (
+                "Run actions",
+                vec![
+                    ("p", "pull selected run"),
+                    ("P", "pull by name"),
+                    ("d", "delete run"),
+                    ("M", "move to project"),
+                    ("s", "star / unstar"),
+                    ("n", "edit note"),
+                    ("A", "archive project"),
+                ],
+            ),
+            (
+                "Filter & search",
+                vec![
+                    ("/", "search"),
+                    ("f", "add config filter"),
+                    ("F", "clear filters"),
+                    ("H", "toggle running-only"),
+                    (".", "toggle archived visible"),
+                ],
+            ),
+        ],
+        (View::List, ViewMode::Models) => vec![
+            (
+                "Navigation",
+                vec![
+                    ("↑↓", "move selection"),
+                    ("Tab", "expand/collapse project"),
+                    ("Enter", "open model"),
+                    ("r / a / i", "runs / artifacts / infra"),
+                ],
+            ),
+            ("Actions", vec![("d", "delete model")]),
+        ],
+        (View::List, ViewMode::Artifacts) => vec![
+            (
+                "Navigation",
+                vec![
+                    ("↑↓", "move selection"),
+                    ("Enter", "open artifact"),
+                    ("r / m / i", "runs / models / infra"),
+                ],
+            ),
+            (
+                "Actions",
+                vec![("p", "pull"), ("d", "download"), ("D", "delete")],
+            ),
+        ],
+        (View::List, ViewMode::Infra) | (View::InfraList, _) => vec![
+            (
+                "Navigation",
+                vec![
+                    ("↑↓", "move selection"),
+                    ("Tab", "switch panel (Instances/Types)"),
+                    ("1-4", "switch provider"),
+                    ("r / m / a", "runs / models / artifacts"),
+                ],
+            ),
+            (
+                "Instances",
+                vec![
+                    ("Enter", "SSH into instance"),
+                    ("S", "setup + SSH"),
+                    ("a", "add local machine"),
+                    ("x", "terminate / remove"),
+                    ("R", "refresh"),
+                ],
+            ),
+            (
+                "Types",
+                vec![("Enter", "launch instance"), ("s", "cycle sort")],
+            ),
+        ],
+        (View::RunDetail, _) => vec![
+            (
+                "Navigation",
+                vec![
+                    ("q / Esc", "back to list"),
+                    ("←→", "move card selection"),
+                    ("↑↓", "scroll cards grid"),
+                    ("Enter", "focus selected card"),
+                ],
+            ),
+            (
+                "Actions",
+                vec![
+                    ("p", "pull run"),
+                    ("d", "delete run"),
+                    ("M", "move to project"),
+                    ("n", "edit note"),
+                    ("c", "toggle config panel"),
+                    ("C", "full config view"),
+                    ("S", "toggle system/train metrics"),
+                    ("t", "toggle time/step x-axis"),
+                ],
+            ),
+        ],
+        (View::ModelDetail, _) => vec![
+            (
+                "Navigation",
+                vec![
+                    ("q / Esc", "back to models list"),
+                    ("←→", "move card selection"),
+                    ("↑↓", "scroll cards grid"),
+                    ("Enter", "focus evaluation"),
+                ],
+            ),
+            ("Actions", vec![("d", "delete evaluation")]),
+        ],
+        (View::Focused, _) => vec![
+            (
+                "Navigation",
+                vec![
+                    ("q / Esc", "back"),
+                    ("Tab", "cycle focused section"),
+                    ("↑↓", "scroll section"),
+                    ("[ ]", "previous / next prompt"),
+                    ("< >", "previous / next response"),
+                ],
+            ),
+            (
+                "Actions",
+                vec![
+                    ("y", "copy focused section"),
+                    ("g", "goto step"),
+                    ("d", "download checkpoint"),
+                ],
+            ),
+        ],
+        (View::Compare, _) => vec![(
+            "Navigation",
+            vec![
+                ("q / Esc", "back to runs list"),
+                ("←→", "move card selection"),
+                ("↑↓", "scroll cards grid"),
+                ("Enter", "focus card"),
+            ],
+        )],
+        (View::ConfigFull, _) => vec![
+            (
+                "Navigation",
+                vec![("q / Esc", "back"), ("↑↓", "scroll / move")],
+            ),
+            ("Actions", vec![("y", "copy value"), ("Y", "copy all")]),
+        ],
+        (View::ArtifactDetail, _) => vec![
+            ("Navigation", vec![("Esc / q", "back"), ("↑↓", "scroll")]),
+            ("Actions", vec![("d", "download"), ("D", "delete")]),
+        ],
+        (View::InfraConfig, _) => vec![
+            (
+                "Navigation",
+                vec![("↑↓", "move selection"), ("Esc / q", "back")],
+            ),
+            (
+                "Actions",
+                vec![("Enter / e", "edit key"), ("d", "delete key")],
+            ),
+        ],
+        (View::S3Config, _) => vec![
+            (
+                "Navigation",
+                vec![("↑↓", "move field"), ("Esc / q", "back")],
+            ),
+            (
+                "Actions",
+                vec![("Enter / e", "edit field"), ("d", "clear field")],
+            ),
+        ],
+    };
+
+    let mut all = sections;
+    all.push(("Global", global));
+    all
+}
+
+fn render_help_overlay(app: &App, frame: &mut Frame) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let sections = help_sections_for(app);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (title, entries) in &sections {
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {} ", title),
+            Style::default().fg(NEON_MAGENTA).bold(),
+        )]));
+        for (key, desc) in entries {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:>12}  ", key), Style::default().fg(NEON_CYAN)),
+                Span::styled((*desc).to_string(), Style::default().fg(Color::Gray)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(vec![Span::styled(
+        "  [Esc/q/?] close   [↑↓/PgUp/PgDn] scroll",
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    let popup_width = 64u16.min(area.width.saturating_sub(4));
+    let content_height = lines.len() as u16 + 2;
+    let popup_height = content_height.min(area.height.saturating_sub(4)).max(10);
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let max_scroll = (lines.len() as u16).saturating_sub(popup_height.saturating_sub(2));
+    let scroll = app.help_overlay_scroll.min(max_scroll);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Help ",
+            Style::default().fg(NEON_YELLOW).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_YELLOW))
+        .style(Style::default().bg(Color::Black));
+
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
+
     frame.render_widget(paragraph, popup_area);
 }
 
@@ -9249,29 +9439,14 @@ fn render_artifacts_list(app: &mut App, frame: &mut Frame) {
 
     let help = Line::from(vec![
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("r", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] runs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("m", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] models  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("i", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] infra  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-        Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("Enter", Style::default().fg(NEON_CYAN)),
         Span::styled("] details  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("p", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] pull  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
         Span::styled("] download  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("D", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] delete", Style::default().fg(Color::DarkGray)),
+        Span::styled("?", Style::default().fg(NEON_YELLOW)),
+        Span::styled("] help", Style::default().fg(Color::DarkGray)),
     ]);
     let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
@@ -9407,24 +9582,20 @@ fn render_artifact_detail(app: &App, frame: &mut Frame) {
         Span::styled("Esc", Style::default().fg(NEON_YELLOW)),
         Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-        Span::styled("] scroll  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
         Span::styled("d", Style::default().fg(NEON_YELLOW)),
         Span::styled("] download  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("D", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] delete", Style::default().fg(Color::DarkGray)),
     ];
     if artifact.run_project.is_some() && artifact.run_name.is_some() {
-        footer_spans.push(Span::styled("  ", Style::default()));
         footer_spans.push(Span::styled("[", Style::default().fg(DIM_CYAN)));
         footer_spans.push(Span::styled("g", Style::default().fg(NEON_YELLOW)));
         footer_spans.push(Span::styled(
-            "] go to run",
+            "] go to run  ",
             Style::default().fg(Color::DarkGray),
         ));
     }
+    footer_spans.push(Span::styled("[", Style::default().fg(DIM_CYAN)));
+    footer_spans.push(Span::styled("?", Style::default().fg(NEON_YELLOW)));
+    footer_spans.push(Span::styled("] help", Style::default().fg(Color::DarkGray)));
     frame.render_widget(Paragraph::new(Line::from(footer_spans)), chunks[1]);
 }
 
@@ -9915,23 +10086,17 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
     } else if app.infra_active_panel == InfraPanel::Instances && is_local {
         Line::from(vec![
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-            Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("Enter", Style::default().fg(NEON_GREEN)),
             Span::styled("] ssh  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("S", Style::default().fg(NEON_YELLOW)),
-            Span::styled("] setup+ssh  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("a", Style::default().fg(NEON_GREEN)),
             Span::styled("] add  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("x", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] remove  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("1-4", Style::default().fg(NEON_YELLOW)),
-            Span::styled("] provider", Style::default().fg(Color::DarkGray)),
+            Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("?", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] help", Style::default().fg(Color::DarkGray)),
         ])
     } else if app.infra_active_panel == InfraPanel::Instances {
         Line::from(vec![
@@ -9939,23 +10104,14 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("Tab", Style::default().fg(NEON_CYAN)),
             Span::styled("] panel  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-            Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("Enter", Style::default().fg(NEON_GREEN)),
             Span::styled("] ssh  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("S", Style::default().fg(NEON_YELLOW)),
-            Span::styled("] setup+ssh  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("x", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] terminate  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("1-4", Style::default().fg(NEON_YELLOW)),
             Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("R", Style::default().fg(NEON_CYAN)),
-            Span::styled("] refresh", Style::default().fg(Color::DarkGray)),
+            Span::styled("?", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] help", Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
@@ -9963,20 +10119,14 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("Tab", Style::default().fg(NEON_CYAN)),
             Span::styled("] panel  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-            Span::styled("] nav  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("Enter", Style::default().fg(NEON_GREEN)),
             Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("s", Style::default().fg(NEON_CYAN)),
-            Span::styled("] sort  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("1-4", Style::default().fg(NEON_YELLOW)),
             Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("R", Style::default().fg(NEON_CYAN)),
-            Span::styled("] refresh", Style::default().fg(Color::DarkGray)),
+            Span::styled("?", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] help", Style::default().fg(Color::DarkGray)),
         ])
     };
 
@@ -10464,21 +10614,16 @@ fn render_infra_config(app: &App, frame: &mut Frame) {
     } else {
         Line::from(vec![
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
-            Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("Enter", Style::default().fg(NEON_GREEN)),
             Span::styled("/", Style::default().fg(Color::DarkGray)),
             Span::styled("e", Style::default().fg(NEON_GREEN)),
             Span::styled("] edit key  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("d", Style::default().fg(NEON_YELLOW)),
-            Span::styled("] delete key  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("/", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] back", Style::default().fg(Color::DarkGray)),
+            Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("?", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] help", Style::default().fg(Color::DarkGray)),
         ])
     };
 
@@ -10741,11 +10886,11 @@ fn render_s3_config(app: &App, frame: &mut Frame) {
             Span::styled("e/Enter", Style::default().fg(NEON_GREEN)),
             Span::styled("] Edit  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("d", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] Clear  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("q/Esc", Style::default().fg(Color::Gray)),
-            Span::styled("] Back", Style::default().fg(Color::DarkGray)),
+            Span::styled("] Back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("?", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] help", Style::default().fg(Color::DarkGray)),
         ]
     };
 

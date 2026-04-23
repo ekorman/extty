@@ -1213,10 +1213,9 @@ fn parse_single_reward<E: serde::de::Error>(elem: serde_json::Value) -> Result<R
         serde_json::Value::Object(obj) => {
             let mut components = HashMap::new();
             for (k, v) in obj {
-                let val = v
-                    .as_f64()
-                    .ok_or_else(|| E::custom("expected f64 value in reward object"))?;
-                components.insert(k, val);
+                if let Some(val) = v.as_f64() {
+                    components.insert(k, val);
+                }
             }
             Ok(Reward::Components(components))
         }
@@ -1284,8 +1283,10 @@ where
             A: de::MapAccess<'de>,
         {
             let mut components = HashMap::new();
-            while let Some((key, value)) = map.next_entry::<String, f64>()? {
-                components.insert(key, value);
+            while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                if let Some(val) = value.as_f64() {
+                    components.insert(key, val);
+                }
             }
             Ok(Some(vec![vec![Reward::Components(components)]]))
         }
