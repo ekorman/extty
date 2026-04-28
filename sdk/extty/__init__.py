@@ -11,6 +11,8 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable, ParamSpec, TypeVar
 
+from extty._logger import log as logger
+
 from extty.example import BatchExample, Example
 from extty.compare import compare, config_diff, plot_metric, reduce_metric
 from extty.query import RunData, get_run, get_runs
@@ -32,6 +34,8 @@ from extty.artifact import (
     save_artifact as _save_artifact_raw,
 )
 from extty.s3 import S3Config
+
+_logger = logger
 
 __all__ = [
     "init",
@@ -64,6 +68,7 @@ __all__ = [
     "load_artifact",
     "get_artifact",
     "delete_artifact",
+    "logger",
 ]
 
 # Version is managed by setuptools_scm
@@ -137,8 +142,11 @@ def init(
             config=config,
             system_metrics=system_metrics,
         )
-        print(
-            f"extty initialized with run {project}/{_active_run.name}, writing to {_active_run.run_dir}"
+        _logger.info(
+            "initialized run %s/%s, writing to %s",
+            project,
+            _active_run.name,
+            _active_run.run_dir,
         )
     else:
         _active_run = NoOpRun(project, name=name, config=config)
@@ -583,7 +591,7 @@ def push(
 
     if dry_run:
         for proj, run_name in runs_to_push:
-            print(f"Would push: {proj}/{run_name}")
+            _logger.info("would push: %s/%s", proj, run_name)
         return [f"{p}/{r}" for p, r in runs_to_push]
 
     pushed = []
@@ -594,7 +602,7 @@ def push(
 
         _push_run_to_s3(client, s3_config.bucket, s3_prefix, local_run_dir, force=force)
         pushed.append(f"{proj}/{run_name}")
-        print(f"Pushed: {proj}/{run_name}")
+        _logger.info("pushed: %s/%s", proj, run_name)
 
     return pushed
 
