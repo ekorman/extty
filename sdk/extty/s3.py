@@ -7,12 +7,156 @@ import io
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from extty._logger import (
+    _DIM_CYAN,
+    _NEON_CYAN,
+    _NEON_GREEN,
+    _RESET,
+    _supports_color,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _format_bytes(n: float) -> str:
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024:
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}PiB"
+
+
+def _default_boto_config() -> Any:
+    """Botocore client config tuned for resilient checkpoint/artifact transfers."""
+    from botocore.config import Config
+
+    return Config(
+        retries={"max_attempts": 10, "mode": "adaptive"},
+        connect_timeout=10,
+        read_timeout=120,
+        max_pool_connections=20,
+    )
+
+
+def _default_transfer_config() -> Any:
+    """boto3 ``TransferConfig`` for multi-part downloads with chunk retries."""
+    from boto3.s3.transfer import TransferConfig
+
+    return TransferConfig(
+        multipart_threshold=64 * 1024 * 1024,
+        multipart_chunksize=16 * 1024 * 1024,
+        max_concurrency=8,
+        num_download_attempts=10,
+        use_threads=True,
+    )
+
+
+def _download_with_progress(
+    client: Any,
+    bucket: str,
+    s3_key: str,
+    local_path: Path,
+    *,
+    label: str | None = None,
+) -> None:
+    """Download an S3 object to ``local_path`` with a progress bar.
+
+    Streams to ``<local_path>.part`` and renames atomically on success so
+    a partial download from a previous failed run isn't mistaken for a
+    valid cache entry.
+    """
+    head = client.head_object(Bucket=bucket, Key=s3_key)
+    total = int(head.get("ContentLength", 0))
+    bar_label = label or local_path.name
+    logger.info(
+        "downloading s3://%s/%s -> %s (%s)",
+        bucket,
+        s3_key,
+        local_path,
+        _format_bytes(total),
+    )
+    tmp_path = local_path.with_name(local_path.name + ".part")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    progress = _DownloadProgress(total, bar_label)
+    try:
+        client.download_file(
+            Bucket=bucket,
+            Key=s3_key,
+            Filename=str(tmp_path),
+            Callback=progress,
+            Config=_default_transfer_config(),
+        )
+    except BaseException:
+        progress.abort()
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+    progress.finish()
+    tmp_path.replace(local_path)
+
+
+class _DownloadProgress:
+    """boto3 ``Callback`` that renders an in-place progress bar to stderr."""
+
+    def __init__(self, total_bytes: int, label: str, *, width: int = 30) -> None:
+        self._total = max(total_bytes, 1)
+        self._seen = 0
+        self._label = label
+        self._width = width
+        self._stream = sys.stderr
+        self._enabled = _supports_color(self._stream)
+        self._lock = threading.Lock()
+        self._last_render = 0.0
+
+    def __call__(self, bytes_transferred: int) -> None:
+        with self._lock:
+            self._seen += bytes_transferred
+            if not self._enabled:
+                return
+            now = time.time()
+            if now - self._last_render < 0.1 and self._seen < self._total:
+                return
+            self._last_render = now
+            self._render()
+
+    def _render(self, end: str = "") -> None:
+        frac = min(self._seen / self._total, 1.0)
+        filled = int(self._width * frac)
+        bar = "█" * filled + "░" * (self._width - filled)
+        line = (
+            f"{_DIM_CYAN}[{_RESET}"
+            f"{_NEON_GREEN}{bar}{_RESET}"
+            f"{_DIM_CYAN}]{_RESET} "
+            f"{_NEON_CYAN}{frac * 100:5.1f}%{_RESET} "
+            f"{_format_bytes(self._seen)} / {_format_bytes(self._total)} "
+            f"{_DIM_CYAN}{self._label}{_RESET}"
+        )
+        self._stream.write(f"\r\033[2K{line}{end}")
+        self._stream.flush()
+
+    def finish(self) -> None:
+        if self._enabled:
+            with self._lock:
+                self._render(end="\n")
+
+    def abort(self) -> None:
+        if self._enabled:
+            with self._lock:
+                self._stream.write("\n")
+                self._stream.flush()
+
 
 try:
     from botocore.exceptions import BotoCoreError, ClientError
@@ -147,7 +291,7 @@ class S3Storage:
                 "boto3 is required for S3 storage. Install with: pip install extty[s3]"
             )
 
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {"config": _default_boto_config()}
         if self.config.region:
             kwargs["region_name"] = self.config.region
         if self.config.access_key_id and self.config.secret_access_key:
@@ -649,13 +793,22 @@ class S3Storage:
             if not load_optimizer and fname == "optimizer.pt":
                 continue
             local_path = local_dir / fname
-            if not local_path.exists():
-                s3_key = self._s3_key("checkpoints", str(step), fname)
-                self._client.download_file(
-                    Bucket=self.config.bucket,
-                    Key=s3_key,
-                    Filename=str(local_path),
+            if local_path.exists():
+                logger.info(
+                    "checkpoint step %d: using cached %s (%s)",
+                    step,
+                    fname,
+                    _format_bytes(local_path.stat().st_size),
                 )
+                continue
+            s3_key = self._s3_key("checkpoints", str(step), fname)
+            _download_with_progress(
+                self._client,
+                self.config.bucket,
+                s3_key,
+                local_path,
+                label=f"step {step} / {fname}",
+            )
 
         is_legacy = file_names == ["checkpoint.pt"]
         if is_legacy:

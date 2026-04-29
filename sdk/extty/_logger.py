@@ -7,7 +7,7 @@ import os
 import sys
 from typing import IO
 
-# Cyberpunk palette mirroring tui/src/main.rs (24-bit truecolor escapes).
+# palette mirroring tui/src/main.rs (24-bit truecolor escapes).
 _NEON_CYAN = "\033[38;2;0;255;255m"
 _NEON_MAGENTA = "\033[38;2;255;0;128m"
 _NEON_GREEN = "\033[38;2;0;255;136m"

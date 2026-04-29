@@ -9,7 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from extty.s3 import S3Config
+from extty.s3 import (
+    S3Config,
+    _default_boto_config,
+    _download_with_progress,
+    _format_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +99,7 @@ def _build_client(s3_config: S3Config):
             "boto3 is required for S3 operations. Install with: pip install extty[s3]"
         )
 
-    kwargs: dict = {}
+    kwargs: dict = {"config": _default_boto_config()}
     if s3_config.region:
         kwargs["region_name"] = s3_config.region
     if s3_config.access_key_id and s3_config.secret_access_key:
@@ -406,13 +411,26 @@ def load_artifact(
         from extty.storage import get_artifacts_dir
 
         local_dir = get_artifacts_dir() / name / "data"
-        if not _local_cache_valid(local_dir, meta.files):
+        if _local_cache_valid(local_dir, meta.files):
+            logger.info(
+                "artifact '%s': using cached copy at %s (%s)",
+                name,
+                local_dir,
+                _format_bytes(meta.total_size_bytes),
+            )
+        else:
             local_dir.mkdir(parents=True, exist_ok=True)
             for file_entry in meta.files:
                 s3_key = f"{prefix}/{name}/data/{file_entry['path']}"
                 local_path = local_dir / file_entry["path"]
                 local_path.parent.mkdir(parents=True, exist_ok=True)
-                client.download_file(config.bucket, s3_key, str(local_path))
+                _download_with_progress(
+                    client,
+                    config.bucket,
+                    s3_key,
+                    local_path,
+                    label=f"artifact {name} / {file_entry['path']}",
+                )
 
         if meta.content_type == "file":
             return (local_dir / meta.files[0]["path"]).read_bytes()
@@ -436,7 +454,13 @@ def load_artifact(
         s3_key = f"{prefix}/{name}/data/{file_entry['path']}"
         local_path = dest / file_entry["path"]
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        client.download_file(config.bucket, s3_key, str(local_path))
+        _download_with_progress(
+            client,
+            config.bucket,
+            s3_key,
+            local_path,
+            label=f"artifact {name} / {file_entry['path']}",
+        )
 
     if meta.content_type == "file":
         return dest / meta.files[0]["path"]

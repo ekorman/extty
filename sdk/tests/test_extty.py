@@ -1101,18 +1101,30 @@ class TestLoadCheckpoint:
             with open(Filename, "rb") as f:
                 stored[Key] = f.read()
 
-        def download_file(Bucket, Key, Filename):
+        def download_file(Bucket, Key, Filename, **kwargs):
             if Key not in stored:
                 raise client.exceptions.NoSuchKey(
                     {"Error": {"Code": "NoSuchKey"}}, "GetObject"
                 )
+            data = stored[Key]
             with open(Filename, "wb") as f:
-                f.write(stored[Key])
+                f.write(data)
+            callback = kwargs.get("Callback")
+            if callback is not None:
+                callback(len(data))
+
+        def head_object(Bucket, Key):
+            if Key not in stored:
+                raise client.exceptions.NoSuchKey(
+                    {"Error": {"Code": "NoSuchKey"}}, "HeadObject"
+                )
+            return {"ContentLength": len(stored[Key])}
 
         client.put_object.side_effect = put_object
         client.get_object.side_effect = get_object
         client.upload_file.side_effect = upload_file
         client.download_file.side_effect = download_file
+        client.head_object.side_effect = head_object
         client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
         return client, stored
 
