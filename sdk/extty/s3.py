@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -135,14 +136,31 @@ class _DownloadProgress:
         frac = min(self._seen / self._total, 1.0)
         filled = int(self._width * frac)
         bar = "█" * filled + "░" * (self._width - filled)
+        stats = (
+            f"{frac * 100:5.1f}% "
+            f"{_format_bytes(self._seen)} / {_format_bytes(self._total)}"
+        )
+        prefix_visible_len = self._width + len(stats) + 4
+        try:
+            term_width = shutil.get_terminal_size().columns
+        except OSError:
+            term_width = 80
+        budget = max(term_width - prefix_visible_len - 1, 0)
+        label = self._label
+        if len(label) > budget:
+            if budget <= 1:
+                label = ""
+            else:
+                label = "…" + label[-(budget - 1) :]
         line = (
             f"{_DIM_CYAN}[{_RESET}"
             f"{_NEON_GREEN}{bar}{_RESET}"
             f"{_DIM_CYAN}]{_RESET} "
             f"{_NEON_CYAN}{frac * 100:5.1f}%{_RESET} "
-            f"{_format_bytes(self._seen)} / {_format_bytes(self._total)} "
-            f"{_DIM_CYAN}{self._label}{_RESET}"
+            f"{_format_bytes(self._seen)} / {_format_bytes(self._total)}"
         )
+        if label:
+            line += f" {_DIM_CYAN}{label}{_RESET}"
         self._stream.write(f"\r\033[2K{line}{end}")
         self._stream.flush()
 
