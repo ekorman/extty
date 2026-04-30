@@ -500,6 +500,24 @@ impl App {
         entries
     }
 
+    fn sync_list_selection_to_run(&mut self) {
+        if let Some(project) = self.runs.get(self.selected_run).map(|r| {
+            r.project
+                .clone()
+                .unwrap_or_else(|| "(no project)".to_string())
+        }) {
+            self.expanded_projects.insert(project);
+        }
+        let entries = self.list_entries();
+        if let Some(pos) = entries.iter().position(|e| match e {
+            ListEntry::Run { run_index } => *run_index == self.selected_run,
+            _ => false,
+        }) {
+            self.selected_list_item = pos;
+            self.list_state.select(Some(pos));
+        }
+    }
+
     // Build the flattened list of entries (projects and models)
     fn model_list_entries(&self) -> Vec<ModelListEntry> {
         use std::collections::BTreeMap;
@@ -3024,8 +3042,10 @@ impl App {
                 self.view = View::Focused;
             }
             KeyCode::Char('[') => {
+                let current_project = self.runs[self.selected_run].project.clone();
                 let prev = (0..self.selected_run).rev().find(|&i| {
-                    (!self.hide_completed || self.runs[i].is_running())
+                    self.runs[i].project == current_project
+                        && (!self.hide_completed || self.runs[i].is_running())
                         && (self.config_filters.is_empty()
                             || run_matches_filters(&self.runs[i], &self.config_filters))
                 });
@@ -3036,11 +3056,14 @@ impl App {
                     self.config_panel_scroll = 0;
                     self.cached_example = None;
                     self.ensure_run_loaded(self.selected_run);
+                    self.sync_list_selection_to_run();
                 }
             }
             KeyCode::Char(']') => {
+                let current_project = self.runs[self.selected_run].project.clone();
                 let next = (self.selected_run + 1..self.runs.len()).find(|&i| {
-                    (!self.hide_completed || self.runs[i].is_running())
+                    self.runs[i].project == current_project
+                        && (!self.hide_completed || self.runs[i].is_running())
                         && (self.config_filters.is_empty()
                             || run_matches_filters(&self.runs[i], &self.config_filters))
                 });
@@ -3051,6 +3074,7 @@ impl App {
                     self.config_panel_scroll = 0;
                     self.cached_example = None;
                     self.ensure_run_loaded(self.selected_run);
+                    self.sync_list_selection_to_run();
                 }
             }
             KeyCode::Char('c') => {
