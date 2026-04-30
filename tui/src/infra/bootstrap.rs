@@ -58,6 +58,19 @@ touch ~/.no_auto_tmux
 # tmux handling
 if [ -z "$TMUX" ] && [ "{skip_tmux}" != "true" ]; then
     if [ "$1" != "--in-tmux" ]; then
+        if tmux has-session -t extty 2>/dev/null; then
+            busy=$(tmux list-panes -t extty -F '#{{pane_current_command}}' 2>/dev/null \
+                | grep -vE '^(bash|zsh|sh|fish|dash|tmux|-bash|-zsh)$' \
+                | head -n1)
+            if [ -n "$busy" ]; then
+                echo "Error: tmux session 'extty' is busy running '$busy' on this VM." >&2
+                echo "Attach with: tmux attach -t extty" >&2
+                echo "Or kill it with: tmux kill-session -t extty" >&2
+                exit 1
+            fi
+            echo "Reaping idle 'extty' tmux session from a previous run..."
+            tmux kill-session -t extty 2>/dev/null
+        fi
         exec tmux new-session -s extty "$0 --in-tmux"
     fi
 fi
@@ -157,6 +170,10 @@ mod tests {
         assert!(script.contains("sudo apt install -y build-essential"));
         assert!(script.contains("libcuda.so"));
         assert!(!script.contains("extty[gpu]"));
+        assert!(script.contains("tmux has-session -t extty"));
+        assert!(script.contains("tmux list-panes -t extty -F '#{pane_current_command}'"));
+        assert!(script.contains("tmux kill-session -t extty"));
+        assert!(script.contains("exec tmux new-session -s extty"));
         assert!(script.contains("export EXTTY_GIT_HASH=\"abc123def456\""));
         assert!(script.contains("export EXTTY_RUN_COMMAND=\"extty run uv run train.py\""));
         assert!(script.contains("export EXTTY_INSTANCE_ID=\"i-abc123\""));
