@@ -9,6 +9,7 @@ use crate::infra::models::{Instance, InstanceStatus, InstanceType, LaunchOptions
 use crate::infra::providers::CloudProvider;
 
 const BASE_URL: &str = "https://console.vast.ai/api/v0";
+const DISK_GB: u32 = 30;
 
 fn parse_instance_type(instance_type: &str) -> Result<(&str, u32)> {
     if let Some(pos) = instance_type.rfind('x') {
@@ -287,6 +288,7 @@ impl CloudProvider for VastProvider {
             "rentable": {"eq": true},
             "gpu_name": {"eq": gpu_name},
             "num_gpus": {"eq": num_gpus},
+            "disk_space": {"gte": DISK_GB},
             "type": "on-demand",
             "order": [["dph_total", "asc"]],
             "limit": 100,
@@ -316,7 +318,7 @@ impl CloudProvider for VastProvider {
         let mut create_body = serde_json::json!({
             "client_id": "me",
             "image": "pytorch/pytorch:latest",
-            "disk": 50,
+            "disk": DISK_GB,
             "onstart": "",
         });
 
