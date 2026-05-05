@@ -23,7 +23,7 @@ const NEON_GREEN: Color = Color::Rgb(0, 255, 136);
 const NEON_YELLOW: Color = Color::Rgb(255, 255, 0);
 const DIM_CYAN: Color = Color::Rgb(0, 139, 139);
 
-type CompareRunData = (String, Color, Vec<(f64, f64)>);
+type CompareRunData = (String, Color, Vec<(f64, f64)>, bool);
 
 const COMPARE_COLORS: [Color; 8] = [
     NEON_GREEN,
@@ -3190,6 +3190,48 @@ impl App {
                     self.config_copied_at = Some(Instant::now());
                 }
             }
+            KeyCode::Char('[') => {
+                let current_project = self.runs[self.selected_run].project.clone();
+                let prev = (0..self.selected_run).rev().find(|&i| {
+                    self.runs[i].project == current_project
+                        && self.runs[i].config.is_some()
+                        && (!self.hide_completed || self.runs[i].is_running())
+                        && (self.config_filters.is_empty()
+                            || run_matches_filters(&self.runs[i], &self.config_filters))
+                });
+                if let Some(idx) = prev {
+                    self.selected_run = idx;
+                    self.selected_card = 0;
+                    self.scroll_offset = 0;
+                    self.config_panel_scroll = 0;
+                    self.config_cursor = 0;
+                    self.config_copied_at = None;
+                    self.cached_example = None;
+                    self.ensure_run_loaded(self.selected_run);
+                    self.sync_list_selection_to_run();
+                }
+            }
+            KeyCode::Char(']') => {
+                let current_project = self.runs[self.selected_run].project.clone();
+                let next = (self.selected_run + 1..self.runs.len()).find(|&i| {
+                    self.runs[i].project == current_project
+                        && self.runs[i].config.is_some()
+                        && (!self.hide_completed || self.runs[i].is_running())
+                        && (self.config_filters.is_empty()
+                            || run_matches_filters(&self.runs[i], &self.config_filters))
+                });
+                if let Some(idx) = next {
+                    self.selected_run = idx;
+                    self.selected_card = 0;
+                    self.scroll_offset = 0;
+                    self.config_panel_scroll = 0;
+                    self.config_cursor = 0;
+                    self.config_copied_at = None;
+                    self.cached_example = None;
+                    self.ensure_run_loaded(self.selected_run);
+                    self.sync_list_selection_to_run();
+                }
+            }
             _ => {}
         }
     }
@@ -5822,8 +5864,10 @@ fn render_comparison_chart(
         Style::default().fg(NEON_GREEN)
     };
 
-    let non_empty: Vec<&CompareRunData> =
-        run_data.iter().filter(|(_, _, d)| !d.is_empty()).collect();
+    let non_empty: Vec<&CompareRunData> = run_data
+        .iter()
+        .filter(|(_, _, d, _)| !d.is_empty())
+        .collect();
 
     let display_title = match x_axis {
         XAxis::Step => title.to_string(),
@@ -5847,21 +5891,27 @@ fn render_comparison_chart(
         return;
     }
 
+    let all_scalar = non_empty.iter().all(|(_, _, _, is_scalar)| *is_scalar);
+    if all_scalar {
+        render_scalar_bar_compare(frame, area, &display_title, run_data, selected);
+        return;
+    }
+
     let x_min = non_empty
         .iter()
-        .filter_map(|(_, _, d)| d.first().map(|p| p.0))
+        .filter_map(|(_, _, d, _)| d.first().map(|p| p.0))
         .fold(f64::INFINITY, f64::min);
     let x_max = non_empty
         .iter()
-        .filter_map(|(_, _, d)| d.last().map(|p| p.0))
+        .filter_map(|(_, _, d, _)| d.last().map(|p| p.0))
         .fold(f64::NEG_INFINITY, f64::max);
     let y_data_min = non_empty
         .iter()
-        .flat_map(|(_, _, d)| d.iter().map(|p| p.1))
+        .flat_map(|(_, _, d, _)| d.iter().map(|p| p.1))
         .fold(f64::INFINITY, f64::min);
     let y_data_max = non_empty
         .iter()
-        .flat_map(|(_, _, d)| d.iter().map(|p| p.1))
+        .flat_map(|(_, _, d, _)| d.iter().map(|p| p.1))
         .fold(f64::NEG_INFINITY, f64::max);
 
     let y_range = (y_data_max - y_data_min).max(0.001);
@@ -5871,17 +5921,29 @@ fn render_comparison_chart(
     let max_points = (area.width as usize) * 2;
     let downsampled: Vec<CompareRunData> = run_data
         .iter()
-        .filter(|(_, _, d)| !d.is_empty())
-        .map(|(name, color, data)| (name.clone(), *color, lttb_downsample(data, max_points)))
+        .filter(|(_, _, d, _)| !d.is_empty())
+        .map(|(name, color, data, is_scalar)| {
+            (
+                name.clone(),
+                *color,
+                lttb_downsample(data, max_points),
+                *is_scalar,
+            )
+        })
         .collect();
 
     let datasets: Vec<Dataset> = downsampled
         .iter()
-        .map(|(name, color, data)| {
+        .map(|(name, color, data, is_scalar)| {
+            let (marker, graph_type) = if *is_scalar {
+                (Marker::Block, GraphType::Scatter)
+            } else {
+                (Marker::Braille, GraphType::Line)
+            };
             Dataset::default()
                 .name(name.as_str())
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
+                .marker(marker)
+                .graph_type(graph_type)
                 .style(Style::default().fg(*color))
                 .data(data)
         })
@@ -5928,6 +5990,97 @@ fn render_comparison_chart(
                 .labels(y_labels),
         )
         .legend_position(Some(LegendPosition::TopRight));
+
+    frame.render_widget(chart, area);
+}
+
+fn render_scalar_bar_compare(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    run_data: &[CompareRunData],
+    selected: bool,
+) {
+    use ratatui::widgets::{Bar, BarChart, BarGroup};
+
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    let block = Block::default()
+        .title(Span::styled(title.to_string(), title_style))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let entries: Vec<(String, Color, f64)> = run_data
+        .iter()
+        .filter_map(|(name, color, data, _)| data.last().map(|p| (name.clone(), *color, p.1)))
+        .collect();
+
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "No data",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    let raw_min = entries
+        .iter()
+        .map(|(_, _, v)| *v)
+        .fold(f64::INFINITY, f64::min);
+    let raw_max = entries
+        .iter()
+        .map(|(_, _, v)| *v)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let range = (raw_max - raw_min).abs().max(1e-9);
+    let pad = range * 0.15;
+    let scale_max = 10_000.0;
+
+    let bars: Vec<Bar> = entries
+        .iter()
+        .map(|(name, color, value)| {
+            let normalized = (value - raw_min + pad) / (range + pad);
+            let scaled = (normalized * scale_max).max(1.0) as u64;
+            let label_text = if name.chars().count() > 10 {
+                let head: String = name.chars().take(9).collect();
+                format!("{}…", head)
+            } else {
+                name.clone()
+            };
+            Bar::default()
+                .label(Line::from(label_text))
+                .value(scaled)
+                .text_value(format_scalar_value(*value))
+                .style(Style::default().fg(*color))
+                .value_style(Style::default().fg(*color).bold())
+        })
+        .collect();
+
+    let inner_width = block.inner(area).width;
+    let n = bars.len() as u16;
+    let gap: u16 = 1;
+    let total_gap = gap * n.saturating_sub(1);
+    let bar_width = if n == 0 {
+        1
+    } else {
+        ((inner_width.saturating_sub(total_gap)) / n).max(1)
+    };
+
+    let chart = BarChart::default()
+        .block(block)
+        .data(BarGroup::default().bars(&bars))
+        .bar_width(bar_width)
+        .bar_gap(gap)
+        .label_style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(chart, area);
 }
@@ -6033,12 +6186,11 @@ fn render_compare_view(app: &mut App, frame: &mut Frame) {
                     .filter_map(|(ci, &run_idx)| {
                         let run = app.runs.get(run_idx)?;
                         let color = COMPARE_COLORS[ci % COMPARE_COLORS.len()];
-                        let data: Vec<(f64, f64)> = run
-                            .metrics
-                            .get(name)
-                            .map(|pts| points_to_xy(pts, x_axis))
-                            .unwrap_or_default();
-                        Some((run.display_name(), color, data))
+                        let pts = run.metrics.get(name);
+                        let is_scalar = pts.map(|p| is_scalar_series(p)).unwrap_or(true);
+                        let data: Vec<(f64, f64)> =
+                            pts.map(|p| points_to_xy(p, x_axis)).unwrap_or_default();
+                        Some((run.display_name(), color, data, is_scalar))
                     })
                     .collect();
                 render_comparison_chart(frame, card_area, name, &run_data, is_selected, x_axis);
@@ -6710,6 +6862,34 @@ fn points_to_xy(points: &[MetricPoint], x_axis: XAxis) -> Vec<(f64, f64)> {
     }
 }
 
+fn is_scalar_series(points: &[MetricPoint]) -> bool {
+    match points.len() {
+        0 | 1 => true,
+        _ => {
+            let s0 = points[0].step;
+            points.iter().all(|p| p.step == s0)
+        }
+    }
+}
+
+fn format_scalar_value(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let abs = v.abs();
+    if !(1e-3..1e6).contains(&abs) {
+        format!("{:.4e}", v)
+    } else {
+        let s = format!("{:.4}", v);
+        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+        if trimmed.is_empty() || trimmed == "-" {
+            "0".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+}
+
 fn format_x_label(value: f64, span: f64, x_axis: XAxis) -> String {
     match x_axis {
         XAxis::Step => format!("{:.0}", value),
@@ -6791,6 +6971,11 @@ fn render_chart(
         return;
     }
 
+    if is_scalar_series(points) {
+        render_scalar_value_card(frame, area, &display_title, points, selected);
+        return;
+    }
+
     let raw_data: Vec<(f64, f64)> = points_to_xy(points, x_axis);
     let max_points = (area.width as usize) * 2;
     let data = lttb_downsample(&raw_data, max_points);
@@ -6856,6 +7041,62 @@ fn render_chart(
         );
 
     frame.render_widget(chart, area);
+}
+
+fn render_scalar_value_card(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    points: &[MetricPoint],
+    selected: bool,
+) {
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    let block = Block::default()
+        .title(Span::styled(title.to_string(), title_style))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(last) = points.last() else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "No data",
+                Style::default().fg(Color::DarkGray),
+            )),
+            inner,
+        );
+        return;
+    };
+
+    let value_str = format_scalar_value(last.value);
+    let step_str = format!("step {}", last.step);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            value_str,
+            Style::default().fg(NEON_GREEN).bold(),
+        ))
+        .alignment(Alignment::Center),
+        Line::from(""),
+        Line::from(Span::styled(step_str, Style::default().fg(Color::DarkGray)))
+            .alignment(Alignment::Center),
+    ];
+
+    let pad_top = (inner.height as i32 - lines.len() as i32).max(0) / 2;
+    let mut padded: Vec<Line> = (0..pad_top).map(|_| Line::from("")).collect();
+    padded.extend(lines);
+
+    frame.render_widget(Paragraph::new(padded), inner);
 }
 
 fn render_examples_card(
@@ -7374,12 +7615,11 @@ fn render_focused_compare(app: &App, frame: &mut Frame, area: Rect) {
                 .filter_map(|(ci, &run_idx)| {
                     let run = app.runs.get(run_idx)?;
                     let color = COMPARE_COLORS[ci % COMPARE_COLORS.len()];
-                    let data: Vec<(f64, f64)> = run
-                        .metrics
-                        .get(name)
-                        .map(|pts| points_to_xy(pts, x_axis))
-                        .unwrap_or_default();
-                    Some((run.display_name(), color, data))
+                    let pts = run.metrics.get(name);
+                    let is_scalar = pts.map(|p| is_scalar_series(p)).unwrap_or(true);
+                    let data: Vec<(f64, f64)> =
+                        pts.map(|p| points_to_xy(p, x_axis)).unwrap_or_default();
+                    Some((run.display_name(), color, data, is_scalar))
                 })
                 .collect();
             render_comparison_chart(frame, chunks[0], name, &run_data, true, x_axis);
