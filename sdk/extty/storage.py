@@ -77,7 +77,7 @@ def sanitize_metric_name(name: str) -> str:
     Sanitizes each path component individually.
     """
     parts = name.split("/")
-    sanitized_parts = [re.sub(r"[^\w\-.]", "_", part) for part in parts]
+    sanitized_parts = [re.sub(r"[^\w\-.@]", "_", part) for part in parts]
     return "/".join(sanitized_parts)
 
 

@@ -48,7 +48,10 @@ class TestSanitizeMetricName:
         assert sanitize_metric_name("train/metrics/loss") == "train/metrics/loss"
 
     def test_special_chars_in_components(self) -> None:
-        assert sanitize_metric_name("val/f1@epoch") == "val/f1_epoch"
+        assert sanitize_metric_name("val/f1!epoch") == "val/f1_epoch"
+
+    def test_at_sign_preserved(self) -> None:
+        assert sanitize_metric_name("val/pass@8") == "val/pass@8"
 
     def test_preserves_valid_chars(self) -> None:
         assert sanitize_metric_name("loss_v2.0") == "loss_v2.0"
