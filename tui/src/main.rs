@@ -5962,10 +5962,11 @@ fn render_comparison_chart(
         .collect();
 
     let num_y_ticks = 5;
+    let y_range = y_data_max - y_data_min;
     let y_labels: Vec<Span> = (0..num_y_ticks)
         .map(|i| {
-            let v = y_data_min + (y_data_max - y_data_min) * i as f64 / (num_y_ticks - 1) as f64;
-            Span::styled(format!("{:.2}", v), label_style)
+            let v = y_data_min + y_range * i as f64 / (num_y_ticks - 1) as f64;
+            Span::styled(format_y_label(v, y_range), label_style)
         })
         .collect();
 
@@ -6897,6 +6898,30 @@ fn format_x_label(value: f64, span: f64, x_axis: XAxis) -> String {
     }
 }
 
+fn format_y_label(value: f64, range: f64) -> String {
+    let scale = value.abs().max(range.abs());
+    if scale == 0.0 {
+        return "0".to_string();
+    }
+    if !(1e-3..1e6).contains(&scale) {
+        return format!("{:.1e}", value);
+    }
+    let decimals = if range >= 100.0 {
+        0
+    } else if range >= 10.0 {
+        1
+    } else if range >= 1.0 {
+        2
+    } else if range >= 0.1 {
+        3
+    } else if range >= 0.01 {
+        4
+    } else {
+        5
+    };
+    format!("{:.*}", decimals, value)
+}
+
 fn format_duration_label(seconds: f64, span: f64) -> String {
     let span = span.max(1e-9);
     let s = seconds.max(0.0);
@@ -7012,10 +7037,11 @@ fn render_chart(
         .collect();
 
     let num_y_ticks = 5;
+    let y_range = y_data_max - y_data_min;
     let y_labels: Vec<Span> = (0..num_y_ticks)
         .map(|i| {
-            let v = y_data_min + (y_data_max - y_data_min) * i as f64 / (num_y_ticks - 1) as f64;
-            Span::styled(format!("{:.2}", v), label_style)
+            let v = y_data_min + y_range * i as f64 / (num_y_ticks - 1) as f64;
+            Span::styled(format_y_label(v, y_range), label_style)
         })
         .collect();
 
