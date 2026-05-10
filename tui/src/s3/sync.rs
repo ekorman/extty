@@ -860,6 +860,19 @@ impl S3Client {
         Ok(())
     }
 
+    pub async fn list_remote_checkpoint_steps(&self, project: &str, run: &str) -> Result<Vec<u64>> {
+        let index_key = self.s3_prefix(&format!("runs/{}/{}/checkpoints.json", project, run));
+        let Some(content) = self.get_object_content(&index_key).await? else {
+            return Ok(Vec::new());
+        };
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_slice(&content).context("Failed to parse remote checkpoints.json")?;
+        Ok(entries
+            .iter()
+            .filter_map(|e| e.get("step").and_then(|v| v.as_u64()))
+            .collect())
+    }
+
     pub async fn delete_checkpoint(&self, project: &str, run: &str, step: u64) -> Result<()> {
         let prefix = self.s3_prefix(&format!("runs/{}/{}/checkpoints/{}/", project, run, step));
         let mut continuation_token: Option<String> = None;

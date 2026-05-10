@@ -38,6 +38,7 @@ const COMPARE_COLORS: [Color; 8] = [
 
 mod data;
 mod infra;
+mod prune;
 mod run;
 mod s3;
 use data::{
@@ -4423,6 +4424,7 @@ fn main() -> Result<()> {
         Command::Push(options) => run_s3_command("push", options),
         Command::Sync(options) => run_s3_command("sync", options),
         Command::Run(options) => run::run(options),
+        Command::PruneLocal(options) => prune::run_local(options),
     }
 }
 
@@ -4748,6 +4750,7 @@ enum Command {
     Push(SyncOptions),
     Sync(SyncOptions),
     Run(run::RunOptions),
+    PruneLocal(prune::PruneLocalOptions),
 }
 
 struct TuiOptions;
@@ -4781,12 +4784,88 @@ fn parse_command() -> Result<Command> {
             let opts = parse_run_options(&mut args)?;
             Ok(Command::Run(opts))
         }
+        "prune" => {
+            args.remove(0);
+            let sub = args
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("prune requires a subcommand: local"))?
+                .clone();
+            args.remove(0);
+            match sub.as_str() {
+                "local" => {
+                    let opts = parse_prune_local_options(&mut args)?;
+                    Ok(Command::PruneLocal(opts))
+                }
+                other => Err(anyhow::anyhow!(
+                    "Unknown prune subcommand: {}. Valid: local",
+                    other
+                )),
+            }
+        }
         other if other.starts_with('-') => Err(anyhow::anyhow!("Unknown option: {}", other)),
         _ => Err(anyhow::anyhow!(
-            "Unknown command: {}. Valid commands: run, pull, push, sync",
+            "Unknown command: {}. Valid commands: run, pull, push, sync, prune",
             args[0]
         )),
     }
+}
+
+fn parse_prune_local_options(args: &mut Vec<String>) -> Result<prune::PruneLocalOptions> {
+    let mut target = None;
+    let mut artifact = None;
+    let mut no_checkpoints = false;
+    let mut no_artifacts = false;
+    let mut dry_run = false;
+    let mut assume_yes = false;
+
+    while !args.is_empty() {
+        match args[0].as_str() {
+            "--artifact" => {
+                args.remove(0);
+                artifact = Some(
+                    args.first()
+                        .ok_or_else(|| anyhow::anyhow!("--artifact requires a value"))?
+                        .clone(),
+                );
+                args.remove(0);
+            }
+            "--no-checkpoints" => {
+                no_checkpoints = true;
+                args.remove(0);
+            }
+            "--no-artifacts" => {
+                no_artifacts = true;
+                args.remove(0);
+            }
+            "-n" | "--dry-run" => {
+                dry_run = true;
+                args.remove(0);
+            }
+            "-y" | "--yes" => {
+                assume_yes = true;
+                args.remove(0);
+            }
+            s if s.starts_with('-') => {
+                return Err(anyhow::anyhow!("Unknown option: {}", s));
+            }
+            _ => {
+                if target.is_none() {
+                    target = Some(args.remove(0));
+                } else {
+                    return Err(anyhow::anyhow!("Unexpected argument: {}", args[0]));
+                }
+            }
+        }
+    }
+
+    Ok(prune::PruneLocalOptions {
+        target,
+        artifact,
+        no_checkpoints,
+        no_artifacts,
+        dry_run,
+        assume_yes,
+    })
 }
 
 fn parse_run_options(args: &mut Vec<String>) -> Result<run::RunOptions> {
