@@ -5,7 +5,6 @@ import dataclasses
 import functools
 import os
 import warnings
-from datetime import datetime
 
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -21,8 +20,6 @@ from extty.storage import (
     ExampleRecord,
     MetricPoint,
     SystemMetricPoint,
-    log_model_evaluation,
-    generate_random_name,
     get_runs_dir,
 )
 from extty.artifact import (
@@ -40,7 +37,6 @@ _logger = logger
 __all__ = [
     "init",
     "log",
-    "log_evaluation",
     "save_checkpoint",
     "load_checkpoint",
     "load_checkpoint_from",
@@ -272,57 +268,6 @@ def load_checkpoint_from(
     return storage.load_checkpoint(step, load_optimizer=load_optimizer)
 
 
-def log_evaluation(
-    project: str,
-    model: str,
-    *,
-    name: str | None = None,
-    metrics: dict[str, float] | None = None,
-    examples: list[Example] | None = None,
-    model_config: dict[str, Any] | None = None,
-    eval_config: dict[str, Any] | None = None,
-    started_at: str | None = None,
-    finished_at: str | None = None,
-) -> None:
-    """
-    Log an evaluation for a model.
-
-    Parameters
-    ----------
-    project : str
-        Name of the project.
-    model : str
-        Name of the model.
-    name : str
-        Name of this evaluation (e.g., "gsm8k", "humaneval").
-    metrics : dict[str, float], optional
-        Evaluation metrics (e.g., {"accuracy": 0.85}).
-    examples : list[Example], optional
-        Sample outputs as Example objects.
-    model_config : dict[str, Any], optional
-        Model configuration (stored on model's meta.json).
-    eval_config : dict[str, Any], optional
-        Evaluation configuration (stored with evaluation).
-    started_at : str, optional
-        ISO timestamp when the evaluation started.
-    finished_at : str, optional
-        ISO timestamp when the evaluation finished.
-    """
-    name = name or generate_random_name()
-    examples_dicts = [ex.to_dict() for ex in examples] if examples else None
-    log_model_evaluation(
-        project=project,
-        model=model,
-        name=name,
-        metrics=metrics,
-        examples=examples_dicts,
-        model_config=model_config,
-        eval_config=eval_config,
-        started_at=started_at,
-        finished_at=finished_at,
-    )
-
-
 def finish() -> None:
     """Finish the current run and flush all data."""
     global _active_run
@@ -396,57 +341,6 @@ def _sanitize_config(config: dict[str, Any]) -> dict[str, Any]:
         return val
 
     return {k: _convert(v) for k, v in config.items()}
-
-
-def evaluation(
-    project: str,
-    *,
-    name: str | None = None,
-    name_kwarg: str | None = None,
-    model: str | None = None,
-    model_kwarg: str | None = None,
-    model_config_kwargs: list[str],
-    eval_config_kwargs: list[str],
-):
-    def dec(
-        fn: Callable[P, tuple[dict[str, float], list[Example]]],
-    ) -> Callable[P, tuple[dict[str, float], list[Example]]]:
-        @functools.wraps(fn)
-        def wrapper(
-            *args: P.args, **kwargs: P.kwargs
-        ) -> tuple[dict[str, float], list[Example]]:
-            kwargs_copy = copy.deepcopy(kwargs)
-
-            eval_name = name
-            if eval_name is None and name_kwarg is not None:
-                eval_name = kwargs_copy.pop(name_kwarg)
-
-            model_name = model
-            if model_name is None and model_kwarg is not None:
-                model_name = kwargs_copy.pop(model_kwarg)
-
-            model_config = {k: kwargs_copy[k] for k in model_config_kwargs}
-            eval_config = {k: kwargs_copy[k] for k in eval_config_kwargs}
-
-            started_at = datetime.now().isoformat()
-            metrics, examples = fn(*args, **kwargs)
-            finished_at = datetime.now().isoformat()
-            log_evaluation(
-                project=project,
-                model=model_name,
-                name=eval_name,
-                model_config=model_config,
-                eval_config=eval_config,
-                metrics=metrics,
-                examples=examples,
-                started_at=started_at,
-                finished_at=finished_at,
-            )
-            return metrics, examples
-
-        return wrapper
-
-    return dec
 
 
 def experiment(

@@ -100,43 +100,6 @@ impl ExampleGroup {
     }
 }
 
-// An evaluation example (supports batched prompts and grouped responses like training examples)
-#[derive(Debug, Clone)]
-pub struct EvaluationExample {
-    pub prompts: Vec<String>,
-    pub responses: Vec<Vec<String>>,
-    pub rewards: Option<Vec<Vec<Reward>>>,
-    pub groundtruth: Option<Vec<String>>,
-}
-
-// An evaluation snapshot (now associated with models instead of runs)
-#[derive(Debug, Clone)]
-pub struct Evaluation {
-    pub name: String,
-    pub model_name: String,
-    pub project: String,
-    pub path: PathBuf,
-    pub config: Option<serde_json::Value>,
-    pub metrics: Option<serde_json::Map<String, serde_json::Value>>,
-    pub examples: Vec<EvaluationExample>,
-    pub logged_at: Option<DateTime<Local>>,
-    pub started_at: Option<DateTime<Local>>,
-    pub finished_at: Option<DateTime<Local>>,
-}
-
-// A model with its evaluations
-#[derive(Debug, Clone)]
-pub struct Model {
-    pub name: String,
-    pub project: String,
-    pub path: PathBuf,
-    pub config: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    pub created_at: Option<DateTime<Local>>,
-    #[allow(dead_code)]
-    pub updated_at: Option<DateTime<Local>>,
-}
-
 #[derive(Debug, Clone)]
 pub struct CheckpointFile {
     pub name: String,
@@ -261,14 +224,6 @@ fn runs_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".extty")
         .join("runs")
-}
-
-// Get the directory where models are stored
-fn models_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("models")
 }
 
 // Get the directory where artifact metadata is cached
@@ -403,16 +358,6 @@ pub fn move_run(old_path: &Path, new_project: &str) -> Result<PathBuf, std::io::
     Ok(dest)
 }
 
-// Delete an evaluation by removing its JSON file
-pub fn delete_evaluation(path: &Path) -> Result<(), std::io::Error> {
-    fs::remove_file(path)
-}
-
-// Delete a model by removing its directory
-pub fn delete_model(path: &Path) -> Result<(), std::io::Error> {
-    fs::remove_dir_all(path)
-}
-
 // Load a single run from a directory
 fn load_run(path: &Path) -> Option<Run> {
     let name = path.file_name()?.to_string_lossy().to_string();
@@ -439,216 +384,18 @@ fn load_run(path: &Path) -> Option<Run> {
     })
 }
 
-// Load all models from the models directory
-pub fn load_models() -> Vec<Model> {
-    let mut models = Vec::new();
-    let dir = models_dir();
-
-    if !dir.exists() {
-        return models;
-    }
-
-    if let Ok(project_entries) = fs::read_dir(&dir) {
-        for project_entry in project_entries.flatten() {
-            let project_path = project_entry.path();
-            if !project_path.is_dir() {
-                continue;
-            }
-
-            let project_name = project_path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            if let Ok(model_entries) = fs::read_dir(&project_path) {
-                for model_entry in model_entries.flatten() {
-                    let model_path = model_entry.path();
-                    if model_path.is_dir()
-                        && let Some(model) = load_model(&model_path, &project_name)
-                    {
-                        models.push(model);
-                    }
-                }
-            }
-        }
-    }
-
-    models.sort_by(|a, b| a.project.cmp(&b.project).then_with(|| b.name.cmp(&a.name)));
-    models
-}
-
-// Load a single model from a directory
-fn load_model(path: &Path, project: &str) -> Option<Model> {
-    let name = path.file_name()?.to_string_lossy().to_string();
-    let meta_path = path.join("meta.json");
-
-    let (config, created_at, updated_at) = if meta_path.exists() {
-        let content = fs::read_to_string(&meta_path).ok()?;
-        let data: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-        let config = data.get("model_config").cloned();
-        let created_at = data
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Local));
-        let updated_at = data
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Local));
-
-        (config, created_at, updated_at)
-    } else {
-        (None, None, None)
-    };
-
-    Some(Model {
-        name,
-        project: project.to_string(),
-        path: path.to_path_buf(),
-        config,
-        created_at,
-        updated_at,
-    })
-}
-
-// Load all evaluations from a model directory
-pub fn load_evaluations_for_model(
-    model_path: &Path,
-    model_name: &str,
-    project: &str,
-) -> Vec<Evaluation> {
-    let evaluations_dir = model_path.join("evaluations");
-    if !evaluations_dir.exists() {
-        return vec![];
-    }
-
-    let mut evaluations = Vec::new();
-    if let Ok(entries) = fs::read_dir(&evaluations_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false)
-                && let Some(eval) = load_evaluation(&path, model_name, project)
-            {
-                evaluations.push(eval);
-            }
-        }
-    }
-    evaluations.sort_by(|a, b| a.name.cmp(&b.name));
-    evaluations
-}
-
-// Load a single evaluation from a JSON file
-fn load_evaluation(path: &Path, model_name: &str, project: &str) -> Option<Evaluation> {
-    let name = path.file_stem()?.to_string_lossy().to_string();
-    let content = fs::read_to_string(path).ok()?;
-    let data: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-    let config = data.get("config").cloned();
-    let metrics = data.get("metrics").and_then(|v| v.as_object()).cloned();
-    let examples: Vec<EvaluationExample> = data
-        .get("examples")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|ex| {
-                    let ex_data: ExampleData = serde_json::from_value(ex.clone()).ok()?;
-                    Some(EvaluationExample {
-                        prompts: ex_data.prompt,
-                        responses: ex_data.response,
-                        rewards: ex_data.reward,
-                        groundtruth: ex_data.groundtruth,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let logged_at = data
-        .get("logged_at")
-        .and_then(|v| v.as_str())
-        .and_then(parse_datetime);
-    let started_at = data
-        .get("started_at")
-        .and_then(|v| v.as_str())
-        .and_then(parse_datetime);
-    let finished_at = data
-        .get("finished_at")
-        .and_then(|v| v.as_str())
-        .and_then(parse_datetime);
-
-    Some(Evaluation {
-        name,
-        model_name: model_name.to_string(),
-        project: project.to_string(),
-        path: path.to_path_buf(),
-        config,
-        metrics,
-        examples,
-        logged_at,
-        started_at,
-        finished_at,
-    })
-}
-
 /// Parse a datetime string in either RFC3339 or ISO format
 fn parse_datetime(s: &str) -> Option<DateTime<Local>> {
-    // Try RFC3339 first (with timezone)
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Local));
     }
-    // Try ISO format without timezone (assume local)
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
         return dt.and_local_timezone(Local).single();
     }
-    // Try without fractional seconds
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return dt.and_local_timezone(Local).single();
     }
     None
-}
-
-// Load all evaluations from all models
-pub fn load_all_evaluations() -> Vec<Evaluation> {
-    let mut evaluations = Vec::new();
-
-    let dir = models_dir();
-    if !dir.exists() {
-        return evaluations;
-    }
-
-    if let Ok(project_entries) = fs::read_dir(&dir) {
-        for project_entry in project_entries.flatten() {
-            let project_path = project_entry.path();
-            if !project_path.is_dir() {
-                continue;
-            }
-
-            let project_name = project_path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            if let Ok(model_entries) = fs::read_dir(&project_path) {
-                for model_entry in model_entries.flatten() {
-                    let model_path = model_entry.path();
-                    if model_path.is_dir() {
-                        let model_name = model_path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        evaluations.extend(load_evaluations_for_model(
-                            &model_path,
-                            &model_name,
-                            &project_name,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    evaluations
 }
 
 // Load checkpoints from checkpoints.json

@@ -42,9 +42,8 @@ mod prune;
 mod run;
 mod s3;
 use data::{
-    Artifact, Checkpoint, Evaluation, Example, ExampleGroup, MetricPoint, Model, Reward, Run,
-    artifacts_dir, delete_evaluation, delete_model, load_all_evaluations, load_archived_projects,
-    load_artifacts_from_cache, load_models, load_run_notes, load_runs_lightweight,
+    Artifact, Checkpoint, Example, ExampleGroup, MetricPoint, Reward, Run, artifacts_dir,
+    load_archived_projects, load_artifacts_from_cache, load_run_notes, load_runs_lightweight,
     load_starred_runs, mark_run_completed, save_archived_projects, save_run_notes,
     save_starred_runs,
 };
@@ -64,11 +63,10 @@ enum S3PullMessage {
     Error(String),
 }
 
-// View mode: Runs, Models, or Infra
+// View mode: Runs, Artifacts, or Infra
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
     Runs,
-    Models,
     Artifacts,
     Infra,
 }
@@ -78,7 +76,6 @@ enum ViewMode {
 enum View {
     List,
     RunDetail,
-    ModelDetail,
     Focused,
     Compare,
     ConfigFull,
@@ -155,12 +152,11 @@ enum FilterPhase {
     ValueSelect,
 }
 
-// A card in the detail grid - either a chart, example group, or evaluation
+// A card in the detail grid - chart, example group, checkpoints, or artifacts
 #[derive(Clone)]
 enum Card {
     Chart { name: String },
     Examples { name: String },
-    Evaluation { name: String },
     Checkpoints,
     Artifacts,
 }
@@ -178,25 +174,13 @@ enum ListEntry {
     Run { run_index: usize },
 }
 
-// Represents an item in the hierarchical list view (models)
-#[derive(Clone, Debug)]
-enum ModelListEntry {
-    Project { name: String },
-    Model { model_index: usize },
-}
-
 // All application state lives here
 struct App {
     runs: Vec<Run>,
-    models: Vec<Model>,
-    model_evaluations: Vec<Evaluation>,
     selected_run: usize,
-    selected_model: usize,
     selected_list_item: usize, // Current position in the flattened list (runs)
     list_state: ListState,
-    selected_model_list_item: usize, // Current position in the flattened list (models)
     expanded_projects: HashSet<String>, // Which projects are expanded (runs)
-    expanded_model_projects: HashSet<String>, // Which projects are expanded (models)
     selected_card: usize,
     selected_example: usize,  // Index within an example group when focused
     selected_prompt: usize,   // Index within prompts batch for an example
@@ -214,8 +198,6 @@ struct App {
     show_delete_confirm: bool,
     show_complete_confirm: bool,
     pending_delete_run: Option<usize>, // Index into runs vector of run to delete
-    pending_delete_model: Option<usize>, // Index into models vector of model to delete
-    pending_delete_eval: Option<usize>, // Index into model_evaluations of eval to delete
     term_width: u16,
     term_height: u16,
     // Infra state
@@ -314,21 +296,14 @@ struct App {
 impl App {
     fn new() -> Self {
         let runs = load_runs_lightweight();
-        let models = load_models();
-        let model_evaluations = load_all_evaluations();
         let infra_config = load_config().unwrap_or_default();
         let default_provider = infra_config.default_provider;
         App {
             runs,
-            models,
-            model_evaluations,
             selected_run: 0,
-            selected_model: 0,
             selected_list_item: 0,
             list_state: ListState::default(),
-            selected_model_list_item: 0,
             expanded_projects: HashSet::new(),
-            expanded_model_projects: HashSet::new(),
             selected_card: 0,
             selected_example: 0,
             selected_prompt: 0,
@@ -346,8 +321,6 @@ impl App {
             show_delete_confirm: false,
             show_complete_confirm: false,
             pending_delete_run: None,
-            pending_delete_model: None,
-            pending_delete_eval: None,
             term_width: 80,
             term_height: 24,
             infra_config,
@@ -519,33 +492,6 @@ impl App {
         }
     }
 
-    // Build the flattened list of entries (projects and models)
-    fn model_list_entries(&self) -> Vec<ModelListEntry> {
-        use std::collections::BTreeMap;
-
-        let mut projects: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-
-        for (i, model) in self.models.iter().enumerate() {
-            projects.entry(model.project.clone()).or_default().push(i);
-        }
-
-        let mut entries = Vec::new();
-
-        for (project_name, model_indices) in projects {
-            entries.push(ModelListEntry::Project {
-                name: project_name.clone(),
-            });
-
-            if self.expanded_model_projects.contains(&project_name) {
-                for model_index in model_indices {
-                    entries.push(ModelListEntry::Model { model_index });
-                }
-            }
-        }
-
-        entries
-    }
-
     fn refresh_runs(&mut self) {
         let current_name = self.runs.get(self.selected_run).map(|r| r.name.clone());
 
@@ -587,25 +533,6 @@ impl App {
         let entries = self.list_entries();
         self.selected_list_item = self.selected_list_item.min(entries.len().saturating_sub(1));
         self.list_state.select(Some(self.selected_list_item));
-    }
-
-    fn refresh_models(&mut self) {
-        let current_name = self.models.get(self.selected_model).map(|m| m.name.clone());
-        self.models = load_models();
-        self.model_evaluations = load_all_evaluations();
-
-        if let Some(name) = current_name {
-            if let Some(idx) = self.models.iter().position(|m| m.name == name) {
-                self.selected_model = idx;
-            } else {
-                self.selected_model = self.selected_model.min(self.models.len().saturating_sub(1));
-            }
-        }
-
-        let entries = self.model_list_entries();
-        self.selected_model_list_item = self
-            .selected_model_list_item
-            .min(entries.len().saturating_sub(1));
     }
 
     fn refresh_artifacts(&mut self) {
@@ -1731,16 +1658,10 @@ impl App {
                 .compared_runs
                 .iter()
                 .any(|&ri| self.runs.get(ri).and_then(|r| r.config.as_ref()).is_some()),
-            _ => match self.view_mode {
-                ViewMode::Models => self
-                    .current_model()
-                    .map(|m| m.config.is_some())
-                    .unwrap_or(false),
-                _ => self
-                    .current_run()
-                    .map(|r| r.config.is_some())
-                    .unwrap_or(false),
-            },
+            _ => self
+                .current_run()
+                .map(|r| r.config.is_some())
+                .unwrap_or(false),
         };
         let effective_width = if self.show_config && has_config {
             self.term_width.saturating_sub(config_panel_width)
@@ -1758,10 +1679,7 @@ impl App {
         let card_count = match self.view {
             View::Compare => self.compare_cards().len(),
             View::Focused if self.compare_focused => self.compare_cards().len(),
-            _ => match self.view_mode {
-                ViewMode::Models => self.model_card_count(),
-                _ => self.card_count(),
-            },
+            _ => self.card_count(),
         };
         self.selected_card = self.selected_card.min(card_count.saturating_sub(1));
         let card_row = self.selected_card / cols;
@@ -1777,10 +1695,6 @@ impl App {
 
     fn current_run(&self) -> Option<&Run> {
         self.runs.get(self.selected_run)
-    }
-
-    fn current_model(&self) -> Option<&Model> {
-        self.models.get(self.selected_model)
     }
 
     fn run_artifacts(&self, run: &Run) -> Vec<&Artifact> {
@@ -1850,28 +1764,6 @@ impl App {
         cards
     }
 
-    fn model_cards(&self) -> Vec<Card> {
-        let Some(model) = self.current_model() else {
-            return vec![];
-        };
-
-        let mut cards = Vec::new();
-
-        let model_evaluations: Vec<&Evaluation> = self
-            .model_evaluations
-            .iter()
-            .filter(|e| e.model_name == model.name && e.project == model.project)
-            .collect();
-
-        for eval in model_evaluations {
-            cards.push(Card::Evaluation {
-                name: eval.name.clone(),
-            });
-        }
-
-        cards
-    }
-
     fn compare_cards(&self) -> Vec<Card> {
         let show_sys = self.show_system_metrics;
         let mut metric_names: Vec<String> = self
@@ -1927,13 +1819,6 @@ impl App {
         steps.into_iter().collect()
     }
 
-    fn get_model_evaluation(&self, name: &str) -> Option<&Evaluation> {
-        let model = self.current_model()?;
-        self.model_evaluations
-            .iter()
-            .find(|e| e.model_name == model.name && e.project == model.project && e.name == name)
-    }
-
     fn card_count(&self) -> usize {
         let Some(run) = self.current_run() else {
             return 0;
@@ -1945,16 +1830,6 @@ impl App {
             1
         };
         run.metrics.len() + run.examples.len() + has_checkpoints + has_artifacts
-    }
-
-    fn model_card_count(&self) -> usize {
-        let Some(model) = self.current_model() else {
-            return 0;
-        };
-        self.model_evaluations
-            .iter()
-            .filter(|e| e.model_name == model.name && e.project == model.project)
-            .count()
     }
 
     fn get_or_load_example(&mut self, name: &str, idx: usize) -> Option<&Example> {
@@ -2000,12 +1875,10 @@ impl App {
     fn active_cards(&self) -> Vec<Card> {
         match self.view {
             View::RunDetail | View::List => self.cards(),
-            View::ModelDetail => self.model_cards(),
             View::Compare => self.compare_cards(),
             View::Focused if self.compare_focused => self.compare_cards(),
             View::Focused => match self.view_mode {
                 ViewMode::Runs => self.cards(),
-                ViewMode::Models => self.model_cards(),
                 ViewMode::Artifacts | ViewMode::Infra => vec![],
             },
             View::ConfigFull
@@ -2044,15 +1917,6 @@ impl App {
                     false
                 }
             }
-            Some(Card::Evaluation { name }) => {
-                let eval = match self.view_mode {
-                    ViewMode::Runs | ViewMode::Artifacts | ViewMode::Infra => None,
-                    ViewMode::Models => self.get_model_evaluation(name),
-                };
-                eval.and_then(|e| e.examples.get(self.selected_example))
-                    .and_then(|ex| ex.groundtruth.as_ref())
-                    .is_some()
-            }
             _ => false,
         }
     }
@@ -2085,39 +1949,6 @@ impl App {
             Some(Card::Examples { name }) => {
                 if let Some((ref cn, ci, ref ex)) = self.cached_example {
                     if cn == name && ci == self.selected_example {
-                        match section {
-                            FocusedSection::Prompt => ex
-                                .prompts
-                                .get(self.selected_prompt)
-                                .cloned()
-                                .unwrap_or_default(),
-                            FocusedSection::Groundtruth => ex
-                                .groundtruth
-                                .as_ref()
-                                .and_then(|gt| gt.get(self.selected_prompt))
-                                .cloned()
-                                .unwrap_or_default(),
-                            FocusedSection::Response => ex
-                                .responses
-                                .get(self.selected_prompt)
-                                .and_then(|r| r.get(self.selected_response))
-                                .cloned()
-                                .unwrap_or_default(),
-                        }
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                }
-            }
-            Some(Card::Evaluation { name }) => {
-                let eval = match self.view_mode {
-                    ViewMode::Runs | ViewMode::Artifacts | ViewMode::Infra => None,
-                    ViewMode::Models => self.get_model_evaluation(name),
-                };
-                if let Some(eval) = eval {
-                    if let Some(ex) = eval.examples.get(self.selected_example) {
                         match section {
                             FocusedSection::Prompt => ex
                                 .prompts
@@ -2286,7 +2117,7 @@ impl App {
                                     _ => vec![],
                                 }
                             }
-                            ViewMode::Models | ViewMode::Artifacts | ViewMode::Infra => vec![],
+                            ViewMode::Artifacts | ViewMode::Infra => vec![],
                         }
                     };
 
@@ -2350,17 +2181,12 @@ impl App {
         match self.view {
             View::List => match self.view_mode {
                 ViewMode::Runs => self.handle_list_key(code),
-                ViewMode::Models => self.handle_model_list_key(code),
                 ViewMode::Artifacts => self.handle_artifacts_list_key(code),
                 ViewMode::Infra => self.handle_infra_list_key(code, modifiers),
             },
             View::RunDetail => {
                 let (visible_rows, cols) = self.grid_layout();
                 self.handle_detail_key(code, visible_rows, cols);
-            }
-            View::ModelDetail => {
-                let (visible_rows, cols) = self.grid_layout();
-                self.handle_model_detail_key(code, visible_rows, cols);
             }
             View::Focused => self.handle_focused_key(key),
             View::ConfigFull => self.handle_config_full_key(code),
@@ -2721,24 +2547,6 @@ impl App {
                         self.view = View::List;
                     }
                 }
-                if let Some(model_idx) = self.pending_delete_model
-                    && let Some(model) = self.models.get(model_idx)
-                {
-                    let path = model.path.clone();
-                    let _ = delete_model(&path);
-                    self.refresh_models();
-                    if self.view == View::ModelDetail {
-                        self.view = View::List;
-                    }
-                }
-                if let Some(eval_idx) = self.pending_delete_eval
-                    && let Some(eval) = self.model_evaluations.get(eval_idx)
-                {
-                    let path = eval.path.clone();
-                    let _ = delete_evaluation(&path);
-                    self.refresh_models();
-                    self.selected_card = self.selected_card.saturating_sub(1);
-                }
                 if self.pending_delete_artifact {
                     self.start_s3_delete_artifact();
                     self.refresh_artifacts();
@@ -2758,16 +2566,12 @@ impl App {
                 }
                 self.show_delete_confirm = false;
                 self.pending_delete_run = None;
-                self.pending_delete_model = None;
-                self.pending_delete_eval = None;
                 self.pending_delete_artifact = false;
                 self.pending_delete_checkpoint = false;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.show_delete_confirm = false;
                 self.pending_delete_run = None;
-                self.pending_delete_model = None;
-                self.pending_delete_eval = None;
                 self.pending_delete_artifact = false;
                 self.pending_delete_checkpoint = false;
             }
@@ -2780,11 +2584,6 @@ impl App {
         let entry_count = entries.len();
 
         match code {
-            KeyCode::Char('m') => {
-                self.view_mode = ViewMode::Models;
-                self.selected_card = 0;
-                self.scroll_offset = 0;
-            }
             KeyCode::Char('a') => {
                 self.view_mode = ViewMode::Artifacts;
             }
@@ -2939,75 +2738,6 @@ impl App {
             }
             KeyCode::Esc if !self.compared_runs.is_empty() => {
                 self.compared_runs.clear();
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_model_list_key(&mut self, code: KeyCode) {
-        let entries = self.model_list_entries();
-        let entry_count = entries.len();
-
-        match code {
-            KeyCode::Char('r') => {
-                self.view_mode = ViewMode::Runs;
-                self.selected_card = 0;
-                self.scroll_offset = 0;
-            }
-            KeyCode::Char('a') => {
-                self.view_mode = ViewMode::Artifacts;
-            }
-            KeyCode::Char('i') => {
-                self.view_mode = ViewMode::Infra;
-                self.view = View::InfraList;
-                self.refresh_infra();
-                self.refresh_infra_types();
-            }
-            KeyCode::Char('S') => {
-                self.view = View::S3Config;
-                self.s3_config_field = 0;
-                self.s3_config_editing = false;
-                self.s3_config_message = None;
-            }
-            KeyCode::Up if self.selected_model_list_item > 0 => {
-                self.selected_model_list_item -= 1;
-            }
-            KeyCode::Down if self.selected_model_list_item < entry_count.saturating_sub(1) => {
-                self.selected_model_list_item += 1;
-            }
-            KeyCode::Tab => {
-                if let Some(ModelListEntry::Project { name }) =
-                    entries.get(self.selected_model_list_item)
-                {
-                    if self.expanded_model_projects.contains(name) {
-                        self.expanded_model_projects.remove(name);
-                    } else {
-                        self.expanded_model_projects.insert(name.clone());
-                    }
-                }
-            }
-            KeyCode::Enter => match entries.get(self.selected_model_list_item) {
-                Some(ModelListEntry::Project { name }) => {
-                    if self.expanded_model_projects.contains(name) {
-                        self.expanded_model_projects.remove(name);
-                    } else {
-                        self.expanded_model_projects.insert(name.clone());
-                    }
-                }
-                Some(ModelListEntry::Model { model_index }) => {
-                    self.selected_model = *model_index;
-                    self.selected_card = 0;
-                    self.view = View::ModelDetail;
-                }
-                None => {}
-            },
-            KeyCode::Char('d') => {
-                if let Some(ModelListEntry::Model { model_index }) =
-                    entries.get(self.selected_model_list_item)
-                {
-                    self.pending_delete_model = Some(*model_index);
-                    self.show_delete_confirm = true;
-                }
             }
             _ => {}
         }
@@ -3237,74 +2967,6 @@ impl App {
         }
     }
 
-    fn handle_model_detail_key(&mut self, code: KeyCode, visible_rows: usize, cols: usize) {
-        let card_count = self.model_card_count();
-        let total_rows = card_count.div_ceil(cols);
-        let max_scroll = total_rows.saturating_sub(visible_rows);
-
-        let first_visible_row = self.scroll_offset;
-        let last_visible_row = (self.scroll_offset + visible_rows).saturating_sub(1);
-
-        match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.view = View::List,
-            KeyCode::Left if self.selected_card > 0 => {
-                self.selected_card -= 1;
-                let new_row = self.selected_card / cols;
-                if new_row < first_visible_row {
-                    self.scroll_offset = new_row;
-                }
-            }
-            KeyCode::Right if self.selected_card < card_count.saturating_sub(1) => {
-                self.selected_card += 1;
-                let new_row = self.selected_card / cols;
-                if new_row > last_visible_row {
-                    self.scroll_offset = (new_row + 1).saturating_sub(visible_rows).min(max_scroll);
-                }
-            }
-            KeyCode::Enter if card_count > 0 => {
-                self.selected_example = 0;
-                self.cached_example = None;
-                self.view = View::Focused;
-            }
-            KeyCode::Char('[') if self.selected_model > 0 => {
-                self.selected_model -= 1;
-                self.selected_card = 0;
-                self.scroll_offset = 0;
-                self.config_panel_scroll = 0;
-            }
-            KeyCode::Char(']') if self.selected_model < self.models.len().saturating_sub(1) => {
-                self.selected_model += 1;
-                self.selected_card = 0;
-                self.scroll_offset = 0;
-                self.config_panel_scroll = 0;
-            }
-            KeyCode::Char('c') => {
-                self.show_config = !self.show_config;
-                self.config_panel_scroll = 0;
-                self.ensure_card_visible();
-            }
-            KeyCode::Char('J') if self.show_config => {
-                self.config_panel_scroll += 1;
-            }
-            KeyCode::Char('K') if self.show_config => {
-                self.config_panel_scroll = self.config_panel_scroll.saturating_sub(1);
-            }
-            KeyCode::Char('d') if card_count > 0 => {
-                let cards = self.model_cards();
-                if let Some(Card::Evaluation { name }) = cards.get(self.selected_card)
-                    && let Some(model) = self.current_model()
-                    && let Some(eval_idx) = self.model_evaluations.iter().position(|e| {
-                        e.name == *name && e.model_name == model.name && e.project == model.project
-                    })
-                {
-                    self.pending_delete_eval = Some(eval_idx);
-                    self.show_delete_confirm = true;
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn handle_compare_key(&mut self, code: KeyCode, visible_rows: usize, cols: usize) {
         let cards = self.compare_cards();
         let card_count = cards.len();
@@ -3374,7 +3036,6 @@ impl App {
         } else {
             match self.view_mode {
                 ViewMode::Runs => (self.card_count(), self.cards()),
-                ViewMode::Models => (self.model_card_count(), self.model_cards()),
                 ViewMode::Artifacts | ViewMode::Infra => (0, vec![]),
             }
         };
@@ -3394,13 +3055,6 @@ impl App {
                 .and_then(|r| r.examples.get(name))
                 .map(|e| e.len())
                 .unwrap_or(0),
-            Some(Card::Evaluation { name }) => match self.view_mode {
-                ViewMode::Runs | ViewMode::Artifacts | ViewMode::Infra => 0,
-                ViewMode::Models => self
-                    .get_model_evaluation(name)
-                    .map(|e| e.examples.len())
-                    .unwrap_or(0),
-            },
             _ => 0,
         };
 
@@ -3429,11 +3083,6 @@ impl App {
                 .as_ref()
                 .filter(|(n, i, _)| n == name && *i == self.selected_example)
                 .map(|(_, _, ex)| ex.prompts.len())
-                .unwrap_or(0),
-            Some(Card::Evaluation { name }) => self
-                .get_model_evaluation(name)
-                .and_then(|e| e.examples.get(self.selected_example))
-                .map(|ex| ex.prompts.len())
                 .unwrap_or(0),
             _ => 0,
         };
@@ -3477,7 +3126,6 @@ impl App {
                 } else {
                     self.view = match self.view_mode {
                         ViewMode::Runs => View::RunDetail,
-                        ViewMode::Models => View::ModelDetail,
                         ViewMode::Artifacts => View::List,
                         ViewMode::Infra => View::InfraList,
                     };
@@ -3720,11 +3368,6 @@ impl App {
             KeyCode::Char('g') if example_count > 0 => {
                 self.goto_step_input = Some(String::new());
             }
-            // c toggles model config panel (Models view only)
-            KeyCode::Char('c') if self.view_mode == ViewMode::Models => {
-                self.show_config = !self.show_config;
-                self.config_panel_scroll = 0;
-            }
             KeyCode::Char('J') if self.show_config => {
                 self.config_panel_scroll += 1;
             }
@@ -3775,9 +3418,6 @@ impl App {
         match code {
             KeyCode::Char('r') => {
                 self.view_mode = ViewMode::Runs;
-            }
-            KeyCode::Char('m') => {
-                self.view_mode = ViewMode::Models;
             }
             KeyCode::Char('i') => {
                 self.view_mode = ViewMode::Infra;
@@ -3878,10 +3518,6 @@ impl App {
                     && self.selected_infra_provider == Provider::Local) =>
             {
                 self.view_mode = ViewMode::Artifacts;
-                self.view = View::List;
-            }
-            KeyCode::Char('m') => {
-                self.view_mode = ViewMode::Models;
                 self.view = View::List;
             }
             KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
@@ -4446,10 +4082,9 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
         let size = terminal.size()?;
         app.update_size(size.width, size.height);
 
-        // Periodic refresh of run and model lists (less frequent)
+        // Periodic refresh of run list (less frequent)
         if last_list_refresh.elapsed() >= list_refresh_interval {
             app.refresh_runs();
-            app.refresh_models();
             if matches!(app.view, View::RunDetail | View::Focused) && !app.compare_focused {
                 app.ensure_run_loaded(app.selected_run);
             }
@@ -4978,12 +4613,10 @@ fn render(app: &mut App, frame: &mut Frame) {
     match app.view {
         View::List => match app.view_mode {
             ViewMode::Runs => render_runs_list(app, frame),
-            ViewMode::Models => render_models_list(app, frame),
             ViewMode::Artifacts => render_artifacts_list(app, frame),
             ViewMode::Infra => render_infra_dashboard(app, frame),
         },
         View::RunDetail => render_run_detail(app, frame),
-        View::ModelDetail => render_model_detail(app, frame),
         View::Focused => render_focused(app, frame),
         View::ConfigFull => render_config_full(app, frame),
         View::Compare => render_compare_view(app, frame),
@@ -5270,127 +4903,6 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(help), help_area);
 }
 
-fn render_models_list(app: &App, frame: &mut Frame) {
-    let area = frame.area();
-    let entries = app.model_list_entries();
-
-    let items: Vec<ListItem> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            let is_selected = i == app.selected_model_list_item;
-
-            match entry {
-                ModelListEntry::Project { name } => {
-                    let is_expanded = app.expanded_model_projects.contains(name);
-                    let icon = if is_expanded { "▼ " } else { "▶ " };
-
-                    let model_count = app.models.iter().filter(|m| &m.project == name).count();
-
-                    let name_style = if is_selected {
-                        Style::default().fg(NEON_MAGENTA).bold()
-                    } else {
-                        Style::default().fg(NEON_CYAN).bold()
-                    };
-
-                    ListItem::new(Line::from(vec![
-                        Span::styled(icon, Style::default().fg(NEON_MAGENTA)),
-                        Span::styled(name.clone(), name_style),
-                        Span::styled(
-                            format!("  ({} models)", model_count),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]))
-                }
-                ModelListEntry::Model { model_index } => {
-                    let model = &app.models[*model_index];
-
-                    let model_evals: Vec<_> = app
-                        .model_evaluations
-                        .iter()
-                        .filter(|e| e.model_name == model.name && e.project == model.project)
-                        .collect();
-                    let eval_count = model_evals.len();
-
-                    // Find the latest evaluation timestamp (prefer started_at, fall back to logged_at)
-                    let latest_eval_time = model_evals
-                        .iter()
-                        .filter_map(|e| e.started_at.or(e.logged_at))
-                        .max();
-
-                    let name_style = if is_selected {
-                        Style::default().fg(NEON_CYAN).bold()
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    };
-
-                    let mut spans = vec![
-                        Span::styled("  └─ ", Style::default().fg(DIM_CYAN)),
-                        Span::styled("◆ ", Style::default().fg(NEON_YELLOW)),
-                        Span::styled(model.name.clone(), name_style),
-                        Span::styled(
-                            format!("  ({} evals)", eval_count),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ];
-
-                    if let Some(latest) = latest_eval_time {
-                        spans.push(Span::styled("  ", Style::default()));
-                        spans.push(Span::styled(
-                            latest.format("%m-%d %H:%M").to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                    }
-
-                    ListItem::new(Line::from(spans))
-                }
-            }
-        })
-        .collect();
-
-    let mut state = ListState::default();
-    state.select(Some(app.selected_model_list_item));
-
-    let title = Line::from(vec![
-        Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("Runs", Style::default().fg(Color::DarkGray)),
-        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
-        Span::styled("[Models]", Style::default().fg(NEON_CYAN).bold()),
-        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
-        Span::styled("Artifacts", Style::default().fg(Color::DarkGray)),
-        Span::styled(" | ", Style::default().fg(DIM_CYAN)),
-        Span::styled("Infra", Style::default().fg(Color::DarkGray)),
-        Span::styled(" ", Style::default()),
-    ]);
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(DIM_CYAN)),
-        )
-        .highlight_style(Style::default().bg(Color::Rgb(30, 40, 50)))
-        .highlight_symbol("▶ ");
-
-    frame.render_stateful_widget(list, area, &mut state);
-
-    let help = Line::from(vec![
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Enter", Style::default().fg(NEON_CYAN)),
-        Span::styled("] open  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Tab", Style::default().fg(NEON_CYAN)),
-        Span::styled("] expand  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("?", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] help", Style::default().fg(Color::DarkGray)),
-    ]);
-    let help_area = Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1);
-    frame.render_widget(Paragraph::new(help), help_area);
-}
-
 fn format_time_ago(secs: u64) -> String {
     match secs {
         0..=59 => format!("{}s ago", secs),
@@ -5654,159 +5166,6 @@ fn render_run_detail(app: &mut App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
-fn render_model_detail(app: &mut App, frame: &mut Frame) {
-    let area = frame.area();
-
-    let Some(model) = app.current_model() else {
-        frame.render_widget(Paragraph::new("No model selected"), area);
-        return;
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    let config_width = 35u16;
-    let (grid_area, config_area) = if app.show_config && model.config.is_some() {
-        let h_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(40), Constraint::Length(config_width)])
-            .split(chunks[1]);
-        (h_chunks[0], Some(h_chunks[1]))
-    } else {
-        (chunks[1], None)
-    };
-
-    let card_width = 40u16;
-    let card_height = 12u16;
-    let cols = (grid_area.width / card_width).max(1) as usize;
-    let cards = app.model_cards();
-    let total_cards = cards.len();
-    let total_rows = total_cards.div_ceil(cols);
-    let visible_rows = (grid_area.height / card_height) as usize;
-    let max_scroll = total_rows.saturating_sub(visible_rows);
-    let scroll = app.scroll_offset.min(max_scroll);
-
-    let scroll_indicator = if total_rows > visible_rows {
-        let has_above = scroll > 0;
-        let has_below = scroll < max_scroll;
-        match (has_above, has_below) {
-            (true, true) => " [↑↓ more]".to_string(),
-            (true, false) => " [↑ more above]".to_string(),
-            (false, true) => " [↓ more below]".to_string(),
-            (false, false) => String::new(),
-        }
-    } else {
-        String::new()
-    };
-
-    let header_spans = vec![
-        Span::styled("◆ ", Style::default().fg(NEON_YELLOW)),
-        Span::styled(
-            format!("{}/{}", model.project, model.name),
-            Style::default().fg(NEON_CYAN).bold(),
-        ),
-        Span::styled("  │  ", Style::default().fg(DIM_CYAN)),
-        Span::styled(format!("{}", total_cards), Style::default().fg(NEON_GREEN)),
-        Span::styled(" evaluations", Style::default().fg(Color::DarkGray)),
-        Span::styled(&scroll_indicator, Style::default().fg(NEON_MAGENTA)),
-    ];
-    let header_text = Line::from(header_spans);
-    let header = Paragraph::new(header_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(DIM_CYAN)),
-    );
-    frame.render_widget(header, chunks[0]);
-
-    render_model_cards_grid(app, frame, grid_area, &cards);
-
-    let model_config_cloned = model.config.clone();
-    if let Some(config_area) = config_area
-        && let Some(ref config) = model_config_cloned
-    {
-        render_config_panel(frame, config_area, config, &mut app.config_panel_scroll);
-    }
-
-    let config_hint = if app.show_config { "hide" } else { "config" };
-    let footer = Line::from(vec![
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-        Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("←→", Style::default().fg(NEON_CYAN)),
-        Span::styled("] select  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("Enter", Style::default().fg(NEON_GREEN)),
-        Span::styled("] focus  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("c", Style::default().fg(NEON_CYAN)),
-        Span::styled(
-            format!("] {}  ", config_hint),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("[]", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] model ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{}/{}  ", app.selected_model + 1, app.models.len()),
-            Style::default().fg(NEON_YELLOW),
-        ),
-        Span::styled("[", Style::default().fg(DIM_CYAN)),
-        Span::styled("?", Style::default().fg(NEON_YELLOW)),
-        Span::styled("] help", Style::default().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(footer), chunks[2]);
-}
-
-fn render_model_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
-    if cards.is_empty() {
-        frame.render_widget(Paragraph::new("No evaluations"), area);
-        return;
-    }
-
-    let card_width = 40u16;
-    let card_height = 12u16;
-    let cols = (area.width / card_width).max(1) as usize;
-
-    let total_rows = cards.len().div_ceil(cols);
-    let visible_rows = (area.height / card_height) as usize;
-    let max_scroll = total_rows.saturating_sub(visible_rows);
-    let scroll = app.scroll_offset.min(max_scroll);
-
-    for (i, card) in cards.iter().enumerate() {
-        let col = i % cols;
-        let row = i / cols;
-
-        if row < scroll {
-            continue;
-        }
-
-        let visible_row = row - scroll;
-        let x = area.x + (col as u16) * card_width;
-        let y = area.y + (visible_row as u16) * card_height;
-
-        if y + card_height > area.bottom() {
-            continue;
-        }
-
-        let card_area = Rect::new(x, y, card_width.min(area.right() - x), card_height);
-        let is_selected = i == app.selected_card;
-
-        if let Card::Evaluation { name } = card
-            && let Some(eval) = app.get_model_evaluation(name)
-        {
-            render_evaluation_card(frame, card_area, eval, is_selected);
-        }
-    }
-}
-
 fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
     let Some(run) = app.current_run() else { return };
 
@@ -5876,7 +5235,6 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                 let run_artifacts = app.run_artifacts(run);
                 render_artifacts_card(frame, card_area, &run_artifacts, is_selected);
             }
-            Card::Evaluation { .. } => {}
         }
     }
 }
@@ -7552,107 +6910,6 @@ fn render_focused_checkpoints(
     frame.render_widget(paragraph, area);
 }
 
-fn render_evaluation_card(frame: &mut Frame, area: Rect, eval: &Evaluation, selected: bool) {
-    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
-    let title_style = if selected {
-        Style::default().fg(NEON_CYAN).bold()
-    } else {
-        Style::default().fg(NEON_GREEN)
-    };
-
-    // Build content: metrics as key-value pairs
-    let mut content: Vec<Line> = Vec::new();
-
-    if let Some(metrics) = &eval.metrics {
-        let mut keys: Vec<&String> = metrics.keys().collect();
-        keys.sort();
-        for key in keys.iter().take(area.height.saturating_sub(4) as usize) {
-            if let Some(value) = metrics.get(*key) {
-                let val_str = match value {
-                    serde_json::Value::Number(n) => {
-                        if let Some(f) = n.as_f64() {
-                            format!("{:.4}", f)
-                        } else {
-                            n.to_string()
-                        }
-                    }
-                    _ => value.to_string(),
-                };
-                content.push(Line::from(vec![
-                    Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
-                    Span::styled(val_str, Style::default().fg(Color::White)),
-                ]));
-            }
-        }
-    }
-
-    // Add example count
-    if !eval.examples.is_empty() {
-        content.push(Line::from(""));
-        content.push(Line::from(Span::styled(
-            format!("{} examples", eval.examples.len()),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    if content.is_empty() {
-        content.push(Line::from(Span::styled(
-            "No metrics",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    // Build title with time info
-    let mut title_spans = vec![
-        Span::styled("◆ ", Style::default().fg(NEON_YELLOW)),
-        Span::styled(&eval.name, title_style),
-    ];
-    // Show started_at time if available, otherwise logged_at
-    if let Some(started_at) = eval.started_at {
-        title_spans.push(Span::styled(
-            format!("  {}", started_at.format("%m-%d %H:%M")),
-            Style::default().fg(Color::DarkGray),
-        ));
-    } else if let Some(logged_at) = eval.logged_at {
-        title_spans.push(Span::styled(
-            format!("  {}", logged_at.format("%m-%d %H:%M")),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    // Show duration if we have both start and end times
-    if let (Some(started), Some(finished)) = (eval.started_at, eval.finished_at) {
-        let duration = finished.signed_duration_since(started);
-        let duration_str = if duration.num_seconds() < 60 {
-            format!("{}s", duration.num_seconds())
-        } else if duration.num_minutes() < 60 {
-            format!(
-                "{}m{}s",
-                duration.num_minutes(),
-                duration.num_seconds() % 60
-            )
-        } else {
-            format!("{}h{}m", duration.num_hours(), duration.num_minutes() % 60)
-        };
-        title_spans.push(Span::styled(
-            format!("  ({})", duration_str),
-            Style::default().fg(NEON_GREEN),
-        ));
-    }
-    let title = Line::from(title_spans);
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
-    let paragraph = Paragraph::new(content)
-        .block(block)
-        .wrap(ratatui::widgets::Wrap { trim: true });
-
-    frame.render_widget(paragraph, area);
-}
-
 fn reward_color(reward: f64) -> Color {
     if reward >= 0.7 {
         NEON_GREEN
@@ -7671,7 +6928,6 @@ fn render_focused(app: &App, frame: &mut Frame) {
     } else {
         match app.view_mode {
             ViewMode::Runs => render_focused_run(app, frame, area),
-            ViewMode::Models => render_focused_model(app, frame, area),
             ViewMode::Artifacts | ViewMode::Infra => {}
         }
     }
@@ -8154,7 +7410,6 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
             ]);
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
-        Card::Evaluation { .. } => {}
     }
 }
 
@@ -8199,643 +7454,6 @@ fn render_focused_artifacts(frame: &mut Frame, area: Rect, artifacts: &[&Artifac
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
-}
-
-fn render_focused_model(app: &App, frame: &mut Frame, area: Rect) {
-    let cards = app.model_cards();
-    let Some(card) = cards.get(app.selected_card) else {
-        frame.render_widget(Paragraph::new("No card selected"), area);
-        return;
-    };
-
-    let model = app.current_model();
-    let model_config = model.and_then(|m| m.config.clone());
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    // Breadcrumbs: project / model / evaluation (if viewing evaluation)
-    if let Some(m) = model {
-        let mut breadcrumb_spans = vec![
-            Span::styled(&m.project, Style::default().fg(Color::DarkGray)),
-            Span::styled(" / ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&m.name, Style::default().fg(NEON_CYAN).bold()),
-        ];
-        if let Card::Evaluation { name } = card {
-            breadcrumb_spans.extend(vec![
-                Span::styled(" / ", Style::default().fg(Color::DarkGray)),
-                Span::styled(name, Style::default().fg(NEON_YELLOW).bold()),
-            ]);
-        }
-        let breadcrumb = Line::from(breadcrumb_spans);
-        frame.render_widget(Paragraph::new(breadcrumb), chunks[0]);
-    }
-
-    if let Card::Evaluation { name } = card
-        && let Some(eval) = app.get_model_evaluation(name)
-    {
-        render_focused_evaluation(
-            frame,
-            chunks[1],
-            eval,
-            app.selected_example,
-            app.selected_prompt,
-            app.selected_response,
-            app.focused_section,
-            app.prompt_scroll_offset,
-            app.response_scroll_offset,
-            app.groundtruth_scroll_offset,
-            app.show_config,
-            model_config.as_ref(),
-            app.config_panel_scroll,
-        );
-        let example_count = eval.examples.len();
-        let current_example = eval.examples.get(app.selected_example);
-        let prompt_count = current_example.map(|e| e.prompts.len()).unwrap_or(0);
-        let response_count = current_example
-            .and_then(|e| e.responses.get(app.selected_prompt))
-            .map(|r| r.len())
-            .unwrap_or(0);
-        let focus_label = match app.focused_section {
-            FocusedSection::Prompt => "prompt",
-            FocusedSection::Groundtruth => "groundtruth",
-            FocusedSection::Response => "response",
-        };
-        let config_hint = if app.show_config { "hide" } else { "config" };
-        let mut footer_spans = vec![
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("q", Style::default().fg(NEON_MAGENTA)),
-            Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("←→", Style::default().fg(NEON_CYAN)),
-            Span::styled("] card ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}/{}", app.selected_card + 1, cards.len()),
-                Style::default().fg(NEON_GREEN),
-            ),
-            Span::styled("  ", Style::default()),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("c", Style::default().fg(NEON_CYAN)),
-            Span::styled(
-                format!("] {}  ", config_hint),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ];
-        if example_count > 0 {
-            footer_spans.extend(vec![
-                Span::styled("[", Style::default().fg(DIM_CYAN)),
-                Span::styled("Tab", Style::default().fg(NEON_CYAN)),
-                Span::styled("] focus:", Style::default().fg(Color::DarkGray)),
-                Span::styled(focus_label, Style::default().fg(NEON_GREEN)),
-                Span::styled("  ", Style::default()),
-                Span::styled("[", Style::default().fg(DIM_CYAN)),
-                Span::styled("↑↓/⇧", Style::default().fg(NEON_CYAN)),
-                Span::styled("] example ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{}/{}", app.selected_example + 1, example_count),
-                    Style::default().fg(NEON_YELLOW),
-                ),
-            ]);
-            if prompt_count > 1 {
-                footer_spans.extend(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("[]", Style::default().fg(NEON_CYAN)),
-                    Span::styled("] prompt ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{}/{}", app.selected_prompt + 1, prompt_count),
-                        Style::default().fg(NEON_MAGENTA),
-                    ),
-                ]);
-            }
-            if response_count > 1 {
-                footer_spans.extend(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled("[", Style::default().fg(DIM_CYAN)),
-                    Span::styled("<>", Style::default().fg(NEON_CYAN)),
-                    Span::styled("] response ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{}/{}", app.selected_response + 1, response_count),
-                        Style::default().fg(NEON_MAGENTA),
-                    ),
-                ]);
-            }
-        }
-        footer_spans.extend(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled("[", Style::default().fg(DIM_CYAN)),
-            Span::styled("?", Style::default().fg(NEON_YELLOW)),
-            Span::styled("] help", Style::default().fg(Color::DarkGray)),
-        ]);
-        let footer = Line::from(footer_spans);
-        frame.render_widget(Paragraph::new(footer), chunks[2]);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_focused_evaluation(
-    frame: &mut Frame,
-    area: Rect,
-    eval: &Evaluation,
-    selected_example: usize,
-    selected_prompt: usize,
-    selected_response: usize,
-    focused_section: FocusedSection,
-    prompt_scroll_offset: usize,
-    response_scroll_offset: usize,
-    groundtruth_scroll_offset: usize,
-    show_model_config: bool,
-    model_config: Option<&serde_json::Value>,
-    config_panel_scroll: usize,
-) {
-    let (main_area, config_area) = if show_model_config && model_config.is_some() {
-        let h_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-            .split(area);
-        (h_chunks[0], Some(h_chunks[1]))
-    } else {
-        (area, None)
-    };
-
-    if let Some(config_area) = config_area {
-        let config_content: Vec<Line> = if let Some(config) = model_config {
-            let mut lines = Vec::new();
-            render_json_value(config, 0, &mut lines, None, "");
-            lines
-        } else {
-            vec![Line::from(Span::styled(
-                "No config",
-                Style::default().fg(Color::DarkGray),
-            ))]
-        };
-        let total_lines = config_content.len();
-        let visible = config_area.height.saturating_sub(2) as usize;
-        let max_scroll = total_lines.saturating_sub(visible);
-        let scroll = config_panel_scroll.min(max_scroll) as u16;
-        let config_block = Block::default()
-            .title(Span::styled(
-                "◆ MODEL CONFIG ",
-                Style::default().fg(NEON_YELLOW).bold(),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(DIM_CYAN));
-        frame.render_widget(
-            Paragraph::new(config_content)
-                .block(config_block)
-                .scroll((scroll, 0)),
-            config_area,
-        );
-    }
-
-    if eval.examples.is_empty() {
-        // No examples, just show metrics and eval config
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(main_area);
-
-        // Eval config panel (top) - includes timing info
-        let mut config_content: Vec<Line> = Vec::new();
-
-        // Add timing info
-        if let Some(started) = eval.started_at {
-            config_content.push(Line::from(vec![
-                Span::styled("started: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    started.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-        }
-        if let Some(finished) = eval.finished_at {
-            config_content.push(Line::from(vec![
-                Span::styled("finished: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    finished.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-        }
-        if let (Some(started), Some(finished)) = (eval.started_at, eval.finished_at) {
-            let duration = finished.signed_duration_since(started);
-            let duration_str = format!(
-                "{}.{:03}s",
-                duration.num_seconds(),
-                duration.num_milliseconds() % 1000
-            );
-            config_content.push(Line::from(vec![
-                Span::styled("duration: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(duration_str, Style::default().fg(NEON_GREEN)),
-            ]));
-        }
-
-        // Add separator if we have timing info and config
-        if !config_content.is_empty() && eval.config.is_some() {
-            config_content.push(Line::from(""));
-        }
-
-        // Add config
-        if let Some(config) = &eval.config {
-            render_json_value(config, 0, &mut config_content, None, "");
-        } else if config_content.is_empty() {
-            config_content.push(Line::from(Span::styled(
-                "No config",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-
-        let config_block = Block::default()
-            .title(Span::styled(
-                "◆ EVAL CONFIG ",
-                Style::default().fg(NEON_CYAN).bold(),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(DIM_CYAN));
-        frame.render_widget(
-            Paragraph::new(config_content)
-                .block(config_block)
-                .wrap(ratatui::widgets::Wrap { trim: false }),
-            chunks[0],
-        );
-
-        // Metrics panel (bottom)
-        let metrics_content: Vec<Line> = if let Some(metrics) = &eval.metrics {
-            let mut lines = Vec::new();
-            let mut keys: Vec<&String> = metrics.keys().collect();
-            keys.sort();
-            for key in keys {
-                if let Some(value) = metrics.get(key) {
-                    let val_str = match value {
-                        serde_json::Value::Number(n) => {
-                            if let Some(f) = n.as_f64() {
-                                format!("{:.6}", f)
-                            } else {
-                                n.to_string()
-                            }
-                        }
-                        _ => value.to_string(),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
-                        Span::styled(val_str, Style::default().fg(Color::White)),
-                    ]));
-                }
-            }
-            lines
-        } else {
-            vec![Line::from(Span::styled(
-                "No metrics",
-                Style::default().fg(Color::DarkGray),
-            ))]
-        };
-        let metrics_block = Block::default()
-            .title(Span::styled(
-                "◆ METRICS ",
-                Style::default().fg(NEON_GREEN).bold(),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(DIM_CYAN));
-        frame.render_widget(
-            Paragraph::new(metrics_content)
-                .block(metrics_block)
-                .wrap(ratatui::widgets::Wrap { trim: false }),
-            chunks[1],
-        );
-    } else {
-        // Has examples: left side (config + metrics), right side (examples)
-        let h_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(main_area);
-
-        // Left side: eval config (top) and metrics (bottom)
-        let left_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(h_chunks[0]);
-
-        // Eval config panel (top left) - includes timing info
-        let mut config_content: Vec<Line> = Vec::new();
-
-        // Add timing info
-        if let Some(started) = eval.started_at {
-            config_content.push(Line::from(vec![
-                Span::styled("started: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    started.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-        }
-        if let Some(finished) = eval.finished_at {
-            config_content.push(Line::from(vec![
-                Span::styled("finished: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    finished.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-        }
-        if let (Some(started), Some(finished)) = (eval.started_at, eval.finished_at) {
-            let duration = finished.signed_duration_since(started);
-            let duration_str = format!(
-                "{}.{:03}s",
-                duration.num_seconds(),
-                duration.num_milliseconds() % 1000
-            );
-            config_content.push(Line::from(vec![
-                Span::styled("duration: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(duration_str, Style::default().fg(NEON_GREEN)),
-            ]));
-        }
-
-        // Add separator if we have timing info and config
-        if !config_content.is_empty() && eval.config.is_some() {
-            config_content.push(Line::from(""));
-        }
-
-        // Add config
-        if let Some(config) = &eval.config {
-            render_json_value(config, 0, &mut config_content, None, "");
-        } else if config_content.is_empty() {
-            config_content.push(Line::from(Span::styled(
-                "No config",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-
-        let config_block = Block::default()
-            .title(Span::styled(
-                "◆ EVAL CONFIG ",
-                Style::default().fg(NEON_CYAN).bold(),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(DIM_CYAN));
-        frame.render_widget(
-            Paragraph::new(config_content)
-                .block(config_block)
-                .wrap(ratatui::widgets::Wrap { trim: false }),
-            left_chunks[0],
-        );
-
-        // Metrics panel (bottom left)
-        let metrics_content: Vec<Line> = if let Some(metrics) = &eval.metrics {
-            let mut lines = Vec::new();
-            let mut keys: Vec<&String> = metrics.keys().collect();
-            keys.sort();
-            for key in keys {
-                if let Some(value) = metrics.get(key) {
-                    let val_str = match value {
-                        serde_json::Value::Number(n) => {
-                            if let Some(f) = n.as_f64() {
-                                format!("{:.6}", f)
-                            } else {
-                                n.to_string()
-                            }
-                        }
-                        _ => value.to_string(),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{}: ", key), Style::default().fg(NEON_MAGENTA)),
-                        Span::styled(val_str, Style::default().fg(Color::White)),
-                    ]));
-                }
-            }
-            lines
-        } else {
-            vec![Line::from(Span::styled(
-                "No metrics",
-                Style::default().fg(Color::DarkGray),
-            ))]
-        };
-        let metrics_block = Block::default()
-            .title(Span::styled(
-                "◆ METRICS ",
-                Style::default().fg(NEON_GREEN).bold(),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(DIM_CYAN));
-        frame.render_widget(
-            Paragraph::new(metrics_content)
-                .block(metrics_block)
-                .wrap(ratatui::widgets::Wrap { trim: false }),
-            left_chunks[1],
-        );
-
-        // Right side: Examples card containing prompt and response
-        let examples_block = Block::default()
-            .title(Span::styled(
-                format!(
-                    "◆ EXAMPLES #{}/{} ",
-                    selected_example + 1,
-                    eval.examples.len()
-                ),
-                Style::default().fg(NEON_YELLOW).bold(),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(DIM_CYAN));
-        let examples_inner = examples_block.inner(h_chunks[1]);
-        frame.render_widget(examples_block, h_chunks[1]);
-
-        // Get current example
-        if let Some(example) = eval.examples.get(selected_example) {
-            let has_gt = example.groundtruth.is_some();
-
-            // Split examples inner area into prompt/groundtruth/response
-            let example_chunks = if has_gt {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(30),
-                        Constraint::Percentage(35),
-                        Constraint::Percentage(35),
-                    ])
-                    .split(examples_inner)
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-                    .split(examples_inner)
-            };
-
-            // Get the prompt text
-            let prompt_text = example
-                .prompts
-                .get(selected_prompt)
-                .cloned()
-                .unwrap_or_default();
-
-            // Prompt title - show batch position if multiple prompts
-            let prompt_focused = focused_section == FocusedSection::Prompt;
-            let prompt_border_color = if prompt_focused { NEON_CYAN } else { DIM_CYAN };
-            let mut prompt_title_spans = vec![Span::styled(
-                "PROMPT ",
-                Style::default().fg(NEON_YELLOW).bold(),
-            )];
-            if example.prompts.len() > 1 {
-                prompt_title_spans.extend(vec![
-                    Span::styled(
-                        format!("{}/{}", selected_prompt + 1, example.prompts.len()),
-                        Style::default().fg(NEON_YELLOW),
-                    ),
-                    Span::styled(" ", Style::default()),
-                ]);
-            }
-            let prompt_title = Line::from(prompt_title_spans);
-
-            let prompt_block = Block::default()
-                .title(prompt_title)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(prompt_border_color));
-            frame.render_widget(
-                Paragraph::new(prompt_text)
-                    .style(Style::default().fg(Color::White))
-                    .block(prompt_block)
-                    .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((prompt_scroll_offset as u16, 0)),
-                example_chunks[0],
-            );
-
-            let response_chunk_idx = if has_gt {
-                let gt_text = example
-                    .groundtruth
-                    .as_ref()
-                    .and_then(|gt| gt.get(selected_prompt))
-                    .cloned()
-                    .unwrap_or_default();
-                let gt_focused = focused_section == FocusedSection::Groundtruth;
-                let gt_border_color = if gt_focused { NEON_CYAN } else { DIM_CYAN };
-                let gt_block = Block::default()
-                    .title(Span::styled(
-                        "GROUNDTRUTH ",
-                        Style::default().fg(NEON_MAGENTA).bold(),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(gt_border_color));
-                frame.render_widget(
-                    Paragraph::new(gt_text)
-                        .style(Style::default().fg(Color::White))
-                        .block(gt_block)
-                        .wrap(ratatui::widgets::Wrap { trim: false })
-                        .scroll((groundtruth_scroll_offset as u16, 0)),
-                    example_chunks[1],
-                );
-                2
-            } else {
-                1
-            };
-
-            // Get responses for the selected prompt
-            let responses_for_prompt = example
-                .responses
-                .get(selected_prompt)
-                .cloned()
-                .unwrap_or_default();
-
-            // Get the reward for the selected response variant (if it exists)
-            let current_reward = example
-                .rewards
-                .as_ref()
-                .and_then(|rewards| rewards.get(selected_prompt))
-                .and_then(|prompt_rewards| prompt_rewards.get(selected_response));
-
-            // Response title with variant indicator if multiple responses
-            let response_focused = focused_section == FocusedSection::Response;
-            let response_border_color = if response_focused {
-                NEON_CYAN
-            } else {
-                DIM_CYAN
-            };
-
-            let mut response_title_spans = vec![Span::styled(
-                "RESPONSE ",
-                Style::default().fg(NEON_GREEN).bold(),
-            )];
-
-            if responses_for_prompt.len() > 1 {
-                response_title_spans.extend(vec![
-                    Span::styled("│ ", Style::default().fg(DIM_CYAN)),
-                    Span::styled("group ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{}/{}", selected_response + 1, responses_for_prompt.len()),
-                        Style::default().fg(NEON_MAGENTA),
-                    ),
-                ]);
-            }
-
-            if let Some(reward) = current_reward {
-                response_title_spans.push(Span::styled(" │ ", Style::default().fg(DIM_CYAN)));
-                match reward {
-                    Reward::Scalar(v) => {
-                        let color = reward_color(*v);
-                        response_title_spans.push(Span::styled(
-                            "reward: ",
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                        response_title_spans.push(Span::styled(
-                            format!("{:.2}", v),
-                            Style::default().fg(color),
-                        ));
-                    }
-                    Reward::Components(map) => {
-                        let mut parts: Vec<(&String, &f64)> = map.iter().collect();
-                        parts.sort_by_key(|(k, _)| *k);
-                        for (i, (key, value)) in parts.iter().enumerate() {
-                            let color = reward_color(**value);
-                            if i > 0 {
-                                response_title_spans.push(Span::styled("  ", Style::default()));
-                            }
-                            response_title_spans.push(Span::styled(
-                                format!("{}: ", key),
-                                Style::default().fg(Color::DarkGray),
-                            ));
-                            response_title_spans.push(Span::styled(
-                                format!("{:.2}", value),
-                                Style::default().fg(color),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            let response_title = Line::from(response_title_spans);
-
-            // Get the selected response text
-            let response_text = responses_for_prompt
-                .get(selected_response)
-                .cloned()
-                .unwrap_or_default();
-
-            let response_block = Block::default()
-                .title(response_title)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(response_border_color));
-            frame.render_widget(
-                Paragraph::new(response_text)
-                    .style(Style::default().fg(Color::Gray))
-                    .block(response_block)
-                    .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((response_scroll_offset as u16, 0)),
-                example_chunks[response_chunk_idx],
-            );
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9050,20 +7668,6 @@ fn render_delete_confirm(app: &App, frame: &mut Frame) {
             .map(|r| r.name.as_str())
             .unwrap_or("unknown");
         ("run", name)
-    } else if let Some(idx) = app.pending_delete_model {
-        let name = app
-            .models
-            .get(idx)
-            .map(|m| m.name.as_str())
-            .unwrap_or("unknown");
-        ("model", name)
-    } else if let Some(idx) = app.pending_delete_eval {
-        let name = app
-            .model_evaluations
-            .get(idx)
-            .map(|e| e.name.as_str())
-            .unwrap_or("unknown");
-        ("evaluation", name)
     } else if app.pending_delete_artifact {
         let name = app
             .artifacts
@@ -9492,7 +8096,7 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                     ("↑↓", "move selection"),
                     ("Tab", "expand/collapse project"),
                     ("Enter", "open run"),
-                    ("m / a / i", "models / artifacts / infra"),
+                    ("a / i", "artifacts / infra"),
                 ],
             ),
             (
@@ -9526,25 +8130,13 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                 ],
             ),
         ],
-        (View::List, ViewMode::Models) => vec![
-            (
-                "Navigation",
-                vec![
-                    ("↑↓", "move selection"),
-                    ("Tab", "expand/collapse project"),
-                    ("Enter", "open model"),
-                    ("r / a / i", "runs / artifacts / infra"),
-                ],
-            ),
-            ("Actions", vec![("d", "delete model")]),
-        ],
         (View::List, ViewMode::Artifacts) => vec![
             (
                 "Navigation",
                 vec![
                     ("↑↓", "move selection"),
                     ("Enter", "open artifact"),
-                    ("r / m / i", "runs / models / infra"),
+                    ("r / i", "runs / infra"),
                 ],
             ),
             (
@@ -9559,7 +8151,7 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                     ("↑↓", "move selection"),
                     ("Tab", "switch panel (Instances/Types)"),
                     ("1-4", "switch provider"),
-                    ("r / m / a", "runs / models / artifacts"),
+                    ("r / a", "runs / artifacts"),
                 ],
             ),
             (
@@ -9600,18 +8192,6 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                     ("t", "toggle time/step x-axis"),
                 ],
             ),
-        ],
-        (View::ModelDetail, _) => vec![
-            (
-                "Navigation",
-                vec![
-                    ("q / Esc", "back to models list"),
-                    ("←→", "move card selection"),
-                    ("↑↓", "scroll cards grid"),
-                    ("Enter", "focus evaluation"),
-                ],
-            ),
-            ("Actions", vec![("d", "delete evaluation")]),
         ],
         (View::Focused, _) => vec![
             (
