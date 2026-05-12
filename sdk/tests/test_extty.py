@@ -11,16 +11,16 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from botocore.exceptions import BotoCoreError
 
 import extty
+from extty.s3 import S3Config, S3Storage
 from extty.storage import (
     MetaData,
     RunStorage,
     generate_random_name,
     sanitize_metric_name,
 )
-from botocore.exceptions import BotoCoreError
-from extty.s3 import S3Config, S3Storage
 
 
 class TestVersion:

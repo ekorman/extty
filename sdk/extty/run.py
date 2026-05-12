@@ -1,6 +1,7 @@
 """Run class - manages single run state."""
 
 from __future__ import annotations
+
 import os
 import subprocess
 import threading
@@ -8,6 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from extty.artifact import ArtifactMeta
+from extty.artifact import save_artifact as _save_artifact
+from extty.s3 import S3Config, S3Storage
 from extty.storage import (
     MetaData,
     RunStorage,
@@ -15,8 +19,6 @@ from extty.storage import (
     get_runs_dir,
 )
 from extty.system_monitor import SystemMonitor
-from extty.s3 import S3Config, S3Storage
-from extty.artifact import ArtifactMeta, save_artifact as _save_artifact
 
 
 class StorageSink(Protocol):

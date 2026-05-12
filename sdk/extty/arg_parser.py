@@ -4,7 +4,6 @@ from dataclasses import MISSING, Field, fields
 from types import UnionType
 from typing import Callable, Literal, Sequence, Type, TypeVar, get_args, get_origin
 
-
 T = TypeVar("T")
 
 

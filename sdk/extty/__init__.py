@@ -5,33 +5,33 @@ import dataclasses
 import functools
 import os
 import warnings
-
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable, ParamSpec, TypeVar
 
 from extty._logger import log as logger
-
-from extty.example import BatchExample, Example
 from extty.arg_parser import run_experiments_parser
-from extty.compare import compare, config_diff, plot_metric, reduce_metric
-from extty.query import RunData, get_run, get_runs
-from extty.run import NoOpRun, Run
-from extty.storage import (
-    ExampleRecord,
-    MetricPoint,
-    SystemMetricPoint,
-    get_runs_dir,
-)
 from extty.artifact import (
     ArtifactMeta,
     delete_artifact,
     get_artifact,
     list_artifacts,
     load_artifact,
+)
+from extty.artifact import (
     save_artifact as _save_artifact_raw,
 )
+from extty.compare import compare, config_diff, plot_metric, reduce_metric
+from extty.example import BatchExample, Example
+from extty.query import RunData, get_run, get_runs
+from extty.run import NoOpRun, Run
 from extty.s3 import S3Config
+from extty.storage import (
+    ExampleRecord,
+    MetricPoint,
+    SystemMetricPoint,
+    get_runs_dir,
+)
 
 _logger = logger
 
