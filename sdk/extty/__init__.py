@@ -13,6 +13,7 @@ from typing import Any, Callable, ParamSpec, TypeVar
 from extty._logger import log as logger
 
 from extty.example import BatchExample, Example
+from extty.arg_parser import run_experiments_parser
 from extty.compare import compare, config_diff, plot_metric, reduce_metric
 from extty.query import RunData, get_run, get_runs
 from extty.run import NoOpRun, Run
@@ -65,6 +66,7 @@ __all__ = [
     "get_artifact",
     "delete_artifact",
     "logger",
+    "run_experiments_parser",
 ]
 
 # Version is managed by setuptools_scm
