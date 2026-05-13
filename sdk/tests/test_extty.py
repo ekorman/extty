@@ -952,6 +952,87 @@ class TestSaveCheckpoint:
         assert len(result) == 1
         assert result[0]["step"] == 10
 
+    def test_delete_checkpoint_optimizer_removes_only_optimizer(
+        self, tmp_path: Path
+    ) -> None:
+        """Deleting an optimizer removes optimizer.pt and updates metadata."""
+        client, stored = self._make_mock_s3_client()
+        client.delete_object.side_effect = lambda Bucket, Key: stored.pop(Key, None)
+        storage = self._make_storage(
+            client, prefix="pfx", project="proj", run_name="run-opt"
+        )
+
+        mock_torch = mock.MagicMock()
+
+        def fake_save(obj, path):
+            import pickle
+
+            with open(path, "wb") as f:
+                pickle.dump(obj, f)
+
+        mock_torch.save.side_effect = fake_save
+
+        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
+            storage.save_checkpoint(
+                step=42,
+                state_dict={"weight": "data"},
+                optimizer_state_dict={"lr": 0.01},
+            )
+
+        model_key = "pfx/runs/proj/run-opt/checkpoints/42/model.pt"
+        opt_key = "pfx/runs/proj/run-opt/checkpoints/42/optimizer.pt"
+        meta_key = "pfx/runs/proj/run-opt/checkpoints/42/meta.json"
+        index_key = "pfx/runs/proj/run-opt/checkpoints.json"
+        assert opt_key in stored
+
+        storage.delete_checkpoint_optimizer(step=42)
+
+        assert model_key in stored
+        assert opt_key not in stored
+
+        meta = json.loads(stored[meta_key])
+        assert [f["name"] for f in meta["files"]] == ["model.pt"]
+
+        index = json.loads(stored[index_key])
+        assert len(index) == 1
+        assert [f["name"] for f in index[0]["files"]] == ["model.pt"]
+
+    def test_delete_checkpoint_optimizer_noop_when_absent(self, tmp_path: Path) -> None:
+        """Calling delete on a checkpoint without an optimizer is a no-op."""
+        client, stored = self._make_mock_s3_client()
+        client.delete_object.side_effect = lambda Bucket, Key: stored.pop(Key, None)
+        storage = self._make_storage(
+            client, prefix="pfx", project="proj", run_name="run-no-opt"
+        )
+
+        mock_torch = mock.MagicMock()
+
+        def fake_save(obj, path):
+            import pickle
+
+            with open(path, "wb") as f:
+                pickle.dump(obj, f)
+
+        mock_torch.save.side_effect = fake_save
+
+        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
+            storage.save_checkpoint(step=7, state_dict={"weight": "data"})
+
+        before = dict(stored)
+        storage.delete_checkpoint_optimizer(step=7)
+        assert stored == before
+        client.delete_object.assert_not_called()
+
+    def test_delete_checkpoint_optimizer_unknown_step_raises(self) -> None:
+        """Deleting an optimizer for a step that doesn't exist raises."""
+        client, _ = self._make_mock_s3_client()
+        storage = self._make_storage(
+            client, prefix="pfx", project="proj", run_name="run-missing"
+        )
+
+        with pytest.raises(FileNotFoundError):
+            storage.delete_checkpoint_optimizer(step=999)
+
     def test_module_level_save_checkpoint_without_init_raises(self) -> None:
         """Test that calling extty.save_checkpoint without init raises RuntimeError."""
         extty._active_run = None

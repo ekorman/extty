@@ -877,6 +877,70 @@ class S3Storage:
         except self._client.exceptions.NoSuchKey:
             raise FileNotFoundError(f"Checkpoint step {step} not found.")
 
+    def delete_checkpoint_optimizer(self, step: int) -> None:
+        """
+        Delete just the optimizer file of a checkpoint from S3.
+
+        Removes ``optimizer.pt`` from the checkpoint's S3 prefix and
+        rewrites both the per-step ``meta.json`` and the per-run
+        ``checkpoints.json`` index so neither references the optimizer
+        any more. The ``model.pt`` (or legacy ``checkpoint.pt``) is
+        left untouched.
+
+        Idempotent: if the checkpoint exists but has no optimizer
+        recorded, returns without error and without writing.
+
+        Parameters
+        ----------
+        step : int
+            The training step whose optimizer should be removed.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the checkpoint step does not exist.
+        """
+        meta = self._checkpoint_meta(step)
+        files = meta.get("files", [])
+
+        def is_optimizer(entry: Any) -> bool:
+            if isinstance(entry, str):
+                return entry == "optimizer.pt"
+            if isinstance(entry, dict):
+                return entry.get("name") == "optimizer.pt"
+            return False
+
+        if not any(is_optimizer(f) for f in files):
+            return
+
+        opt_key = self._s3_key("checkpoints", str(step), "optimizer.pt")
+        try:
+            self._client.delete_object(Bucket=self.config.bucket, Key=opt_key)
+        except _S3_ERRORS:
+            logger.warning(
+                "Failed to delete optimizer for step %d", step, exc_info=True
+            )
+            return
+
+        meta["files"] = [f for f in files if not is_optimizer(f)]
+
+        meta_key = self._s3_key("checkpoints", str(step), "meta.json")
+        try:
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=meta_key,
+                Body=json.dumps(meta, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except _S3_ERRORS:
+            logger.warning(
+                "Failed to update meta.json for step %d after optimizer delete",
+                step,
+                exc_info=True,
+            )
+
+        self._update_checkpoints_index(meta)
+
     def delete_checkpoint(self, step: int) -> None:
         """
         Delete a checkpoint from S3.
