@@ -87,7 +87,7 @@ def _download_with_progress(
     tmp_path = local_path.with_name(local_path.name + ".part")
     if tmp_path.exists():
         tmp_path.unlink()
-    progress = _DownloadProgress(total, bar_label)
+    progress = _TransferProgress(total, bar_label)
     try:
         client.download_file(
             Bucket=bucket,
@@ -108,8 +108,41 @@ def _download_with_progress(
     tmp_path.replace(local_path)
 
 
-class _DownloadProgress:
-    """boto3 ``Callback`` that renders an in-place progress bar to stderr."""
+def _upload_with_progress(
+    client: Any,
+    local_path: Path,
+    bucket: str,
+    s3_key: str,
+    *,
+    label: str | None = None,
+) -> None:
+    """Upload ``local_path`` to S3 with a progress bar."""
+    total = local_path.stat().st_size
+    bar_label = label or local_path.name
+    logger.info(
+        "uploading %s -> s3://%s/%s (%s)",
+        local_path,
+        bucket,
+        s3_key,
+        _format_bytes(total),
+    )
+    progress = _TransferProgress(total, bar_label)
+    try:
+        client.upload_file(
+            Filename=str(local_path),
+            Bucket=bucket,
+            Key=s3_key,
+            Callback=progress,
+            Config=_default_transfer_config(),
+        )
+    except BaseException:
+        progress.abort()
+        raise
+    progress.finish()
+
+
+class _TransferProgress:
+    """boto3 ``Callback`` that renders an in-place transfer progress bar to stderr."""
 
     def __init__(self, total_bytes: int, label: str, *, width: int = 30) -> None:
         self._total = max(total_bytes, 1)

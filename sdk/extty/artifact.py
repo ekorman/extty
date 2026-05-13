@@ -14,6 +14,7 @@ from extty.s3 import (
     _default_boto_config,
     _download_with_progress,
     _format_bytes,
+    _upload_with_progress,
 )
 
 logger = logging.getLogger(__name__)
@@ -223,7 +224,13 @@ def save_artifact(
         size = path.stat().st_size
         files = [{"path": path.name, "size_bytes": size}]
         s3_key = f"{prefix}/{name}/data/{path.name}"
-        client.upload_file(str(path), config.bucket, s3_key)
+        _upload_with_progress(
+            client,
+            path,
+            config.bucket,
+            s3_key,
+            label=f"artifact {name} / {path.name}",
+        )
     else:
         content_type = "directory"
         entries = _walk_directory(path)
@@ -231,7 +238,13 @@ def save_artifact(
         size = sum(sz for _, sz in entries)
         for rel, _ in entries:
             s3_key = f"{prefix}/{name}/data/{rel}"
-            client.upload_file(str(path / rel), config.bucket, s3_key)
+            _upload_with_progress(
+                client,
+                path / rel,
+                config.bucket,
+                s3_key,
+                label=f"artifact {name} / {rel}",
+            )
 
     meta = ArtifactMeta(
         name=name,
