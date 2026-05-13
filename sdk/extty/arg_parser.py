@@ -1,8 +1,8 @@
 import argparse
 import inspect
-from dataclasses import MISSING, Field, fields
+from dataclasses import MISSING, Field, fields, is_dataclass
 from types import UnionType
-from typing import Callable, Literal, Sequence, Type, TypeVar, get_args, get_origin
+from typing import Any, Callable, Literal, Sequence, Type, TypeVar, get_args, get_origin
 
 T = TypeVar("T")
 
@@ -36,14 +36,37 @@ def _add_dataclass_to_parser_(
             parser.add_argument(arg_name, type=arg_type, required=f.default is MISSING)
 
 
+def _add_param_to_parser(parser: argparse.ArgumentParser, p: inspect.Parameter) -> None:
+    if is_dataclass(p.annotation):
+        _add_dataclass_to_parser_(parser, p.name, p.annotation)
+        return
+
+    arg_type = _arg_type(p.annotation)
+    arg_name = f"--{p.name.replace('_', '-')}"
+    has_default = p.default is not inspect.Parameter.empty
+
+    if arg_type is bool:
+        default = p.default if has_default else False
+        parser.add_argument(
+            arg_name, action=argparse.BooleanOptionalAction, default=default
+        )
+    else:
+        kwargs: dict[str, Any] = {"type": arg_type}
+        if has_default:
+            kwargs["default"] = p.default
+        else:
+            kwargs["required"] = True
+        parser.add_argument(arg_name, **kwargs)
+
+
 def create_subparser(
     name: str,
     subparsers: argparse._SubParsersAction,
-    dcs: Sequence[tuple[str, Type[T]]],
+    params: Sequence[inspect.Parameter],
 ):
     parser: argparse.ArgumentParser = subparsers.add_parser(name)
-    for name, dc in dcs:
-        _add_dataclass_to_parser_(parser, name, dc)
+    for p in params:
+        _add_param_to_parser(parser, p)
 
 
 def load_dc_from_arg_parser_args(name: str, dc: Type[T], args: argparse.Namespace) -> T:
@@ -69,8 +92,9 @@ def _build_parser(
     if not isinstance(experiments, list):
         sig = inspect.signature(experiments)
         parameters[None] = [p for p in sig.parameters.values()]
-        for name, dc in [(p.name, p.annotation) for p in parameters[None]]:
-            _add_dataclass_to_parser_(parser, name, dc)
+
+        for p in parameters[None]:
+            _add_param_to_parser(parser, p)
 
     else:
         subparsers = parser.add_subparsers(dest="env")
@@ -81,10 +105,16 @@ def _build_parser(
             create_subparser(
                 name=name,
                 subparsers=subparsers,
-                dcs=[(p.name, p.annotation) for p in parameters[name]],
+                params=parameters[name],
             )
 
     return parser, parameters
+
+
+def get_value(args: argparse.Namespace, p: inspect.Parameter) -> Any:
+    if is_dataclass(p.annotation):
+        return load_dc_from_arg_parser_args(p.name, p.annotation, args)
+    return getattr(args, p.name)
 
 
 def run_experiments_parser(experiments: Callable | list[tuple[str, Callable]]):
@@ -94,7 +124,7 @@ def run_experiments_parser(experiments: Callable | list[tuple[str, Callable]]):
     if not isinstance(experiments, list):
         kwargs = {}
         for p in parameters[None]:
-            kwargs[p.name] = load_dc_from_arg_parser_args(p.name, p.annotation, args)
+            kwargs[p.name] = get_value(args, p)
 
         return experiments(**kwargs)
 
@@ -102,7 +132,6 @@ def run_experiments_parser(experiments: Callable | list[tuple[str, Callable]]):
         if args.env == name:
             kwargs = {}
             for p in parameters[name]:
-                param_class = p.annotation
-                kwargs[p.name] = load_dc_from_arg_parser_args(p.name, param_class, args)
+                kwargs[p.name] = get_value(args, p)
 
             return fn(**kwargs)
