@@ -22,6 +22,7 @@ from extty._logger import (
     _RESET,
     _supports_color,
 )
+from extty.storage import sanitize_metric_name
 
 logger = logging.getLogger(__name__)
 
@@ -472,7 +473,7 @@ class S3Storage:
     def _upload_metrics(
         self, name: str, values: list[tuple[int, float, float]]
     ) -> None:
-        safe_name = name.replace("/", "_")
+        safe_name = sanitize_metric_name(name)
         key = self._s3_key("metrics", f"{safe_name}.csv")
 
         existing_data: set[tuple[int, float]] = set()
@@ -513,7 +514,7 @@ class S3Storage:
         )
 
     def _upload_examples(self, name: str, records: list[dict[str, Any]]) -> None:
-        safe_name = name.replace("/", "_")
+        safe_name = sanitize_metric_name(name)
         key = self._s3_key("examples", f"{safe_name}.jsonl")
 
         existing_data: set[tuple[int, float]] = set()
