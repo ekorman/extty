@@ -178,6 +178,9 @@ impl S3Client {
                 && let Ok(meta) = serde_json::from_slice::<MetaJson>(&content)
                 && meta.status.as_deref() == Some("completed")
             {
+                let _ = self
+                    .sync_checkpoints_index_if_newer(project, run, &run_dir)
+                    .await;
                 return Ok(false);
             }
         }
@@ -858,6 +861,55 @@ impl S3Client {
         }
 
         Ok(())
+    }
+
+    async fn sync_checkpoints_index_if_newer(
+        &self,
+        project: &str,
+        run: &str,
+        run_dir: &Path,
+    ) -> Result<bool> {
+        let key = self.s3_prefix(&format!("runs/{}/{}/checkpoints.json", project, run));
+        let local_path = run_dir.join("checkpoints.json");
+
+        let head = match self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                if format!("{:?}", e).contains("NotFound") {
+                    return Ok(false);
+                }
+                return Err(e.into());
+            }
+        };
+
+        if local_path.exists()
+            && let Some(remote_dt) = head.last_modified()
+            && let Ok(metadata) = fs::metadata(&local_path)
+            && let Ok(local_mtime) = metadata.modified()
+            && let Ok(local_dur) = local_mtime.duration_since(std::time::UNIX_EPOCH)
+            && remote_dt.secs() <= local_dur.as_secs() as i64
+        {
+            return Ok(false);
+        }
+
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(&key)
+            .send()
+            .await?;
+        let body = resp.body.collect().await?.into_bytes();
+        fs::create_dir_all(run_dir)?;
+        fs::write(&local_path, &body)?;
+        Ok(true)
     }
 
     pub async fn list_remote_checkpoint_steps(&self, project: &str, run: &str) -> Result<Vec<u64>> {
