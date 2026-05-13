@@ -318,6 +318,40 @@ def _list_artifacts_by_prefix(client, bucket: str, prefix: str) -> list[Artifact
     return artifacts
 
 
+def artifact_exists(
+    name: str,
+    *,
+    s3_config: S3Config | None = None,
+) -> bool:
+    """
+    Check whether an artifact exists in S3.
+
+    Parameters
+    ----------
+    name : str
+        Name of the artifact.
+    s3_config : S3Config, optional
+        S3 configuration. Loaded from environment if not provided.
+
+    Returns
+    -------
+    bool
+        True if the artifact's meta.json is present in S3, False otherwise.
+    """
+    config = _resolve_config(s3_config)
+    client = _build_client(config)
+    prefix = _artifacts_prefix(config)
+
+    try:
+        client.head_object(Bucket=config.bucket, Key=f"{prefix}/{name}/meta.json")
+        return True
+    except client.exceptions.ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+
 def get_artifact(
     name: str,
     *,

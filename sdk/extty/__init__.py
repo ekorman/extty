@@ -13,6 +13,7 @@ from extty._logger import log as logger
 from extty.arg_parser import run_experiments_parser
 from extty.artifact import (
     ArtifactMeta,
+    artifact_exists,
     delete_artifact,
     get_artifact,
     list_artifacts,
@@ -64,6 +65,7 @@ __all__ = [
     "list_artifacts",
     "load_artifact",
     "get_artifact",
+    "artifact_exists",
     "delete_artifact",
     "logger",
     "run_experiments_parser",
