@@ -132,6 +132,7 @@ class TestRunStorage:
             {"prompt": "Hello", "response": "Hi"},
             step=10,
         )
+        storage.flush()
 
         jsonl_path = temp_run_dir / "test-run" / "examples" / "val" / "example.jsonl"
         assert jsonl_path.exists()

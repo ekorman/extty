@@ -1,5 +1,6 @@
 """extty: Terminal-native ML experiment tracker."""
 
+import atexit
 import copy
 import dataclasses
 import functools
@@ -79,10 +80,30 @@ except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
 _active_run: Run | None = None
+_atexit_registered: bool = False
 
 
 def has_active_run() -> bool:
     return _active_run is not None
+
+
+def _atexit_finish_active_run() -> None:
+    """Best-effort flush of any still-active run when the interpreter exits.
+
+    Daemon writer threads in :class:`extty.async_sink.AsyncSink` are killed
+    without draining at interpreter shutdown, so this handler protects users
+    who forget to call :func:`extty.finish`.
+    """
+    global _active_run
+    run = _active_run
+    if run is None:
+        return
+    try:
+        run.finish()
+    except Exception:
+        _logger.exception("extty atexit handler failed while finishing run")
+    finally:
+        _active_run = None
 
 
 def _is_main_process(rank: int | None) -> bool:
@@ -131,9 +152,13 @@ def init(
     Run
         The initialized run object (or :class:`NoOpRun` on non-main processes).
     """
-    global _active_run
+    global _active_run, _atexit_registered
     if _active_run is not None:
         _active_run.finish()
+
+    if not _atexit_registered:
+        atexit.register(_atexit_finish_active_run)
+        _atexit_registered = True
 
     if _is_main_process(rank):
         _active_run = Run(
