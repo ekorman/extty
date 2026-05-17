@@ -186,3 +186,16 @@ class TestAtexitSafetyNet:
         extty._active_run = None
         extty._atexit_finish_active_run()
         assert extty._active_run is None
+
+    def test_atexit_registered_only_once_across_inits(self, tmp_path) -> None:
+        extty._atexit_registered = False
+        with (
+            mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"),
+            mock.patch("extty.atexit.register") as register_mock,
+        ):
+            extty.init("atexit-once", name="r1", system_metrics=False)
+            extty.init("atexit-once", name="r2", system_metrics=False)
+            extty.init("atexit-once", name="r3", system_metrics=False)
+            extty.finish()
+            assert register_mock.call_count == 1
+            assert extty._atexit_registered is True

@@ -10,6 +10,7 @@ from extty._logger import log as logger
 from extty._sink import StorageSink
 
 _HIGH_WATER_MARK = 100_000
+_STOP = object()
 
 
 class AsyncSink:
@@ -44,7 +45,6 @@ class AsyncSink:
     def __init__(self, inner: StorageSink, *, name: str = "extty-writer") -> None:
         self._inner = inner
         self._queue: queue.Queue[Any] = queue.Queue()
-        self._stop = object()
         self._high_water_warned = False
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
@@ -84,7 +84,7 @@ class AsyncSink:
         if not self._thread.is_alive():
             self._inner.close()
             return
-        self._queue.put(self._stop)
+        self._queue.put(_STOP)
         self._thread.join()
         self._inner.close()
 
@@ -102,7 +102,7 @@ class AsyncSink:
         while True:
             item = self._queue.get()
             try:
-                if item is self._stop:
+                if item is _STOP:
                     try:
                         self._inner.flush()
                     except Exception:
@@ -132,3 +132,5 @@ class AsyncSink:
         elif tag == "system":
             _, ram_u, ram_t, gpu_u, gpu_t, gpu_p = item
             self._inner.log_system(ram_u, ram_t, gpu_u, gpu_t, gpu_p)
+        else:
+            raise AssertionError(f"unknown AsyncSink dispatch tag: {tag!r}")

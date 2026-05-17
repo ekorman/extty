@@ -118,7 +118,12 @@ class MetaData:
 
 @dataclass
 class RunStorage:
-    """Handles all file I/O for a single run."""
+    """Handles all file I/O for a single run.
+
+    Not thread-safe: ``log_metric``, ``log_example``, ``log_system``, ``flush``,
+    and ``close`` mutate internal buffers without locking. In production these
+    are driven by a single :class:`extty.async_sink.AsyncSink` worker thread.
+    """
 
     run_dir: Path
     _readonly: bool = field(default=False, repr=False)

@@ -25,6 +25,11 @@ from extty.system_monitor import SystemMonitor
 __all__ = ["Run", "NoOpRun", "StorageSink", "MultiSink"]
 
 
+# ``StorageSink`` moved to :mod:`extty._sink` so the async wrapper can import it
+# without a cycle; it stays re-exported here for any caller importing
+# ``extty.run.StorageSink``.
+
+
 class MultiSink:
     """Dispatches storage operations to multiple sinks."""
 
@@ -231,11 +236,11 @@ class Run:
         with self._lock:
             if self._finished:
                 raise RuntimeError("Cannot log to a finished run.")
-            for name, value in metrics.items():
-                if hasattr(value, "to_dict"):
-                    self._storage.log_example(name, value.to_dict(), step)
-                else:
-                    self._storage.log_metric(name, float(value), step)
+        for name, value in metrics.items():
+            if hasattr(value, "to_dict"):
+                self._storage.log_example(name, value.to_dict(), step)
+            else:
+                self._storage.log_metric(name, float(value), step)
 
     def save_checkpoint(
         self,
@@ -359,6 +364,9 @@ class Run:
         Finish the run.
 
         Stops system monitoring, flushes all data, and marks run complete.
+        Safe to call twice — the second call short-circuits, which is what
+        keeps the :mod:`extty` atexit handler from double-finishing a run
+        that the user has already closed.
         """
         with self._lock:
             if self._finished:

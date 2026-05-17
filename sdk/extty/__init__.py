@@ -156,11 +156,10 @@ def init(
     if _active_run is not None:
         _active_run.finish()
 
-    if not _atexit_registered:
-        atexit.register(_atexit_finish_active_run)
-        _atexit_registered = True
-
     if _is_main_process(rank):
+        if not _atexit_registered:
+            atexit.register(_atexit_finish_active_run)
+            _atexit_registered = True
         _active_run = Run(
             project,
             name=name,
