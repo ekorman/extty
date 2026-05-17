@@ -9,8 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from extty._sink import StorageSink
 from extty.artifact import ArtifactMeta
 from extty.artifact import save_artifact as _save_artifact
+from extty.async_sink import AsyncSink
 from extty.s3 import S3Config, S3Storage
 from extty.storage import (
     MetaData,
@@ -20,31 +22,19 @@ from extty.storage import (
 )
 from extty.system_monitor import SystemMonitor
 
+__all__ = ["Run", "NoOpRun", "StorageSink", "MultiSink"]
 
-class StorageSink(Protocol):
-    def log_metric(self, name: str, value: float, step: int) -> None: ...
 
-    def log_example(self, name: str, data: dict[str, Any], step: int) -> None: ...
-
-    def log_system(
-        self,
-        ram_used_gb: float,
-        ram_total_gb: float,
-        gpu_mem_used_gb: float | None = None,
-        gpu_mem_total_gb: float | None = None,
-        gpu_util_pct: float | None = None,
-    ) -> None: ...
-
-    def flush(self) -> None: ...
-
-    def close(self) -> None: ...
+# ``StorageSink`` moved to :mod:`extty._sink` so the async wrapper can import it
+# without a cycle; it stays re-exported here for any caller importing
+# ``extty.run.StorageSink``.
 
 
 class MultiSink:
     """Dispatches storage operations to multiple sinks."""
 
     def __init__(
-        self, primary: StorageSink, secondary: S3Storage | None = None
+        self, primary: StorageSink, secondary: StorageSink | None = None
     ) -> None:
         self._primary = primary
         self._secondary = secondary
@@ -190,7 +180,7 @@ class Run:
         project_dir = project if project else "_default"
         run_dir = get_runs_dir() / project_dir / self.name
         local_storage = RunStorage(run_dir=run_dir)
-        primary_storage: StorageSink = local_storage
+        self._local_storage = local_storage
         self._meta = MetaData(
             project=project,
             run_name=self.name,
@@ -202,7 +192,15 @@ class Run:
         if self._s3_storage and self._meta:
             self._s3_storage.write_meta(self._meta.to_dict())
 
-        self._storage = MultiSink(primary_storage, self._s3_storage)
+        primary_storage: StorageSink = AsyncSink(
+            local_storage, name="extty-writer-local"
+        )
+        secondary: StorageSink | None = (
+            AsyncSink(self._s3_storage, name="extty-writer-s3")
+            if self._s3_storage is not None
+            else None
+        )
+        self._storage = MultiSink(primary_storage, secondary)
 
         self._system_monitor: SystemMonitor | None = None
         if system_metrics:
@@ -238,11 +236,11 @@ class Run:
         with self._lock:
             if self._finished:
                 raise RuntimeError("Cannot log to a finished run.")
-            for name, value in metrics.items():
-                if hasattr(value, "to_dict"):
-                    self._storage.log_example(name, value.to_dict(), step)
-                else:
-                    self._storage.log_metric(name, float(value), step)
+        for name, value in metrics.items():
+            if hasattr(value, "to_dict"):
+                self._storage.log_example(name, value.to_dict(), step)
+            else:
+                self._storage.log_metric(name, float(value), step)
 
     def save_checkpoint(
         self,
@@ -366,6 +364,9 @@ class Run:
         Finish the run.
 
         Stops system monitoring, flushes all data, and marks run complete.
+        Safe to call twice — the second call short-circuits, which is what
+        keeps the :mod:`extty` atexit handler from double-finishing a run
+        that the user has already closed.
         """
         with self._lock:
             if self._finished:
@@ -381,15 +382,9 @@ class Run:
         if self._meta is not None:
             self._meta.finished_at = datetime.now(timezone.utc).isoformat()
             self._meta.status = "completed"
-            primary = (
-                self._storage._primary
-                if isinstance(self._storage, MultiSink)
-                else self._storage
-            )
-            if isinstance(primary, RunStorage):
-                primary.write_meta(self._meta)
-            if isinstance(primary, FinishableStorage):
-                primary.finish(self._meta.finished_at, self._meta.status)
+            self._local_storage.write_meta(self._meta)
+            if isinstance(self._local_storage, FinishableStorage):
+                self._local_storage.finish(self._meta.finished_at, self._meta.status)
             if self._s3_storage:
                 self._s3_storage.write_meta(self._meta.to_dict())
 
@@ -404,14 +399,7 @@ class Run:
     @property
     def run_dir(self) -> str:
         """Return the path to this run's directory."""
-        primary = (
-            self._storage._primary
-            if isinstance(self._storage, MultiSink)
-            else self._storage
-        )
-        if isinstance(primary, RunStorage):
-            return str(primary.run_dir)
-        return ""
+        return str(self._local_storage.run_dir)
 
 
 class NoOpRun(Run):

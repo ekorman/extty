@@ -118,7 +118,12 @@ class MetaData:
 
 @dataclass
 class RunStorage:
-    """Handles all file I/O for a single run."""
+    """Handles all file I/O for a single run.
+
+    Not thread-safe: ``log_metric``, ``log_example``, ``log_system``, ``flush``,
+    and ``close`` mutate internal buffers without locking. In production these
+    are driven by a single :class:`extty.async_sink.AsyncSink` worker thread.
+    """
 
     run_dir: Path
     _readonly: bool = field(default=False, repr=False)
@@ -127,7 +132,10 @@ class RunStorage:
     _buffer: list[tuple[str, int, float, float]] = field(
         default_factory=list, repr=False
     )
-    _buffer_size: int = 10
+    _example_buffer: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
+    _buffer_size: int = 200
     _last_flush: float = field(default_factory=time.time, repr=False)
     _flush_interval: float = 1.0
 
@@ -160,29 +168,39 @@ class RunStorage:
         """Buffer a metric value for later writing."""
         timestamp = time.time()
         self._buffer.append((name, step, timestamp, value))
+        self._maybe_flush()
 
+    def _maybe_flush(self) -> None:
+        """Flush if the combined buffer is full or the flush interval has elapsed."""
+        total = len(self._buffer) + sum(len(v) for v in self._example_buffer.values())
+        if total == 0:
+            return
         should_flush = (
-            len(self._buffer) >= self._buffer_size
+            total >= self._buffer_size
             or (time.time() - self._last_flush) >= self._flush_interval
         )
         if should_flush:
             self.flush()
 
     def flush(self) -> None:
-        """Flush all buffered metrics to disk."""
-        if not self._buffer:
-            return
+        """Flush all buffered metrics and examples to disk."""
+        if self._buffer:
+            metrics_by_name: dict[str, list[tuple[int, float, float]]] = {}
+            for name, step, timestamp, value in self._buffer:
+                if name not in metrics_by_name:
+                    metrics_by_name[name] = []
+                metrics_by_name[name].append((step, timestamp, value))
 
-        metrics_by_name: dict[str, list[tuple[int, float, float]]] = {}
-        for name, step, timestamp, value in self._buffer:
-            if name not in metrics_by_name:
-                metrics_by_name[name] = []
-            metrics_by_name[name].append((step, timestamp, value))
+            for name, values in metrics_by_name.items():
+                self._write_metric_batch(name, values)
 
-        for name, values in metrics_by_name.items():
-            self._write_metric_batch(name, values)
+            self._buffer.clear()
 
-        self._buffer.clear()
+        if self._example_buffer:
+            for name, records in self._example_buffer.items():
+                self._write_example_batch(name, records)
+            self._example_buffer.clear()
+
         self._last_flush = time.time()
 
     def _write_metric_batch(
@@ -199,6 +217,16 @@ class RunStorage:
                 f.write("step,timestamp,value\n")
             for step, timestamp, value in values:
                 f.write(f"{step},{timestamp:.6f},{value}\n")
+
+    def _write_example_batch(self, name: str, records: list[dict[str, Any]]) -> None:
+        """Write a batch of example records to the JSONL file."""
+        relative_path = sanitize_metric_name(name) + ".jsonl"
+        filepath = self.run_dir / "examples" / relative_path
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(filepath, "a") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
 
     def log_system(
         self,
@@ -232,19 +260,16 @@ class RunStorage:
             )
 
     def log_example(self, name: str, data: dict[str, Any], step: int) -> None:
-        """Log a structured example payload to a JSONL file."""
-        timestamp = time.time()
-        relative_path = sanitize_metric_name(name) + ".jsonl"
-        filepath = self.run_dir / "examples" / relative_path
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-
+        """Buffer a structured example payload for later writing."""
         record = {
             "step": step,
-            "timestamp": timestamp,
+            "timestamp": time.time(),
             "data": data,
         }
-        with open(filepath, "a") as f:
-            f.write(json.dumps(record) + "\n")
+        if name not in self._example_buffer:
+            self._example_buffer[name] = []
+        self._example_buffer[name].append(record)
+        self._maybe_flush()
 
     def close(self) -> None:
         """Flush remaining data and close any open file handles."""
