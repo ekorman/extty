@@ -22,6 +22,7 @@ from extty._logger import (
     _RESET,
     _supports_color,
 )
+from extty.confusion import ConfusionMatrix
 from extty.storage import sanitize_metric_name
 
 logger = logging.getLogger(__name__)
@@ -321,6 +322,9 @@ class S3Storage:
     _example_buffer: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict, repr=False
     )
+    _confusion_buffer: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
     _system_buffer: list[
         tuple[float, float, float, float | None, float | None, float | None]
     ] = field(default_factory=list, repr=False)
@@ -376,6 +380,21 @@ class S3Storage:
             if name not in self._example_buffer:
                 self._example_buffer[name] = []
             self._example_buffer[name].append(record)
+            self._buffer_count += 1
+            self._maybe_flush()
+
+    def log_confusion_matrix(self, name: str, cm: ConfusionMatrix, step: int) -> None:
+        timestamp = time.time()
+        record = {
+            "step": step,
+            "timestamp": timestamp,
+            "labels": cm.labels,
+            "matrix": cm.matrix,
+        }
+        with self._lock:
+            if name not in self._confusion_buffer:
+                self._confusion_buffer[name] = []
+            self._confusion_buffer[name].append(record)
             self._buffer_count += 1
             self._maybe_flush()
 
@@ -450,6 +469,21 @@ class S3Storage:
         self._example_buffer.clear()
         self._example_buffer.update(failed_examples)
 
+        failed_confusion: dict[str, list[dict[str, Any]]] = {}
+        for name, records in self._confusion_buffer.items():
+            try:
+                self._upload_confusion(name, records)
+            except _S3_ERRORS:
+                logger.warning(
+                    "Failed to upload confusion matrix '%s' to S3",
+                    name,
+                    exc_info=True,
+                )
+                failed_confusion[name] = records
+                had_failure = True
+        self._confusion_buffer.clear()
+        self._confusion_buffer.update(failed_confusion)
+
         if self._system_buffer:
             try:
                 self._upload_system(self._system_buffer)
@@ -466,6 +500,7 @@ class S3Storage:
         self._buffer_count = (
             sum(len(v) for v in self._metric_buffer.values())
             + sum(len(v) for v in self._example_buffer.values())
+            + sum(len(v) for v in self._confusion_buffer.values())
             + len(self._system_buffer)
         )
         self._last_flush = time.time()
@@ -546,6 +581,45 @@ class S3Storage:
             output += "\n"
 
         key = self._s3_key("examples", f"{safe_name}.jsonl")
+        self._client.put_object(
+            Bucket=self.config.bucket,
+            Key=key,
+            Body=output.encode("utf-8"),
+            ContentType="application/x-ndjson",
+        )
+
+    def _upload_confusion(self, name: str, records: list[dict[str, Any]]) -> None:
+        safe_name = sanitize_metric_name(name)
+        key = self._s3_key("confusion_matrices", f"{safe_name}.jsonl")
+
+        existing_data: set[tuple[int, float]] = set()
+        existing_records: list[dict[str, Any]] = []
+
+        try:
+            response = self._client.get_object(Bucket=self.config.bucket, Key=key)
+            content = response["Body"].read().decode("utf-8")
+            for line in content.strip().split("\n"):
+                if line:
+                    record = json.loads(line)
+                    existing_data.add((record["step"], record["timestamp"]))
+                    existing_records.append(record)
+        except self._client.exceptions.NoSuchKey:
+            pass
+        except Exception:
+            pass
+
+        for record in records:
+            key_tuple = (record["step"], record["timestamp"])
+            if key_tuple not in existing_data:
+                existing_data.add(key_tuple)
+                existing_records.append(record)
+
+        existing_records.sort(key=lambda x: (x["step"], x["timestamp"]))
+
+        output = "\n".join(json.dumps(r) for r in existing_records)
+        if output:
+            output += "\n"
+
         self._client.put_object(
             Bucket=self.config.bucket,
             Key=key,

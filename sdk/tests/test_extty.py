@@ -77,6 +77,7 @@ class TestRunStorage:
         assert (temp_run_dir / "test-run").exists()
         assert (temp_run_dir / "test-run" / "metrics").exists()
         assert (temp_run_dir / "test-run" / "examples").exists()
+        assert (temp_run_dir / "test-run" / "confusion_matrices").exists()
 
     def test_write_and_read_meta(self, temp_run_dir: Path) -> None:
         storage = RunStorage(run_dir=temp_run_dir / "test-run")
@@ -140,6 +141,44 @@ class TestRunStorage:
         assert len(lines) == 1
         assert '"prompt": "Hello"' in lines[0]
 
+    def test_log_confusion_matrix_creates_jsonl(self, temp_run_dir: Path) -> None:
+        storage = RunStorage(run_dir=temp_run_dir / "test-run")
+        storage.log_confusion_matrix(
+            "eval/cm",
+            extty.ConfusionMatrix(matrix=[[5, 1], [0, 6]], labels=["a", "b"]),
+            step=10,
+        )
+        storage.flush()
+
+        jsonl_path = (
+            temp_run_dir / "test-run" / "confusion_matrices" / "eval" / "cm.jsonl"
+        )
+        assert jsonl_path.exists()
+        lines = jsonl_path.read_text().strip().split("\n")
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["step"] == 10
+        assert record["labels"] == ["a", "b"]
+        assert record["matrix"] == [[5, 1], [0, 6]]
+
+    def test_read_confusion_matrix_roundtrip(self, temp_run_dir: Path) -> None:
+        storage = RunStorage(run_dir=temp_run_dir / "test-run")
+        for step in range(3):
+            storage.log_confusion_matrix(
+                "eval/cm",
+                extty.ConfusionMatrix(
+                    matrix=[[step, 1], [0, step + 1]], labels=["a", "b"]
+                ),
+                step=step,
+            )
+        storage.flush()
+
+        records = storage.read_confusion_matrix("eval/cm")
+        assert [r.step for r in records] == [0, 1, 2]
+        assert records[2].matrix == [[2, 1], [0, 3]]
+        assert records[0].labels == ["a", "b"]
+        assert "eval/cm" in storage.list_confusion_matrix_names()
+
 
 class TestExttyAPI:
     def test_init_creates_run(self, tmp_path: Path) -> None:
@@ -190,6 +229,33 @@ class TestExttyAPI:
             assert example_path.exists()
             content = example_path.read_text()
             assert '"Paris"' in content
+
+    def test_log_confusion_matrix(self, tmp_path: Path) -> None:
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="cm-test", system_metrics=False)
+            extty.log(
+                {
+                    "eval/cm": extty.ConfusionMatrix(
+                        matrix=[[5, 1], [0, 6]], labels=["a", "b"]
+                    )
+                },
+                step=0,
+            )
+            extty.finish()
+
+        cm_path = (
+            tmp_path
+            / "runs"
+            / "test-project"
+            / "cm-test"
+            / "confusion_matrices"
+            / "eval"
+            / "cm.jsonl"
+        )
+        assert cm_path.exists()
+        record = json.loads(cm_path.read_text().strip())
+        assert record["labels"] == ["a", "b"]
+        assert record["matrix"] == [[5, 1], [0, 6]]
 
     def test_context_manager(self, tmp_path: Path) -> None:
         import json
@@ -254,6 +320,36 @@ class TestInstanceId:
             )
             meta = json.loads(meta_path.read_text())
             assert "_instance_id" not in meta["config"]
+
+
+class TestConfusionMatrix:
+    """Tests for ConfusionMatrix construction and validation."""
+
+    def test_basic(self) -> None:
+        cm = extty.ConfusionMatrix(matrix=[[5, 1], [0, 6]], labels=["a", "b"])
+        assert cm.matrix == [[5, 1], [0, 6]]
+        assert cm.labels == ["a", "b"]
+
+    def test_row_count_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match="matrix rows"):
+            extty.ConfusionMatrix(matrix=[[1, 0]], labels=["a", "b"])
+
+    def test_row_length_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match="matrix row"):
+            extty.ConfusionMatrix(matrix=[[1, 0, 0], [0, 1, 0]], labels=["a", "b"])
+
+    def test_from_array_with_tolist(self) -> None:
+        class Fake:
+            def tolist(self) -> list[list[int]]:
+                return [[1, 2], [3, 4]]
+
+        cm = extty.ConfusionMatrix.from_array(Fake(), ["x", "y"])
+        assert cm.matrix == [[1, 2], [3, 4]]
+        assert cm.labels == ["x", "y"]
+
+    def test_from_array_with_plain_list(self) -> None:
+        cm = extty.ConfusionMatrix.from_array([[0, 1], [2, 3]], ["a", "b"])
+        assert cm.matrix == [[0, 1], [2, 3]]
 
 
 class TestExampleRewards:

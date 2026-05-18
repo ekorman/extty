@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+from extty.confusion import ConfusionMatrix
+
 
 @runtime_checkable
 class StorageSink(Protocol):
     def log_metric(self, name: str, value: float, step: int) -> None: ...
 
     def log_example(self, name: str, data: dict[str, Any], step: int) -> None: ...
+
+    def log_confusion_matrix(
+        self, name: str, cm: ConfusionMatrix, step: int
+    ) -> None: ...
 
     def log_system(
         self,

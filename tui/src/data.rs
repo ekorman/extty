@@ -101,6 +101,30 @@ impl ExampleGroup {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConfusionMatrixPoint {
+    pub step: u64,
+    #[allow(dead_code)]
+    pub timestamp: f64,
+    pub labels: Vec<String>,
+    pub matrix: Vec<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConfusionMatrixSeries {
+    pub points: Vec<ConfusionMatrixPoint>,
+}
+
+impl ConfusionMatrixSeries {
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&ConfusionMatrixPoint> {
+        self.points.get(idx)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CheckpointFile {
     pub name: String,
     pub size_bytes: Option<u64>,
@@ -157,6 +181,7 @@ pub struct Run {
     pub path: PathBuf,
     pub metrics: HashMap<String, Vec<MetricPoint>>,
     pub examples: HashMap<String, ExampleGroup>,
+    pub confusion_matrices: HashMap<String, ConfusionMatrixSeries>,
     pub start_time: Option<DateTime<Local>>,
     pub end_time: Option<DateTime<Local>>,
     pub status: RunStatus,
@@ -284,6 +309,7 @@ fn load_run_lightweight(path: &Path) -> Option<Run> {
         path: path.to_path_buf(),
         metrics: HashMap::new(),
         examples: HashMap::new(),
+        confusion_matrices: HashMap::new(),
         start_time,
         end_time,
         status,
@@ -364,6 +390,7 @@ fn load_run(path: &Path) -> Option<Run> {
     let mut metrics = load_metrics(path);
     metrics.extend(load_system_metrics(path));
     let examples = load_examples(path);
+    let confusion_matrices = load_confusion_matrices(path);
     let checkpoints = load_checkpoints(path);
 
     let (project, start_time, end_time, status, config) = load_run_meta(path);
@@ -374,6 +401,7 @@ fn load_run(path: &Path) -> Option<Run> {
         path: path.to_path_buf(),
         metrics,
         examples,
+        confusion_matrices,
         start_time,
         end_time,
         status,
@@ -1144,6 +1172,71 @@ fn build_example_index(
     Ok((metas, reward_total, reward_count, last_example))
 }
 
+#[derive(Debug, Deserialize)]
+struct ConfusionMatrixRow {
+    step: u64,
+    timestamp: f64,
+    labels: Vec<String>,
+    matrix: Vec<Vec<u64>>,
+}
+
+fn load_confusion_matrices(run_path: &Path) -> HashMap<String, ConfusionMatrixSeries> {
+    let mut series: HashMap<String, ConfusionMatrixSeries> = HashMap::new();
+    let cm_dir = run_path.join("confusion_matrices");
+
+    if !cm_dir.exists() {
+        return series;
+    }
+
+    load_confusion_matrices_recursive(&cm_dir, &cm_dir, &mut series);
+
+    for s in series.values_mut() {
+        s.points.sort_by_key(|p| p.step);
+    }
+    series
+}
+
+fn load_confusion_matrices_recursive(
+    base_dir: &Path,
+    current_dir: &Path,
+    series: &mut HashMap<String, ConfusionMatrixSeries>,
+) {
+    let Ok(entries) = fs::read_dir(current_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            load_confusion_matrices_recursive(base_dir, &path, series);
+        } else if path.extension().map(|e| e == "jsonl").unwrap_or(false)
+            && let Ok(relative) = path.strip_prefix(base_dir)
+        {
+            let name = relative.with_extension("").to_string_lossy().to_string();
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let reader = BufReader::new(file);
+            let entry = series.entry(name).or_default();
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(row) = serde_json::from_str::<ConfusionMatrixRow>(&line) else {
+                    continue;
+                };
+                entry.points.push(ConfusionMatrixPoint {
+                    step: row.step,
+                    timestamp: row.timestamp,
+                    labels: row.labels,
+                    matrix: row.matrix,
+                });
+            }
+        }
+    }
+}
+
 fn starred_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1339,4 +1432,38 @@ pub fn load_artifacts_from_cache() -> Vec<Artifact> {
 
     artifacts.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     artifacts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_confusion_matrices_reads_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let run_path = tmp.path();
+        let cm_dir = run_path.join("confusion_matrices").join("eval");
+        fs::create_dir_all(&cm_dir).unwrap();
+        let jsonl = "\
+{\"step\":0,\"timestamp\":1.0,\"labels\":[\"a\",\"b\"],\"matrix\":[[1,2],[3,4]]}
+{\"step\":1,\"timestamp\":2.0,\"labels\":[\"a\",\"b\"],\"matrix\":[[5,0],[0,5]]}
+";
+        fs::write(cm_dir.join("cm.jsonl"), jsonl).unwrap();
+
+        let series = load_confusion_matrices(run_path);
+        let s = series.get("eval/cm").expect("eval/cm loaded");
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.get(0).unwrap().step, 0);
+        assert_eq!(s.get(0).unwrap().labels, vec!["a", "b"]);
+        assert_eq!(s.get(1).unwrap().matrix, vec![vec![5, 0], vec![0, 5]]);
+    }
+
+    #[test]
+    fn load_confusion_matrices_missing_dir_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let series = load_confusion_matrices(tmp.path());
+        assert!(series.is_empty());
+    }
 }

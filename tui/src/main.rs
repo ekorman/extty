@@ -42,10 +42,10 @@ mod prune;
 mod run;
 mod s3;
 use data::{
-    Artifact, Checkpoint, Example, ExampleGroup, MetricPoint, Reward, Run, artifacts_dir,
-    load_archived_projects, load_artifacts_from_cache, load_run_notes, load_runs_lightweight,
-    load_starred_runs, mark_run_completed, save_archived_projects, save_run_notes,
-    save_starred_runs,
+    Artifact, Checkpoint, ConfusionMatrixPoint, Example, ExampleGroup, MetricPoint, Reward, Run,
+    artifacts_dir, load_archived_projects, load_artifacts_from_cache, load_run_notes,
+    load_runs_lightweight, load_starred_runs, mark_run_completed, save_archived_projects,
+    save_run_notes, save_starred_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, ScriptOptions,
@@ -157,6 +157,7 @@ enum FilterPhase {
 enum Card {
     Chart { name: String },
     Examples { name: String },
+    ConfusionMatrix { name: String },
     Checkpoints,
     Artifacts,
 }
@@ -291,6 +292,7 @@ struct App {
     pending_delete_checkpoint: bool,
     help_overlay_open: bool,
     help_overlay_scroll: u16,
+    confusion_step_idx: HashMap<String, usize>,
 }
 
 impl App {
@@ -407,6 +409,7 @@ impl App {
             pending_delete_checkpoint: false,
             help_overlay_open: false,
             help_overlay_scroll: 0,
+            confusion_step_idx: HashMap::new(),
         }
     }
 
@@ -510,6 +513,7 @@ impl App {
                 if old_run.data_loaded {
                     new_run.metrics = old_run.metrics;
                     new_run.examples = old_run.examples;
+                    new_run.confusion_matrices = old_run.confusion_matrices;
                     new_run.checkpoints = old_run.checkpoints;
                     new_run.data_loaded = true;
                     new_run.data_loaded_at = old_run.data_loaded_at;
@@ -1752,6 +1756,12 @@ impl App {
                 cards.push(Card::Examples { name: name.clone() });
             }
 
+            let mut cm_names: Vec<&String> = run.confusion_matrices.keys().collect();
+            cm_names.sort();
+            for name in cm_names {
+                cards.push(Card::ConfusionMatrix { name: name.clone() });
+            }
+
             if !run.checkpoints.is_empty() {
                 cards.push(Card::Checkpoints);
             }
@@ -1829,7 +1839,11 @@ impl App {
         } else {
             1
         };
-        run.metrics.len() + run.examples.len() + has_checkpoints + has_artifacts
+        run.metrics.len()
+            + run.examples.len()
+            + run.confusion_matrices.len()
+            + has_checkpoints
+            + has_artifacts
     }
 
     fn get_or_load_example(&mut self, name: &str, idx: usize) -> Option<&Example> {
@@ -3058,6 +3072,14 @@ impl App {
             _ => 0,
         };
 
+        let confusion_state = match current_card {
+            Some(Card::ConfusionMatrix { name }) => self
+                .current_run()
+                .and_then(|r| r.confusion_matrices.get(name))
+                .map(|s| (name.clone(), s.len())),
+            _ => None,
+        };
+
         let prompt_count = match current_card {
             Some(Card::Examples { name }) if self.compare_focused => {
                 let steps = self.compare_example_steps(name);
@@ -3274,6 +3296,49 @@ impl App {
             KeyCode::Char('D') if checkpoint_count > 0 => {
                 self.pending_delete_checkpoint = true;
                 self.show_delete_confirm = true;
+            }
+            // Confusion matrix step scrubbing
+            KeyCode::Up if confusion_state.is_some() => {
+                if let Some((name, len)) = confusion_state.clone() {
+                    let cur = self
+                        .confusion_step_idx
+                        .get(&name)
+                        .copied()
+                        .unwrap_or_else(|| len.saturating_sub(1));
+                    let step = if modifiers.contains(KeyModifiers::SHIFT) {
+                        10
+                    } else {
+                        1
+                    };
+                    self.confusion_step_idx
+                        .insert(name, cur.saturating_sub(step));
+                }
+            }
+            KeyCode::Down if confusion_state.is_some() => {
+                if let Some((name, len)) = confusion_state.clone() {
+                    let cur = self
+                        .confusion_step_idx
+                        .get(&name)
+                        .copied()
+                        .unwrap_or_else(|| len.saturating_sub(1));
+                    let step = if modifiers.contains(KeyModifiers::SHIFT) {
+                        10
+                    } else {
+                        1
+                    };
+                    let next = (cur + step).min(len.saturating_sub(1));
+                    self.confusion_step_idx.insert(name, next);
+                }
+            }
+            KeyCode::Home if confusion_state.is_some() => {
+                if let Some((name, _)) = confusion_state.clone() {
+                    self.confusion_step_idx.insert(name, 0);
+                }
+            }
+            KeyCode::End if confusion_state.is_some() => {
+                if let Some((name, len)) = confusion_state.clone() {
+                    self.confusion_step_idx.insert(name, len.saturating_sub(1));
+                }
             }
             // Shift+Up/Down jump 10 examples at a time
             KeyCode::Up if example_count > 0 && modifiers.contains(KeyModifiers::SHIFT) => {
@@ -5220,6 +5285,18 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                     render_examples_card(frame, card_area, name, examples, is_selected);
                 }
             }
+            Card::ConfusionMatrix { name } => {
+                if let Some(series) = run.confusion_matrices.get(name) {
+                    let idx = app
+                        .confusion_step_idx
+                        .get(name)
+                        .copied()
+                        .unwrap_or_else(|| series.len().saturating_sub(1));
+                    if let Some(point) = series.get(idx) {
+                        render_confusion_matrix_card(frame, card_area, name, point, is_selected);
+                    }
+                }
+            }
             Card::Checkpoints => {
                 render_checkpoints_card(
                     frame,
@@ -6783,6 +6860,212 @@ fn render_checkpoints_card(
     frame.render_widget(paragraph, area);
 }
 
+fn cm_cell_color(t: f64) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let r = ((1.0 - t) * 0.0) as u8;
+    let g = ((1.0 - t) * 40.0 + t * 255.0) as u8;
+    let b = ((1.0 - t) * 60.0 + t * 136.0) as u8;
+    Color::Rgb(r, g, b)
+}
+
+fn render_confusion_matrix_card(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    point: &ConfusionMatrixPoint,
+    selected: bool,
+) {
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    let title = Line::from(vec![
+        Span::styled(format!(" {} ", name), title_style),
+        Span::styled(
+            format!("@ step {} ", point.step),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let n = point.matrix.len();
+    if n == 0 || inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let max_val = point
+        .matrix
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1) as f64;
+
+    let cell_w = ((inner.width as usize) / n).clamp(1, 4) as u16;
+    let cell_h = ((inner.height as usize) / n).clamp(1, 2) as u16;
+
+    let grid_w = cell_w * n as u16;
+    let grid_h = cell_h * n as u16;
+    let x0 = inner.x + (inner.width.saturating_sub(grid_w)) / 2;
+    let y0 = inner.y + (inner.height.saturating_sub(grid_h)) / 2;
+
+    let block_str: String = "█".repeat(cell_w as usize);
+
+    for i in 0..n {
+        for j in 0..n {
+            let v = point.matrix[i][j] as f64;
+            let t = v / max_val;
+            let color = cm_cell_color(t);
+            let style = Style::default().fg(color);
+            for dy in 0..cell_h {
+                let y = y0 + (i as u16) * cell_h + dy;
+                let x = x0 + (j as u16) * cell_w;
+                if y >= inner.bottom() || x >= inner.right() {
+                    continue;
+                }
+                let line_area = Rect::new(x, y, cell_w.min(inner.right() - x), 1);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(block_str.clone(), style))),
+                    line_area,
+                );
+            }
+        }
+    }
+}
+
+fn render_focused_confusion_matrix(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    point: &ConfusionMatrixPoint,
+    step_idx: usize,
+    total_steps: usize,
+) {
+    let title = Line::from(vec![
+        Span::styled(format!(" {} ", name), Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(
+            format!("step {}  [{}/{}] ", point.step, step_idx + 1, total_steps),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(NEON_CYAN));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let n = point.matrix.len();
+    if n == 0 || inner.width < 6 || inner.height < 4 {
+        return;
+    }
+
+    let max_label_len = point
+        .labels
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(12);
+
+    let max_val = point.matrix.iter().flatten().copied().max().unwrap_or(0);
+    let cell_text_w = max_val.to_string().len().max(3) + 1;
+
+    let row_label_w = (max_label_len + 2) as u16;
+    let header_h: u16 = 2;
+
+    let available_w = inner.width.saturating_sub(row_label_w);
+    let available_h = inner.height.saturating_sub(header_h);
+
+    let cell_w = (available_w as usize / n).clamp(cell_text_w, cell_text_w.max(10)) as u16;
+    let cell_h = (available_h as usize / n).clamp(1, 3) as u16;
+    if cell_w == 0 || cell_h == 0 {
+        return;
+    }
+
+    let grid_x = inner.x + row_label_w;
+    let grid_y = inner.y + header_h;
+
+    for (j, label) in point.labels.iter().enumerate().take(n) {
+        let x = grid_x + (j as u16) * cell_w;
+        if x >= inner.right() {
+            break;
+        }
+        let width = cell_w.min(inner.right() - x);
+        let truncated: String = label.chars().take(cell_w as usize).collect();
+        let centered = format!("{:^w$}", truncated, w = cell_w as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                centered,
+                Style::default().fg(NEON_MAGENTA),
+            ))),
+            Rect::new(x, inner.y, width, 1),
+        );
+    }
+
+    let max_val_f = (max_val as f64).max(1.0);
+    for i in 0..n {
+        let row_y = grid_y + (i as u16) * cell_h;
+        if row_y >= inner.bottom() {
+            break;
+        }
+        let label = point.labels.get(i).map(String::as_str).unwrap_or("");
+        let truncated: String = label.chars().take(max_label_len).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{:>w$} ", truncated, w = max_label_len),
+                Style::default().fg(NEON_MAGENTA),
+            ))),
+            Rect::new(inner.x, row_y + cell_h / 2, row_label_w, 1),
+        );
+
+        for j in 0..n {
+            let x = grid_x + (j as u16) * cell_w;
+            if x >= inner.right() {
+                break;
+            }
+            let width = cell_w.min(inner.right() - x);
+            let v = point.matrix[i][j];
+            let t = v as f64 / max_val_f;
+            let bg = cm_cell_color(t);
+            let fg = if t > 0.55 { Color::Black } else { Color::White };
+            let text = format!("{:^w$}", v, w = cell_w as usize);
+            let style = Style::default().fg(fg).bg(bg);
+            let mid = row_y + cell_h / 2;
+            for dy in 0..cell_h {
+                let y = row_y + dy;
+                if y >= inner.bottom() {
+                    break;
+                }
+                let line_text = if y == mid {
+                    text.clone()
+                } else {
+                    " ".repeat(cell_w as usize)
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(line_text, style))),
+                    Rect::new(x, y, width, 1),
+                );
+            }
+        }
+    }
+}
+
 fn render_focused_checkpoints(
     frame: &mut Frame,
     area: Rect,
@@ -7353,6 +7636,49 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                     Span::styled("] help", Style::default().fg(Color::DarkGray)),
                 ]);
                 let footer = Line::from(footer_spans);
+                frame.render_widget(Paragraph::new(footer), chunks[1]);
+            }
+        }
+        Card::ConfusionMatrix { name } => {
+            if let Some(series) = run.confusion_matrices.get(name) {
+                let idx = app
+                    .confusion_step_idx
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| series.len().saturating_sub(1));
+                let idx = idx.min(series.len().saturating_sub(1));
+                if let Some(point) = series.get(idx) {
+                    render_focused_confusion_matrix(
+                        frame,
+                        chunks[0],
+                        name,
+                        point,
+                        idx,
+                        series.len(),
+                    );
+                }
+                let footer = Line::from(vec![
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+                    Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}  ", app.selected_card + 1, cards.len()),
+                        Style::default().fg(NEON_GREEN),
+                    ),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] step ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}  ", idx + 1, series.len()),
+                        Style::default().fg(NEON_YELLOW),
+                    ),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("?", Style::default().fg(NEON_YELLOW)),
+                    Span::styled("] help", Style::default().fg(Color::DarkGray)),
+                ]);
                 frame.render_widget(Paragraph::new(footer), chunks[1]);
             }
         }
@@ -9851,4 +10177,118 @@ fn render_s3_config(app: &App, frame: &mut Frame) {
         height: 1,
     };
     frame.render_widget(help, help_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn confusion_matrix_card_renders_without_panic() {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let point = ConfusionMatrixPoint {
+            step: 5,
+            timestamp: 0.0,
+            labels: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            matrix: vec![vec![10, 1, 0], vec![2, 8, 1], vec![0, 1, 9]],
+        };
+        terminal
+            .draw(|f| {
+                render_confusion_matrix_card(f, Rect::new(0, 0, 40, 12), "eval/cm", &point, true);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "snapshot dump for manual visual inspection; run with --ignored"]
+    fn focused_confusion_matrix_snapshot() {
+        let backend = TestBackend::new(80, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let point = ConfusionMatrixPoint {
+            step: 19,
+            timestamp: 0.0,
+            labels: vec![
+                "cat".to_string(),
+                "dog".to_string(),
+                "fish".to_string(),
+                "bird".to_string(),
+                "frog".to_string(),
+            ],
+            matrix: vec![
+                vec![43, 2, 3, 1, 2],
+                vec![1, 41, 2, 0, 1],
+                vec![0, 1, 44, 2, 1],
+                vec![2, 0, 1, 40, 3],
+                vec![1, 2, 0, 1, 42],
+            ],
+        };
+        terminal
+            .draw(|f| {
+                render_focused_confusion_matrix(
+                    f,
+                    Rect::new(0, 0, 80, 22),
+                    "eval/cm",
+                    &point,
+                    19,
+                    20,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        println!("--- snapshot ---");
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            for x in 0..buf.area.width {
+                let symbol = buf[(x, y)].symbol();
+                row.push_str(if symbol.is_empty() { " " } else { symbol });
+            }
+            println!("{}", row);
+        }
+        println!("--- end snapshot ---");
+    }
+
+    #[test]
+    fn focused_confusion_matrix_renders_without_panic() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let point = ConfusionMatrixPoint {
+            step: 5,
+            timestamp: 0.0,
+            labels: vec!["cat".to_string(), "dog".to_string(), "fish".to_string()],
+            matrix: vec![vec![10, 1, 0], vec![2, 8, 1], vec![0, 1, 9]],
+        };
+        terminal
+            .draw(|f| {
+                render_focused_confusion_matrix(
+                    f,
+                    Rect::new(0, 0, 120, 30),
+                    "eval/cm",
+                    &point,
+                    3,
+                    20,
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn focused_confusion_matrix_tiny_area_does_not_panic() {
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let point = ConfusionMatrixPoint {
+            step: 5,
+            timestamp: 0.0,
+            labels: vec!["a".to_string(), "b".to_string()],
+            matrix: vec![vec![0, 0], vec![0, 0]],
+        };
+        terminal
+            .draw(|f| {
+                render_focused_confusion_matrix(f, Rect::new(0, 0, 20, 8), "eval/cm", &point, 0, 1);
+            })
+            .unwrap();
+    }
 }

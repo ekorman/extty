@@ -13,6 +13,7 @@ from extty._sink import StorageSink
 from extty.artifact import ArtifactMeta
 from extty.artifact import save_artifact as _save_artifact
 from extty.async_sink import AsyncSink
+from extty.confusion import ConfusionMatrix
 from extty.s3 import S3Config, S3Storage
 from extty.storage import (
     MetaData,
@@ -48,6 +49,11 @@ class MultiSink:
         self._primary.log_example(name, data, step)
         if self._secondary:
             self._secondary.log_example(name, data, step)
+
+    def log_confusion_matrix(self, name: str, cm: ConfusionMatrix, step: int) -> None:
+        self._primary.log_confusion_matrix(name, cm, step)
+        if self._secondary:
+            self._secondary.log_confusion_matrix(name, cm, step)
 
     def log_system(
         self,
@@ -225,6 +231,7 @@ class Run:
             Dictionary of metric names to values. Values can be:
             - float/int: logged as metric
             - Example/BatchExample: logged as structured example
+            - ConfusionMatrix: logged as a confusion matrix
         step : int
             The current training step.
 
@@ -237,7 +244,9 @@ class Run:
             if self._finished:
                 raise RuntimeError("Cannot log to a finished run.")
         for name, value in metrics.items():
-            if hasattr(value, "to_dict"):
+            if isinstance(value, ConfusionMatrix):
+                self._storage.log_confusion_matrix(name, value, step)
+            elif hasattr(value, "to_dict"):
                 self._storage.log_example(name, value.to_dict(), step)
             else:
                 self._storage.log_metric(name, float(value), step)

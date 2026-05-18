@@ -8,6 +8,7 @@ from typing import Any
 
 from extty._logger import log as logger
 from extty._sink import StorageSink
+from extty.confusion import ConfusionMatrix
 
 _HIGH_WATER_MARK = 100_000
 _STOP = object()
@@ -54,6 +55,9 @@ class AsyncSink:
 
     def log_example(self, name: str, data: dict[str, Any], step: int) -> None:
         self._enqueue(("example", name, data, step))
+
+    def log_confusion_matrix(self, name: str, cm: ConfusionMatrix, step: int) -> None:
+        self._enqueue(("confusion", name, cm, step))
 
     def log_system(
         self,
@@ -129,6 +133,9 @@ class AsyncSink:
         elif tag == "example":
             _, name, data, step = item
             self._inner.log_example(name, data, step)
+        elif tag == "confusion":
+            _, name, cm, step = item
+            self._inner.log_confusion_matrix(name, cm, step)
         elif tag == "system":
             _, ram_u, ram_t, gpu_u, gpu_t, gpu_p = item
             self._inner.log_system(ram_u, ram_t, gpu_u, gpu_t, gpu_p)

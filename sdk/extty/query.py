@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from extty.storage import (
+    ConfusionMatrixRecord,
     ExampleRecord,
     MetaData,
     MetricPoint,
@@ -114,6 +115,33 @@ class RunData:
             If the example file does not exist.
         """
         return self._storage.read_examples(name)
+
+    @property
+    def confusion_matrix_names(self) -> list[str]:
+        """List all available confusion matrix names for this run."""
+        return self._storage.list_confusion_matrix_names()
+
+    def confusion_matrix(self, name: str) -> list[ConfusionMatrixRecord]:
+        """
+        Load all confusion matrix records for a specific name.
+
+        Parameters
+        ----------
+        name : str
+            Confusion matrix name (e.g., "eval/cm").
+
+        Returns
+        -------
+        list[ConfusionMatrixRecord]
+            List of ConfusionMatrixRecord(step, timestamp, labels, matrix),
+            sorted by step in the order written.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the confusion matrix file does not exist.
+        """
+        return self._storage.read_confusion_matrix(name)
 
     @property
     def duration_seconds(self) -> float | None:

@@ -24,11 +24,13 @@ from extty.artifact import (
     save_artifact as _save_artifact_raw,
 )
 from extty.compare import compare, config_diff, plot_metric, reduce_metric
+from extty.confusion import ConfusionMatrix
 from extty.example import BatchExample, Example
 from extty.query import RunData, get_run, get_runs
 from extty.run import NoOpRun, Run
 from extty.s3 import S3Config
 from extty.storage import (
+    ConfusionMatrixRecord,
     ExampleRecord,
     MetricPoint,
     SystemMetricPoint,
@@ -56,6 +58,8 @@ __all__ = [
     "reduce_metric",
     "Example",
     "BatchExample",
+    "ConfusionMatrix",
+    "ConfusionMatrixRecord",
     "MetricPoint",
     "SystemMetricPoint",
     "ExampleRecord",
@@ -189,6 +193,7 @@ def log(metrics: dict[str, Any], *, step: int) -> None:
         - float/int: logged as metric
         - Example: single prompt with grouped responses
         - BatchExample: batch of prompts with grouped responses
+        - ConfusionMatrix: N×N matrix with class labels
     step : int
         The current training step.
     """
@@ -584,6 +589,13 @@ def _push_run_to_s3(
         for jsonl_file in examples_dir.rglob("*.jsonl"):
             relative_path = jsonl_file.relative_to(examples_dir)
             s3_key = f"{s3_prefix}/examples/{relative_path}"
+            _push_jsonl_file(client, bucket, s3_key, jsonl_file, force=force)
+
+    confusion_dir = local_run_dir / "confusion_matrices"
+    if confusion_dir.exists():
+        for jsonl_file in confusion_dir.rglob("*.jsonl"):
+            relative_path = jsonl_file.relative_to(confusion_dir)
+            s3_key = f"{s3_prefix}/confusion_matrices/{relative_path}"
             _push_jsonl_file(client, bucket, s3_key, jsonl_file, force=force)
 
     system_csv = local_run_dir / "system.csv"

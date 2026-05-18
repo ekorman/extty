@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from extty.confusion import ConfusionMatrix
+
 
 def get_runs_dir() -> Path:
     """Get the default runs directory (~/.ex/runs/)."""
@@ -50,6 +52,16 @@ class ExampleRecord:
     step: int
     timestamp: float
     data: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ConfusionMatrixRecord:
+    """A single logged confusion matrix record."""
+
+    step: int
+    timestamp: float
+    labels: list[str]
+    matrix: list[list[int]]
 
 
 @dataclass(frozen=True)
@@ -135,6 +147,9 @@ class RunStorage:
     _example_buffer: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict, repr=False
     )
+    _confusion_buffer: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
     _buffer_size: int = 200
     _last_flush: float = field(default_factory=time.time, repr=False)
     _flush_interval: float = 1.0
@@ -144,6 +159,7 @@ class RunStorage:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             (self.run_dir / "metrics").mkdir(exist_ok=True)
             (self.run_dir / "examples").mkdir(exist_ok=True)
+            (self.run_dir / "confusion_matrices").mkdir(exist_ok=True)
 
     @classmethod
     def open_readonly(cls, run_dir: Path) -> RunStorage:
@@ -172,7 +188,11 @@ class RunStorage:
 
     def _maybe_flush(self) -> None:
         """Flush if the combined buffer is full or the flush interval has elapsed."""
-        total = len(self._buffer) + sum(len(v) for v in self._example_buffer.values())
+        total = (
+            len(self._buffer)
+            + sum(len(v) for v in self._example_buffer.values())
+            + sum(len(v) for v in self._confusion_buffer.values())
+        )
         if total == 0:
             return
         should_flush = (
@@ -201,6 +221,11 @@ class RunStorage:
                 self._write_example_batch(name, records)
             self._example_buffer.clear()
 
+        if self._confusion_buffer:
+            for name, records in self._confusion_buffer.items():
+                self._write_confusion_batch(name, records)
+            self._confusion_buffer.clear()
+
         self._last_flush = time.time()
 
     def _write_metric_batch(
@@ -222,6 +247,16 @@ class RunStorage:
         """Write a batch of example records to the JSONL file."""
         relative_path = sanitize_metric_name(name) + ".jsonl"
         filepath = self.run_dir / "examples" / relative_path
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(filepath, "a") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+    def _write_confusion_batch(self, name: str, records: list[dict[str, Any]]) -> None:
+        """Write a batch of confusion matrix records to the JSONL file."""
+        relative_path = sanitize_metric_name(name) + ".jsonl"
+        filepath = self.run_dir / "confusion_matrices" / relative_path
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         with open(filepath, "a") as f:
@@ -269,6 +304,29 @@ class RunStorage:
         if name not in self._example_buffer:
             self._example_buffer[name] = []
         self._example_buffer[name].append(record)
+        self._maybe_flush()
+
+    def log_confusion_matrix(self, name: str, cm: ConfusionMatrix, step: int) -> None:
+        """Buffer a confusion matrix for later writing.
+
+        Parameters
+        ----------
+        name : str
+            Stream name (e.g., "eval/cm").
+        cm : ConfusionMatrix
+            The matrix and class labels to log.
+        step : int
+            The training step.
+        """
+        record = {
+            "step": step,
+            "timestamp": time.time(),
+            "labels": cm.labels,
+            "matrix": cm.matrix,
+        }
+        if name not in self._confusion_buffer:
+            self._confusion_buffer[name] = []
+        self._confusion_buffer[name].append(record)
         self._maybe_flush()
 
     def close(self) -> None:
@@ -367,6 +425,42 @@ class RunStorage:
                         step=obj["step"],
                         timestamp=obj["timestamp"],
                         data=obj["data"],
+                    )
+                )
+        return records
+
+    def list_confusion_matrix_names(self) -> list[str]:
+        """List all confusion matrix stream names by scanning confusion_matrices/."""
+        cm_dir = self.run_dir / "confusion_matrices"
+        if not cm_dir.exists():
+            return []
+        names = []
+        for jsonl_file in sorted(cm_dir.rglob("*.jsonl")):
+            relative = jsonl_file.relative_to(cm_dir)
+            names.append(relative.with_suffix("").as_posix())
+        return names
+
+    def read_confusion_matrix(self, name: str) -> list[ConfusionMatrixRecord]:
+        """Read all confusion matrix records for a named stream."""
+        relative_path = sanitize_metric_name(name) + ".jsonl"
+        filepath = self.run_dir / "confusion_matrices" / relative_path
+        if not filepath.exists():
+            raise FileNotFoundError(
+                f"Confusion matrix '{name}' not found at {filepath}"
+            )
+        records = []
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                records.append(
+                    ConfusionMatrixRecord(
+                        step=obj["step"],
+                        timestamp=obj["timestamp"],
+                        labels=obj["labels"],
+                        matrix=obj["matrix"],
                     )
                 )
         return records
