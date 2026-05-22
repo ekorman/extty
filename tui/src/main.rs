@@ -282,6 +282,7 @@ struct App {
     search_query: String,
     search_editing: bool,
     hide_completed: bool,
+    show_only_active_projects: bool,
     archived_projects: HashSet<String>,
     show_archived: bool,
     // Artifacts
@@ -400,6 +401,7 @@ impl App {
             search_query: String::new(),
             search_editing: false,
             hide_completed: false,
+            show_only_active_projects: false,
             archived_projects: load_archived_projects(),
             show_archived: false,
             artifacts: load_artifacts_from_cache(),
@@ -451,6 +453,11 @@ impl App {
         let mut entries = Vec::new();
 
         for (project_name, run_indices) in projects {
+            if self.show_only_active_projects
+                && !run_indices.iter().any(|i| self.runs[*i].is_running())
+            {
+                continue;
+            }
             entries.push(ListEntry::Project {
                 name: project_name.clone(),
             });
@@ -2727,6 +2734,11 @@ impl App {
                 self.selected_list_item = 0;
                 self.list_state.select(Some(0));
             }
+            KeyCode::Char('G') => {
+                self.show_only_active_projects = !self.show_only_active_projects;
+                self.selected_list_item = 0;
+                self.list_state.select(Some(0));
+            }
             KeyCode::Char('A') => {
                 if let Some(ListEntry::Project { name }) = entries.get(self.selected_list_item) {
                     if !self.archived_projects.remove(name) {
@@ -4881,6 +4893,14 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
         title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
         title_spans.push(Span::styled(
             "running only",
+            Style::default().fg(NEON_GREEN),
+        ));
+    }
+
+    if app.show_only_active_projects {
+        title_spans.push(Span::styled("  │  ", Style::default().fg(DIM_CYAN)));
+        title_spans.push(Span::styled(
+            "active projects only",
             Style::default().fg(NEON_GREEN),
         ));
     }
@@ -8451,6 +8471,7 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                     ("f", "add config filter"),
                     ("F", "clear filters"),
                     ("H", "toggle running-only"),
+                    ("G", "toggle active projects only"),
                     (".", "toggle archived visible"),
                 ],
             ),
