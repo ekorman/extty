@@ -14,6 +14,7 @@ from extty.storage import (
     MetaData,
     MetricPoint,
     RunStorage,
+    RunStorageReader,
     SystemMetricPoint,
     get_runs_dir,
 )
@@ -49,7 +50,7 @@ class RunData:
     started_at: str
     finished_at: str | None
     status: str
-    _storage: RunStorage = field(repr=False)
+    _storage: RunStorageReader = field(repr=False)
 
     @property
     def metric_names(self) -> list[str]:
@@ -153,7 +154,7 @@ class RunData:
         return (end - start).total_seconds()
 
 
-def _run_data_from_meta(meta: MetaData, storage: RunStorage) -> RunData:
+def _run_data_from_meta(meta: MetaData, storage: RunStorageReader) -> RunData:
     return RunData(
         project=meta.project,
         name=meta.run_name,
@@ -209,9 +210,15 @@ def get_runs(project: str | None = None) -> list[RunData]:
     return result
 
 
-def get_run(project: str, name: str) -> RunData:
+def get_run(project: str, name: str, *, local_only: bool = False) -> RunData:
     """
     Get a single stored run by project and name.
+
+    Looks on the local filesystem first. If the run is not present locally
+    and *local_only* is False, falls back to reading the run directly from
+    S3 using the globally-configured S3 credentials (env vars or
+    ``~/.extty/s3/config.toml``); no data is downloaded to disk in that
+    case — reads stream straight from S3.
 
     Parameters
     ----------
@@ -219,6 +226,9 @@ def get_run(project: str, name: str) -> RunData:
         Project name.
     name : str
         Run name.
+    local_only : bool, default False
+        If True, only consult the local runs directory and never reach
+        out to S3.
 
     Returns
     -------
@@ -228,16 +238,35 @@ def get_run(project: str, name: str) -> RunData:
     Raises
     ------
     FileNotFoundError
-        If the run does not exist.
+        If the run is not found locally, and either *local_only* is True,
+        no S3 configuration is available, or the run is also missing in S3.
     """
     project_dir = project if project else "_default"
     run_dir = get_runs_dir() / project_dir / name
-    if not run_dir.exists() or not (run_dir / "meta.json").exists():
+    if run_dir.exists() and (run_dir / "meta.json").exists():
+        storage = RunStorage.open_readonly(run_dir)
+        meta = storage.read_meta()
+        if meta is None:
+            raise FileNotFoundError(f"Run '{project}/{name}' has no valid meta.json")
+        return _run_data_from_meta(meta, storage)
+
+    if local_only:
         raise FileNotFoundError(f"Run '{project}/{name}' not found at {run_dir}")
 
-    storage = RunStorage.open_readonly(run_dir)
-    meta = storage.read_meta()
-    if meta is None:
-        raise FileNotFoundError(f"Run '{project}/{name}' has no valid meta.json")
+    from extty.s3 import S3Config, S3RunReader
 
-    return _run_data_from_meta(meta, storage)
+    s3_config = S3Config.load()
+    if s3_config is None:
+        raise FileNotFoundError(
+            f"Run '{project}/{name}' not found at {run_dir} and no S3 configuration "
+            "is available (set EXTTY_S3_BUCKET or ~/.extty/s3/config.toml)."
+        )
+
+    reader = S3RunReader(config=s3_config, project=project_dir, run_name=name)
+    meta = reader.read_meta()
+    if meta is None:
+        raise FileNotFoundError(
+            f"Run '{project}/{name}' not found locally or in S3 at "
+            f"s3://{s3_config.bucket}/{reader._s3_key()}"
+        )
+    return _run_data_from_meta(meta, reader)

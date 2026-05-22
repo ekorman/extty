@@ -16,7 +16,18 @@ from typing import Any
 from extty._logger import _DIM_CYAN, _NEON_CYAN, _NEON_GREEN, _RESET, _supports_color
 from extty._logger import log as logger
 from extty.confusion import ConfusionMatrix
-from extty.storage import sanitize_metric_name
+from extty.storage import (
+    ConfusionMatrixRecord,
+    ExampleRecord,
+    MetaData,
+    MetricPoint,
+    SystemMetricPoint,
+    parse_confusion_jsonl,
+    parse_examples_jsonl,
+    parse_metric_csv,
+    parse_system_csv,
+    sanitize_metric_name,
+)
 
 
 def _format_bytes(n: float) -> str:
@@ -280,6 +291,35 @@ class S3Config:
             return None
 
 
+def _make_s3_client(config: S3Config) -> Any:
+    """Build a boto3 S3 client from the given config."""
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError(
+            "boto3 is required for S3 storage. Install with: pip install extty[s3]"
+        )
+
+    kwargs: dict[str, Any] = {"config": _default_boto_config()}
+    if config.region:
+        kwargs["region_name"] = config.region
+    if config.access_key_id and config.secret_access_key:
+        kwargs["aws_access_key_id"] = config.access_key_id
+        kwargs["aws_secret_access_key"] = config.secret_access_key
+    if config.endpoint_url:
+        kwargs["endpoint_url"] = config.endpoint_url
+
+    return boto3.client("s3", **kwargs)
+
+
+def _run_key_prefix(config: S3Config, project: str, run_name: str) -> str:
+    """Return the S3 key prefix (no trailing slash) for a single run."""
+    parts = ["runs", project, run_name]
+    if config.prefix:
+        parts.insert(0, config.prefix)
+    return "/".join(parts)
+
+
 def _parse_toml(content: str) -> dict[str, str | None]:
     """Simple TOML parser for flat key-value config."""
     result: dict[str, str | None] = {}
@@ -344,29 +384,12 @@ class S3Storage:
         self._init_client()
 
     def _init_client(self) -> None:
-        try:
-            import boto3
-        except ImportError:
-            raise ImportError(
-                "boto3 is required for S3 storage. Install with: pip install extty[s3]"
-            )
-
-        kwargs: dict[str, Any] = {"config": _default_boto_config()}
-        if self.config.region:
-            kwargs["region_name"] = self.config.region
-        if self.config.access_key_id and self.config.secret_access_key:
-            kwargs["aws_access_key_id"] = self.config.access_key_id
-            kwargs["aws_secret_access_key"] = self.config.secret_access_key
-        if self.config.endpoint_url:
-            kwargs["endpoint_url"] = self.config.endpoint_url
-
-        self._client = boto3.client("s3", **kwargs)
+        self._client = _make_s3_client(self.config)
 
     def _s3_key(self, *parts: str) -> str:
-        path_parts = ["runs", self.project, self.run_name, *parts]
-        if self.config.prefix:
-            path_parts.insert(0, self.config.prefix)
-        return "/".join(path_parts)
+        return "/".join(
+            (_run_key_prefix(self.config, self.project, self.run_name), *parts)
+        )
 
     def log_metric(self, name: str, value: float, step: int) -> None:
         timestamp = time.time()
@@ -1019,3 +1042,98 @@ class S3Storage:
 
     def close(self) -> None:
         self.flush()
+
+
+@dataclass
+class S3RunReader:
+    """
+    Read-only view of a run stored in S3.
+
+    Implements :class:`extty.storage.RunStorageReader` so it can be slotted
+    into :class:`extty.query.RunData` interchangeably with the local-disk
+    :class:`extty.storage.RunStorage`.
+    """
+
+    config: S3Config
+    project: str
+    run_name: str
+    _client: Any = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self._client is None:
+            self._client = _make_s3_client(self.config)
+
+    def _s3_key(self, *parts: str) -> str:
+        return "/".join(
+            (_run_key_prefix(self.config, self.project, self.run_name), *parts)
+        )
+
+    def _get_text(self, key: str) -> str | None:
+        try:
+            response = self._client.get_object(Bucket=self.config.bucket, Key=key)
+        except self._client.exceptions.NoSuchKey:
+            return None
+        return response["Body"].read().decode("utf-8")
+
+    def _list_stream_names(self, sub_prefix: str, suffix: str) -> list[str]:
+        prefix = self._s3_key(sub_prefix) + "/"
+        paginator = self._client.get_paginator("list_objects_v2")
+        names: list[str] = []
+        for page in paginator.paginate(Bucket=self.config.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(suffix):
+                    continue
+                relative = key[len(prefix) : -len(suffix)]
+                if relative:
+                    names.append(relative)
+        names.sort()
+        return names
+
+    def read_meta(self) -> MetaData | None:
+        text = self._get_text(self._s3_key("meta.json"))
+        if text is None:
+            return None
+        return MetaData.from_dict(json.loads(text))
+
+    def list_metric_names(self) -> list[str]:
+        return self._list_stream_names("metrics", ".csv")
+
+    def read_metric(self, name: str) -> list[MetricPoint]:
+        key = self._s3_key("metrics", sanitize_metric_name(name) + ".csv")
+        text = self._get_text(key)
+        if text is None:
+            raise FileNotFoundError(
+                f"Metric '{name}' not found at s3://{self.config.bucket}/{key}"
+            )
+        return parse_metric_csv(text)
+
+    def read_system_metrics(self) -> list[SystemMetricPoint]:
+        text = self._get_text(self._s3_key("system.csv"))
+        if text is None:
+            return []
+        return parse_system_csv(text)
+
+    def list_example_names(self) -> list[str]:
+        return self._list_stream_names("examples", ".jsonl")
+
+    def read_examples(self, name: str) -> list[ExampleRecord]:
+        key = self._s3_key("examples", sanitize_metric_name(name) + ".jsonl")
+        text = self._get_text(key)
+        if text is None:
+            raise FileNotFoundError(
+                f"Examples '{name}' not found at s3://{self.config.bucket}/{key}"
+            )
+        return parse_examples_jsonl(text)
+
+    def list_confusion_matrix_names(self) -> list[str]:
+        return self._list_stream_names("confusion_matrices", ".jsonl")
+
+    def read_confusion_matrix(self, name: str) -> list[ConfusionMatrixRecord]:
+        key = self._s3_key("confusion_matrices", sanitize_metric_name(name) + ".jsonl")
+        text = self._get_text(key)
+        if text is None:
+            raise FileNotFoundError(
+                f"Confusion matrix '{name}' not found at s3://{self.config.bucket}/{key}"
+            )
+        return parse_confusion_jsonl(text)

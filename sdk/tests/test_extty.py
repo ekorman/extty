@@ -1937,6 +1937,153 @@ class TestS3UploadAvoidsReads:
         assert len(storage._cumulative_metric_rows["loss"]) == 8
 
 
+class TestGetRunS3Fallback:
+    """``extty.get_run`` reads runs directly from S3 when not local."""
+
+    def _seed_s3_client(self, stored: dict[str, bytes]) -> mock.MagicMock:
+        client = mock.MagicMock()
+        client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        def get_object(Bucket, Key):
+            if Key in stored:
+                body = mock.MagicMock()
+                body.read.return_value = stored[Key]
+                return {"Body": body}
+            raise client.exceptions.NoSuchKey(
+                {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+            )
+
+        def paginate(Bucket, Prefix=""):
+            contents = [
+                {"Key": k, "Size": len(v)}
+                for k, v in stored.items()
+                if k.startswith(Prefix)
+            ]
+            return iter([{"Contents": contents}])
+
+        paginator = mock.MagicMock()
+        paginator.paginate.side_effect = paginate
+        client.get_object.side_effect = get_object
+        client.get_paginator.return_value = paginator
+        return client
+
+    def _seed_remote_run(
+        self,
+        bucket: str = "test-bucket",
+        prefix: str = "test",
+        project: str = "myproject",
+        run_name: str = "run-remote",
+    ) -> tuple[dict[str, bytes], S3Config]:
+        run_prefix = f"{prefix}/runs/{project}/{run_name}"
+        meta = {
+            "project": project,
+            "run_name": run_name,
+            "config": {"lr": 0.001},
+            "started_at": "2024-01-01T00:00:00",
+            "finished_at": "2024-01-01T00:01:00",
+            "status": "completed",
+        }
+        metric_csv = "step,timestamp,value\n0,1700000000.0,0.5\n1,1700000001.0,0.3\n"
+        examples_jsonl = (
+            json.dumps({"step": 0, "timestamp": 1700000000.0, "data": {"prompt": "hi"}})
+            + "\n"
+        )
+        stored: dict[str, bytes] = {
+            f"{run_prefix}/meta.json": json.dumps(meta).encode("utf-8"),
+            f"{run_prefix}/metrics/loss.csv": metric_csv.encode("utf-8"),
+            f"{run_prefix}/examples/val_example.jsonl": examples_jsonl.encode("utf-8"),
+        }
+        return stored, S3Config(bucket=bucket, prefix=prefix)
+
+    def test_local_run_does_not_touch_s3(self, tmp_path: Path) -> None:
+        runs_dir = tmp_path / "runs"
+        with (
+            mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
+            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+        ):
+            extty.init(
+                "myproject", name="local-run", config={"lr": 0.5}, system_metrics=False
+            )
+            extty.log({"loss": 0.1}, step=0)
+            extty.finish()
+
+            with (
+                mock.patch("boto3.client") as boto_mock,
+                mock.patch("extty.s3.S3Config.load") as load_mock,
+            ):
+                run = extty.get_run("myproject", "local-run")
+                boto_mock.assert_not_called()
+                load_mock.assert_not_called()
+            assert run.config["lr"] == 0.5
+            assert run.metric("loss")[0].value == 0.1
+
+    def test_s3_fallback_loads_meta_metrics_examples(self, tmp_path: Path) -> None:
+        stored, s3_config = self._seed_remote_run(
+            project="myproject", run_name="run-remote"
+        )
+        client = self._seed_s3_client(stored)
+
+        runs_dir = tmp_path / "runs"
+        with (
+            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+            mock.patch("extty.s3.S3Config.load", return_value=s3_config),
+            mock.patch("boto3.client", return_value=client),
+        ):
+            run = extty.get_run("myproject", "run-remote")
+
+        assert run.project == "myproject"
+        assert run.name == "run-remote"
+        assert run.config == {"lr": 0.001}
+        assert run.status == "completed"
+
+        assert sorted(run.metric_names) == ["loss"]
+        points = run.metric("loss")
+        assert [p.step for p in points] == [0, 1]
+        assert [p.value for p in points] == [0.5, 0.3]
+
+        assert run.example_names == ["val_example"]
+        examples = run.examples("val_example")
+        assert len(examples) == 1
+        assert examples[0].data == {"prompt": "hi"}
+
+    def test_local_only_does_not_consult_s3(self, tmp_path: Path) -> None:
+        stored, s3_config = self._seed_remote_run(run_name="run-remote")
+        client = self._seed_s3_client(stored)
+
+        runs_dir = tmp_path / "runs"
+        with (
+            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+            mock.patch("extty.s3.S3Config.load", return_value=s3_config) as load_mock,
+            mock.patch("boto3.client", return_value=client) as boto_mock,
+        ):
+            with pytest.raises(FileNotFoundError):
+                extty.get_run("myproject", "run-remote", local_only=True)
+            load_mock.assert_not_called()
+            boto_mock.assert_not_called()
+
+    def test_missing_everywhere_raises(self, tmp_path: Path) -> None:
+        stored, s3_config = self._seed_remote_run(run_name="run-remote")
+        client = self._seed_s3_client(stored)
+
+        runs_dir = tmp_path / "runs"
+        with (
+            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+            mock.patch("extty.s3.S3Config.load", return_value=s3_config),
+            mock.patch("boto3.client", return_value=client),
+        ):
+            with pytest.raises(FileNotFoundError, match="not found locally or in S3"):
+                extty.get_run("myproject", "no-such-run")
+
+    def test_no_s3_config_raises_friendly_error(self, tmp_path: Path) -> None:
+        runs_dir = tmp_path / "runs"
+        with (
+            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+            mock.patch("extty.s3.S3Config.load", return_value=None),
+        ):
+            with pytest.raises(FileNotFoundError, match="no S3 configuration"):
+                extty.get_run("myproject", "missing-run")
+
+
 class TestDistributedInit:
     def test_rank_env_nonzero_returns_noop(self, tmp_path: Path) -> None:
         with mock.patch.dict(os.environ, {"RANK": "1"}):

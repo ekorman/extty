@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from extty.confusion import ConfusionMatrix
 
@@ -93,6 +93,102 @@ def generate_random_name() -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     suffix = os.urandom(2).hex()
     return f"{timestamp}_{suffix}"
+
+
+def parse_metric_csv(text: str) -> list[MetricPoint]:
+    """Parse a metric CSV (``step,timestamp,value``) into MetricPoint records."""
+    points: list[MetricPoint] = []
+    lines = text.splitlines()
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        points.append(
+            MetricPoint(
+                step=int(parts[0]),
+                timestamp=float(parts[1]),
+                value=float(parts[2]),
+            )
+        )
+    return points
+
+
+def parse_system_csv(text: str) -> list[SystemMetricPoint]:
+    """Parse a system.csv body into SystemMetricPoint records."""
+    points: list[SystemMetricPoint] = []
+    lines = text.splitlines()
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        points.append(
+            SystemMetricPoint(
+                timestamp=float(parts[0]),
+                ram_used_gb=float(parts[1]),
+                ram_total_gb=float(parts[2]),
+                gpu_mem_used_gb=float(parts[3]) if parts[3] else None,
+                gpu_mem_total_gb=float(parts[4]) if parts[4] else None,
+                gpu_util_pct=float(parts[5]) if parts[5] else None,
+            )
+        )
+    return points
+
+
+def parse_examples_jsonl(text: str) -> list[ExampleRecord]:
+    """Parse an examples JSONL body into ExampleRecord values."""
+    records: list[ExampleRecord] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        records.append(
+            ExampleRecord(
+                step=obj["step"],
+                timestamp=obj["timestamp"],
+                data=obj["data"],
+            )
+        )
+    return records
+
+
+def parse_confusion_jsonl(text: str) -> list[ConfusionMatrixRecord]:
+    """Parse a confusion-matrix JSONL body into ConfusionMatrixRecord values."""
+    records: list[ConfusionMatrixRecord] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        records.append(
+            ConfusionMatrixRecord(
+                step=obj["step"],
+                timestamp=obj["timestamp"],
+                labels=obj["labels"],
+                matrix=obj["matrix"],
+            )
+        )
+    return records
+
+
+class RunStorageReader(Protocol):
+    """Read-only surface needed by :class:`extty.query.RunData`.
+
+    Both the local-filesystem :class:`RunStorage` and the S3-backed
+    ``S3RunReader`` implement this so ``RunData`` doesn't need to care
+    where its data lives.
+    """
+
+    def read_meta(self) -> MetaData | None: ...
+    def list_metric_names(self) -> list[str]: ...
+    def read_metric(self, name: str) -> list[MetricPoint]: ...
+    def read_system_metrics(self) -> list[SystemMetricPoint]: ...
+    def list_example_names(self) -> list[str]: ...
+    def read_examples(self, name: str) -> list[ExampleRecord]: ...
+    def list_confusion_matrix_names(self) -> list[str]: ...
+    def read_confusion_matrix(self, name: str) -> list[ConfusionMatrixRecord]: ...
 
 
 @dataclass
@@ -354,47 +450,14 @@ class RunStorage:
         filepath = self.run_dir / "metrics" / relative_path
         if not filepath.exists():
             raise FileNotFoundError(f"Metric '{name}' not found at {filepath}")
-        points = []
-        with open(filepath) as f:
-            f.readline()  # skip header
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split(",")
-                points.append(
-                    MetricPoint(
-                        step=int(parts[0]),
-                        timestamp=float(parts[1]),
-                        value=float(parts[2]),
-                    )
-                )
-        return points
+        return parse_metric_csv(filepath.read_text())
 
     def read_system_metrics(self) -> list[SystemMetricPoint]:
         """Read system metrics from system.csv."""
         filepath = self.run_dir / "system.csv"
         if not filepath.exists():
             return []
-        points = []
-        with open(filepath) as f:
-            f.readline()  # skip header
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split(",")
-                points.append(
-                    SystemMetricPoint(
-                        timestamp=float(parts[0]),
-                        ram_used_gb=float(parts[1]),
-                        ram_total_gb=float(parts[2]),
-                        gpu_mem_used_gb=float(parts[3]) if parts[3] else None,
-                        gpu_mem_total_gb=float(parts[4]) if parts[4] else None,
-                        gpu_util_pct=float(parts[5]) if parts[5] else None,
-                    )
-                )
-        return points
+        return parse_system_csv(filepath.read_text())
 
     def list_example_names(self) -> list[str]:
         """List all example names by scanning the examples/ directory."""
@@ -413,21 +476,7 @@ class RunStorage:
         filepath = self.run_dir / "examples" / relative_path
         if not filepath.exists():
             raise FileNotFoundError(f"Examples '{name}' not found at {filepath}")
-        records = []
-        with open(filepath) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                records.append(
-                    ExampleRecord(
-                        step=obj["step"],
-                        timestamp=obj["timestamp"],
-                        data=obj["data"],
-                    )
-                )
-        return records
+        return parse_examples_jsonl(filepath.read_text())
 
     def list_confusion_matrix_names(self) -> list[str]:
         """List all confusion matrix stream names by scanning confusion_matrices/."""
@@ -448,22 +497,7 @@ class RunStorage:
             raise FileNotFoundError(
                 f"Confusion matrix '{name}' not found at {filepath}"
             )
-        records = []
-        with open(filepath) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                records.append(
-                    ConfusionMatrixRecord(
-                        step=obj["step"],
-                        timestamp=obj["timestamp"],
-                        labels=obj["labels"],
-                        matrix=obj["matrix"],
-                    )
-                )
-        return records
+        return parse_confusion_jsonl(filepath.read_text())
 
     def list_checkpoints():
         pass
