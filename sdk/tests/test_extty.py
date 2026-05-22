@@ -1629,7 +1629,7 @@ class TestS3FailureTolerance:
         storage.log_metric("loss", 0.5, step=1)
         storage._buffer_max_count = 1
 
-        with caplog.at_level(logging.WARNING, logger="extty.s3"):
+        with caplog.at_level(logging.WARNING, logger="extty"):
             storage.flush()
 
         assert "Failed to upload metrics 'loss' to S3" in caplog.text
@@ -1647,6 +1647,7 @@ class TestS3FailureTolerance:
         assert "loss" in storage._metric_buffer
         assert len(storage._metric_buffer["loss"]) == 2
         assert storage._buffer_count == 2
+        assert storage._cumulative_metric_rows.get("loss", []) == []
 
     def test_failed_examples_retained_in_buffer(self) -> None:
         client, _ = self._make_mock_s3_client()
@@ -1659,6 +1660,7 @@ class TestS3FailureTolerance:
 
         assert "outputs" in storage._example_buffer
         assert len(storage._example_buffer["outputs"]) == 1
+        assert storage._cumulative_example_rows.get("outputs", []) == []
 
     def test_failed_system_metrics_retained_in_buffer(self) -> None:
         client, _ = self._make_mock_s3_client()
@@ -1670,6 +1672,7 @@ class TestS3FailureTolerance:
         storage.flush()
 
         assert len(storage._system_buffer) == 1
+        assert storage._cumulative_system_rows == []
 
     def test_no_data_loss_after_transient_failure(self) -> None:
         """S3 fails on first flush, recovers on second — all data arrives."""
@@ -1713,7 +1716,7 @@ class TestS3FailureTolerance:
 
         client.put_object.side_effect = BotoCoreError()
 
-        with caplog.at_level(logging.WARNING, logger="extty.s3"):
+        with caplog.at_level(logging.WARNING, logger="extty"):
             storage.write_meta({"project": "test", "status": "running"})
 
         assert "Failed to write run metadata to S3" in caplog.text
@@ -1727,7 +1730,7 @@ class TestS3FailureTolerance:
 
         client.upload_file.side_effect = BotoCoreError()
 
-        with caplog.at_level(logging.WARNING, logger="extty.s3"):
+        with caplog.at_level(logging.WARNING, logger="extty"):
             storage.save_checkpoint(step=100, path=str(fake_file))
 
         assert "Failed to save checkpoint (step 100) to S3" in caplog.text
@@ -1738,7 +1741,7 @@ class TestS3FailureTolerance:
 
         client.put_object.side_effect = BotoCoreError()
 
-        with caplog.at_level(logging.WARNING, logger="extty.s3"):
+        with caplog.at_level(logging.WARNING, logger="extty"):
             storage._update_checkpoints_index(
                 {"step": 1, "timestamp": "now", "files": []}
             )
@@ -1870,6 +1873,68 @@ class TestS3FailureTolerance:
         )
         storage.flush()
         assert storage._consecutive_failures == 0
+
+
+class TestS3UploadAvoidsReads:
+    """S3 uploads must never call get_object — cumulative state lives in memory."""
+
+    def _make_storage(self) -> tuple[mock.MagicMock, dict[str, bytes], S3Storage]:
+        stored: dict[str, bytes] = {}
+        client = mock.MagicMock()
+
+        def put_object(Bucket, Key, Body, ContentType=None):
+            if isinstance(Body, str):
+                Body = Body.encode("utf-8")
+            stored[Key] = Body
+
+        def get_object(Bucket, Key):
+            raise AssertionError(
+                f"unexpected get_object call for {Key!r}: uploads must not read"
+            )
+
+        client.put_object.side_effect = put_object
+        client.get_object.side_effect = get_object
+        client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+        config = S3Config(bucket="test-bucket", prefix="test")
+        with mock.patch("boto3.client", return_value=client):
+            storage = S3Storage(config, "myproject", "run-001")
+        return client, stored, storage
+
+    def test_repeated_flush_does_not_call_get_object(self) -> None:
+        client, stored, storage = self._make_storage()
+
+        for i in range(20):
+            storage.log_metric("loss", float(i), step=i)
+            storage.log_example("outputs", {"text": f"hi-{i}"}, step=i)
+        storage.flush()
+        for i in range(20, 40):
+            storage.log_metric("loss", float(i), step=i)
+        storage.flush()
+
+        client.get_object.assert_not_called()
+
+        metrics_key = "test/runs/myproject/run-001/metrics/loss.csv"
+        assert metrics_key in stored
+        lines = stored[metrics_key].decode("utf-8").strip().split("\n")
+        steps = [int(line.split(",")[0]) for line in lines[1:]]
+        assert steps == list(range(40))
+
+    def test_cumulative_state_drives_full_file_uploads(self) -> None:
+        _, stored, storage = self._make_storage()
+
+        for i in range(5):
+            storage.log_metric("loss", float(i), step=i)
+        storage.flush()
+        for i in range(5, 8):
+            storage.log_metric("loss", float(i), step=i)
+        storage.flush()
+
+        key = "test/runs/myproject/run-001/metrics/loss.csv"
+        lines = stored[key].decode("utf-8").strip().split("\n")
+        assert len(lines) == 1 + 8
+        assert storage._cumulative_metric_rows["loss"]
+        assert len(storage._cumulative_metric_rows["loss"]) == 8
 
 
 class TestDistributedInit:

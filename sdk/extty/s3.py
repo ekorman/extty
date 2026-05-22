@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import csv
 import io
 import json
-import logging
 import os
 import shutil
 import sys
@@ -15,17 +13,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from extty._logger import (
-    _DIM_CYAN,
-    _NEON_CYAN,
-    _NEON_GREEN,
-    _RESET,
-    _supports_color,
-)
+from extty._logger import _DIM_CYAN, _NEON_CYAN, _NEON_GREEN, _RESET, _supports_color
+from extty._logger import log as logger
 from extty.confusion import ConfusionMatrix
 from extty.storage import sanitize_metric_name
-
-logger = logging.getLogger(__name__)
 
 
 def _format_bytes(n: float) -> str:
@@ -330,11 +321,24 @@ class S3Storage:
     ] = field(default_factory=list, repr=False)
     _buffer_count: int = field(default=0, repr=False)
     _last_flush: float = field(default_factory=time.time, repr=False)
-    _buffer_max_count: int = 100
+    _buffer_max_count: int = 500
     _buffer_max_seconds: float = 30.0
     _consecutive_failures: int = field(default=0, repr=False)
     _max_backoff_seconds: float = 300.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    _cumulative_metric_rows: dict[str, list[tuple[int, float, float]]] = field(
+        default_factory=dict, repr=False
+    )
+    _cumulative_example_rows: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
+    _cumulative_confusion_rows: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
+    _cumulative_system_rows: list[
+        tuple[float, float, float, float | None, float | None, float | None]
+    ] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         self._init_client()
@@ -426,20 +430,33 @@ class S3Storage:
         flush_interval = self._buffer_max_seconds * (
             2 ** min(self._consecutive_failures, max_doublings)
         )
-        should_flush = (
-            self._buffer_count >= self._buffer_max_count
-            or (time.time() - self._last_flush) >= flush_interval
-        )
-        if should_flush:
-            self._flush_unlocked()
+        age = time.time() - self._last_flush
+        if self._buffer_count >= self._buffer_max_count:
+            reason = f"count ({self._buffer_count} >= {self._buffer_max_count})"
+        elif age >= flush_interval:
+            reason = f"age ({age:.1f}s >= {flush_interval:.1f}s)"
+        else:
+            return
+        self._flush_unlocked(reason=reason)
 
     def flush(self) -> None:
         with self._lock:
-            self._flush_unlocked()
+            self._flush_unlocked(reason="manual")
 
-    def _flush_unlocked(self) -> None:
+    def _flush_unlocked(self, *, reason: str = "manual") -> None:
         if self._buffer_count == 0:
             return
+
+        logger.info(
+            "S3 flush: %d items (%d metric / %d example / %d confusion streams, "
+            "%d system samples) — trigger: %s",
+            self._buffer_count,
+            len(self._metric_buffer),
+            len(self._example_buffer),
+            len(self._confusion_buffer),
+            len(self._system_buffer),
+            reason,
+        )
 
         had_failure = False
 
@@ -505,42 +522,11 @@ class S3Storage:
         )
         self._last_flush = time.time()
 
-    def _upload_metrics(
-        self, name: str, values: list[tuple[int, float, float]]
-    ) -> None:
-        safe_name = sanitize_metric_name(name)
-        key = self._s3_key("metrics", f"{safe_name}.csv")
-
-        existing_data: set[tuple[int, float]] = set()
-        existing_rows: list[tuple[int, float, float]] = []
-
-        try:
-            response = self._client.get_object(Bucket=self.config.bucket, Key=key)
-            content = response["Body"].read().decode("utf-8")
-            reader = csv.DictReader(io.StringIO(content))
-            for row in reader:
-                step = int(row["step"])
-                ts = float(row["timestamp"])
-                val = float(row["value"])
-                existing_data.add((step, ts))
-                existing_rows.append((step, ts, val))
-        except self._client.exceptions.NoSuchKey:
-            pass
-        except Exception:
-            pass
-
-        for step, ts, val in values:
-            if (step, ts) not in existing_data:
-                existing_data.add((step, ts))
-                existing_rows.append((step, ts, val))
-
-        existing_rows.sort(key=lambda x: (x[0], x[1]))
-
+    def _put_csv_metric(self, key: str, rows: list[tuple[int, float, float]]) -> None:
         output = io.StringIO()
         output.write("step,timestamp,value\n")
-        for step, ts, val in existing_rows:
+        for step, ts, val in rows:
             output.write(f"{step},{ts:.6f},{val}\n")
-
         self._client.put_object(
             Bucket=self.config.bucket,
             Key=key,
@@ -548,84 +534,66 @@ class S3Storage:
             ContentType="text/csv",
         )
 
-    def _upload_examples(self, name: str, records: list[dict[str, Any]]) -> None:
-        safe_name = sanitize_metric_name(name)
-        key = self._s3_key("examples", f"{safe_name}.jsonl")
-
-        existing_data: set[tuple[int, float]] = set()
-        existing_records: list[dict[str, Any]] = []
-
-        try:
-            response = self._client.get_object(Bucket=self.config.bucket, Key=key)
-            content = response["Body"].read().decode("utf-8")
-            for line in content.strip().split("\n"):
-                if line:
-                    record = json.loads(line)
-                    existing_data.add((record["step"], record["timestamp"]))
-                    existing_records.append(record)
-        except self._client.exceptions.NoSuchKey:
-            pass
-        except Exception:
-            pass
-
-        for record in records:
-            key_tuple = (record["step"], record["timestamp"])
-            if key_tuple not in existing_data:
-                existing_data.add(key_tuple)
-                existing_records.append(record)
-
-        existing_records.sort(key=lambda x: (x["step"], x["timestamp"]))
-
-        output = "\n".join(json.dumps(r) for r in existing_records)
+    def _put_jsonl(self, key: str, records: list[dict[str, Any]]) -> None:
+        output = "\n".join(json.dumps(r) for r in records)
         if output:
             output += "\n"
-
-        key = self._s3_key("examples", f"{safe_name}.jsonl")
         self._client.put_object(
             Bucket=self.config.bucket,
             Key=key,
             Body=output.encode("utf-8"),
             ContentType="application/x-ndjson",
         )
+
+    def _put_csv_system(
+        self,
+        key: str,
+        rows: list[
+            tuple[float, float, float, float | None, float | None, float | None]
+        ],
+    ) -> None:
+        output = io.StringIO()
+        output.write(
+            "timestamp,ram_used_gb,ram_total_gb,gpu_mem_used_gb,gpu_mem_total_gb,gpu_util_pct\n"
+        )
+        for ts, ram_used, ram_total, gpu_used, gpu_total, gpu_util in rows:
+            gpu_used_str = "" if gpu_used is None else f"{gpu_used:.2f}"
+            gpu_total_str = "" if gpu_total is None else f"{gpu_total:.2f}"
+            gpu_util_str = "" if gpu_util is None else f"{gpu_util:.1f}"
+            output.write(
+                f"{ts:.6f},{ram_used:.2f},{ram_total:.2f},{gpu_used_str},{gpu_total_str},{gpu_util_str}\n"
+            )
+        self._client.put_object(
+            Bucket=self.config.bucket,
+            Key=key,
+            Body=output.getvalue().encode("utf-8"),
+            ContentType="text/csv",
+        )
+
+    def _upload_metrics(
+        self, name: str, values: list[tuple[int, float, float]]
+    ) -> None:
+        safe_name = sanitize_metric_name(name)
+        key = self._s3_key("metrics", f"{safe_name}.csv")
+        rows = list(self._cumulative_metric_rows.get(name, [])) + list(values)
+        self._put_csv_metric(key, rows)
+        self._cumulative_metric_rows[name] = rows
+
+    def _upload_examples(self, name: str, records: list[dict[str, Any]]) -> None:
+        safe_name = sanitize_metric_name(name)
+        key = self._s3_key("examples", f"{safe_name}.jsonl")
+        all_records = list(self._cumulative_example_rows.get(name, [])) + list(records)
+        self._put_jsonl(key, all_records)
+        self._cumulative_example_rows[name] = all_records
 
     def _upload_confusion(self, name: str, records: list[dict[str, Any]]) -> None:
         safe_name = sanitize_metric_name(name)
         key = self._s3_key("confusion_matrices", f"{safe_name}.jsonl")
-
-        existing_data: set[tuple[int, float]] = set()
-        existing_records: list[dict[str, Any]] = []
-
-        try:
-            response = self._client.get_object(Bucket=self.config.bucket, Key=key)
-            content = response["Body"].read().decode("utf-8")
-            for line in content.strip().split("\n"):
-                if line:
-                    record = json.loads(line)
-                    existing_data.add((record["step"], record["timestamp"]))
-                    existing_records.append(record)
-        except self._client.exceptions.NoSuchKey:
-            pass
-        except Exception:
-            pass
-
-        for record in records:
-            key_tuple = (record["step"], record["timestamp"])
-            if key_tuple not in existing_data:
-                existing_data.add(key_tuple)
-                existing_records.append(record)
-
-        existing_records.sort(key=lambda x: (x["step"], x["timestamp"]))
-
-        output = "\n".join(json.dumps(r) for r in existing_records)
-        if output:
-            output += "\n"
-
-        self._client.put_object(
-            Bucket=self.config.bucket,
-            Key=key,
-            Body=output.encode("utf-8"),
-            ContentType="application/x-ndjson",
+        all_records = list(self._cumulative_confusion_rows.get(name, [])) + list(
+            records
         )
+        self._put_jsonl(key, all_records)
+        self._cumulative_confusion_rows[name] = all_records
 
     def _upload_system(
         self,
@@ -634,63 +602,9 @@ class S3Storage:
         ],
     ) -> None:
         key = self._s3_key("system.csv")
-
-        existing_data: set[float] = set()
-        existing_rows: list[
-            tuple[float, float, float, float | None, float | None, float | None]
-        ] = []
-
-        try:
-            response = self._client.get_object(Bucket=self.config.bucket, Key=key)
-            content = response["Body"].read().decode("utf-8")
-            reader = csv.DictReader(io.StringIO(content))
-            for row in reader:
-                ts = float(row["timestamp"])
-                existing_data.add(ts)
-                existing_rows.append(
-                    (
-                        ts,
-                        float(row["ram_used_gb"]),
-                        float(row["ram_total_gb"]),
-                        float(row["gpu_mem_used_gb"])
-                        if row["gpu_mem_used_gb"]
-                        else None,
-                        float(row["gpu_mem_total_gb"])
-                        if row["gpu_mem_total_gb"]
-                        else None,
-                        float(row["gpu_util_pct"]) if row["gpu_util_pct"] else None,
-                    )
-                )
-        except self._client.exceptions.NoSuchKey:
-            pass
-        except Exception:
-            pass
-
-        for row in values:
-            if row[0] not in existing_data:
-                existing_data.add(row[0])
-                existing_rows.append(row)
-
-        existing_rows.sort(key=lambda x: x[0])
-
-        output = io.StringIO()
-        output.write(
-            "timestamp,ram_used_gb,ram_total_gb,gpu_mem_used_gb,gpu_mem_total_gb,gpu_util_pct\n"
-        )
-        for ts, ram_used, ram_total, gpu_used, gpu_total, gpu_util in existing_rows:
-            gpu_used_str = "" if gpu_used is None else f"{gpu_used:.2f}"
-            gpu_total_str = "" if gpu_total is None else f"{gpu_total:.2f}"
-            gpu_util_str = "" if gpu_util is None else f"{gpu_util:.1f}"
-            output.write(
-                f"{ts:.6f},{ram_used:.2f},{ram_total:.2f},{gpu_used_str},{gpu_total_str},{gpu_util_str}\n"
-            )
-
-        self._client.put_object(
-            Bucket=self.config.bucket,
-            Key=key,
-            Body=output.getvalue().encode("utf-8"),
-            ContentType="text/csv",
-        )
+        rows = list(self._cumulative_system_rows) + list(values)
+        self._put_csv_system(key, rows)
+        self._cumulative_system_rows = rows
 
     def write_meta(self, meta_dict: dict[str, Any]) -> None:
         key = self._s3_key("meta.json")

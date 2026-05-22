@@ -5291,7 +5291,8 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                         .confusion_step_idx
                         .get(name)
                         .copied()
-                        .unwrap_or_else(|| series.len().saturating_sub(1));
+                        .unwrap_or_else(|| series.len().saturating_sub(1))
+                        .min(series.len().saturating_sub(1));
                     if let Some(point) = series.get(idx) {
                         render_confusion_matrix_card(frame, card_area, name, point, is_selected);
                     }
