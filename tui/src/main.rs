@@ -216,6 +216,8 @@ struct App {
     pending_terminate_instance: Option<usize>,
     infra_active_panel: InfraPanel,
     infra_type_sort: InfraTypeSort,
+    infra_type_search: String,
+    infra_type_search_editing: bool,
     infra_last_refresh: Instant,
     // Infra config editing
     config_provider_index: usize,
@@ -340,6 +342,8 @@ impl App {
             pending_terminate_instance: None,
             infra_active_panel: InfraPanel::Instances,
             infra_type_sort: InfraTypeSort::default(),
+            infra_type_search: String::new(),
+            infra_type_search_editing: false,
             infra_last_refresh: Instant::now(),
             config_provider_index: 0,
             config_api_key_input: String::new(),
@@ -1240,6 +1244,35 @@ impl App {
             .min(self.infra_instances.len().saturating_sub(1));
     }
 
+    fn filtered_infra_types(&self) -> Vec<&InstanceType> {
+        if self.infra_type_search.is_empty() {
+            return self.infra_types.iter().collect();
+        }
+        let q = self.infra_type_search.to_lowercase();
+        self.infra_types
+            .iter()
+            .filter(|t| {
+                t.name.to_lowercase().contains(&q)
+                    || t.gpu_name
+                        .as_deref()
+                        .is_some_and(|g| g.to_lowercase().contains(&q))
+                    || t.gpu_description
+                        .as_deref()
+                        .is_some_and(|g| g.to_lowercase().contains(&q))
+                    || t.description
+                        .as_deref()
+                        .is_some_and(|d| d.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
+    fn selected_infra_type(&self) -> Option<InstanceType> {
+        self.filtered_infra_types()
+            .into_iter()
+            .nth(self.selected_infra_type)
+            .cloned()
+    }
+
     fn refresh_infra_types(&mut self) {
         self.infra_loading = true;
         self.infra_error = None;
@@ -1273,9 +1306,10 @@ impl App {
 
         self.infra_loading = false;
         self.sort_infra_types();
+        let filtered_count = self.filtered_infra_types().len();
         self.selected_infra_type = self
             .selected_infra_type
-            .min(self.infra_types.len().saturating_sub(1));
+            .min(filtered_count.saturating_sub(1));
         self.infra_types_list_state
             .select(Some(self.selected_infra_type));
     }
@@ -2193,6 +2227,7 @@ impl App {
             && !self.add_machine_open
             && !self.launch_confirming
             && !self.launch_selecting_region
+            && !self.infra_type_search_editing
         {
             self.help_overlay_open = true;
             self.help_overlay_scroll = 0;
@@ -3581,9 +3616,35 @@ impl App {
             return;
         }
 
+        if self.infra_type_search_editing {
+            match code {
+                KeyCode::Char(c) => {
+                    self.infra_type_search.push(c);
+                    self.selected_infra_type = 0;
+                    self.infra_types_list_state.select(Some(0));
+                }
+                KeyCode::Backspace => {
+                    self.infra_type_search.pop();
+                    self.selected_infra_type = 0;
+                    self.infra_types_list_state.select(Some(0));
+                }
+                KeyCode::Esc => {
+                    self.infra_type_search.clear();
+                    self.infra_type_search_editing = false;
+                    self.selected_infra_type = 0;
+                    self.infra_types_list_state.select(Some(0));
+                }
+                KeyCode::Enter => {
+                    self.infra_type_search_editing = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let instances = self.filtered_infra_instances();
         let instance_count = instances.len();
-        let type_count = self.infra_types.len();
+        let type_count = self.filtered_infra_types().len();
 
         match code {
             KeyCode::Char('r') => {
@@ -3632,6 +3693,8 @@ impl App {
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
                 self.infra_types_list_state = ListState::default();
+                self.infra_type_search.clear();
+                self.infra_type_search_editing = false;
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
@@ -3640,6 +3703,8 @@ impl App {
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
                 self.infra_types_list_state = ListState::default();
+                self.infra_type_search.clear();
+                self.infra_type_search_editing = false;
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
@@ -3648,6 +3713,8 @@ impl App {
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
                 self.infra_types_list_state = ListState::default();
+                self.infra_type_search.clear();
+                self.infra_type_search_editing = false;
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
@@ -3656,6 +3723,8 @@ impl App {
                 self.selected_infra_instance = 0;
                 self.selected_infra_type = 0;
                 self.infra_types_list_state = ListState::default();
+                self.infra_type_search.clear();
+                self.infra_type_search_editing = false;
                 self.refresh_infra();
                 self.refresh_infra_types();
             }
@@ -3674,7 +3743,7 @@ impl App {
                     }
                 }
                 InfraPanel::Types if type_count > 0 => {
-                    if let Some(instance_type) = self.infra_types.get(self.selected_infra_type) {
+                    if let Some(instance_type) = self.selected_infra_type() {
                         if instance_type.regions.is_empty() {
                             self.infra_error = Some("No availability for this type".to_string());
                         } else if instance_type.regions.len() == 1 {
@@ -3732,6 +3801,11 @@ impl App {
                 self.infra_type_sort = self.infra_type_sort.next();
                 self.sort_infra_types();
             }
+            KeyCode::Char('/') if self.infra_active_panel == InfraPanel::Types => {
+                self.infra_type_search_editing = true;
+                self.selected_infra_type = 0;
+                self.infra_types_list_state.select(Some(0));
+            }
             _ => {}
         }
     }
@@ -3751,8 +3825,7 @@ impl App {
 
     fn handle_infra_region_select_key(&mut self, code: KeyCode) {
         let regions_count = self
-            .infra_types
-            .get(self.selected_infra_type)
+            .selected_infra_type()
             .map(|t| t.regions.len())
             .unwrap_or(0);
 
@@ -4080,7 +4153,7 @@ impl App {
             return;
         };
 
-        let Some(instance_type) = self.infra_types.get(self.selected_infra_type) else {
+        let Some(instance_type) = self.selected_infra_type() else {
             self.infra_error = Some("No instance type selected".to_string());
             return;
         };
@@ -9242,9 +9315,21 @@ fn render_infra_instances_panel(app: &App, frame: &mut Frame, area: Rect) {
 fn render_infra_types_panel(app: &mut App, frame: &mut Frame, area: Rect) {
     let is_focused = app.infra_active_panel == InfraPanel::Types;
 
-    let title = Line::from(vec![
+    let filtered_types = app.filtered_infra_types();
+
+    let count_label = if app.infra_type_search.is_empty() {
+        format!(" ◆ Instance Types ({}) ", app.infra_types.len())
+    } else {
+        format!(
+            " ◆ Instance Types ({}/{}) ",
+            filtered_types.len(),
+            app.infra_types.len()
+        )
+    };
+
+    let mut title_spans = vec![
         Span::styled(
-            format!(" ◆ Instance Types ({}) ", app.infra_types.len()),
+            count_label,
             Style::default()
                 .fg(if is_focused { NEON_CYAN } else { Color::Gray })
                 .bold(),
@@ -9253,7 +9338,21 @@ fn render_infra_types_panel(app: &mut App, frame: &mut Frame, area: Rect) {
             format!("[sort: {}] ", app.infra_type_sort.label()),
             Style::default().fg(Color::DarkGray),
         ),
-    ]);
+    ];
+
+    if app.infra_type_search_editing || !app.infra_type_search.is_empty() {
+        title_spans.push(Span::styled("/", Style::default().fg(NEON_CYAN)));
+        title_spans.push(Span::styled(
+            app.infra_type_search.clone(),
+            Style::default().fg(NEON_YELLOW),
+        ));
+        if app.infra_type_search_editing {
+            title_spans.push(Span::styled("█", Style::default().fg(NEON_YELLOW)));
+        }
+        title_spans.push(Span::raw(" "));
+    }
+
+    let title = Line::from(title_spans);
 
     let border_color = if is_focused { NEON_CYAN } else { DIM_CYAN };
 
@@ -9291,8 +9390,15 @@ fn render_infra_types_panel(app: &mut App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .infra_types
+    if filtered_types.is_empty() {
+        let msg = format!("No instance types match \"{}\"", app.infra_type_search);
+        let empty =
+            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))).block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = filtered_types
         .iter()
         .enumerate()
         .map(|(i, it)| {
@@ -9404,6 +9510,18 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("?", Style::default().fg(NEON_YELLOW)),
             Span::styled("] help", Style::default().fg(Color::DarkGray)),
         ])
+    } else if app.infra_type_search_editing {
+        Line::from(vec![
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("type to filter", Style::default().fg(NEON_YELLOW)),
+            Span::styled("]  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Enter", Style::default().fg(NEON_GREEN)),
+            Span::styled("] done  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("Esc", Style::default().fg(NEON_YELLOW)),
+            Span::styled("] clear", Style::default().fg(Color::DarkGray)),
+        ])
     } else {
         Line::from(vec![
             Span::styled("[", Style::default().fg(DIM_CYAN)),
@@ -9412,6 +9530,9 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("Enter", Style::default().fg(NEON_GREEN)),
             Span::styled("] launch  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(DIM_CYAN)),
+            Span::styled("/", Style::default().fg(NEON_CYAN)),
+            Span::styled("] search  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(DIM_CYAN)),
             Span::styled("1-4", Style::default().fg(NEON_YELLOW)),
             Span::styled("] provider  ", Style::default().fg(Color::DarkGray)),
@@ -9435,12 +9556,16 @@ fn render_infra_help_bar(app: &App, frame: &mut Frame, area: Rect) {
 fn render_infra_region_popup(app: &App, frame: &mut Frame) {
     use ratatui::widgets::Clear;
 
-    let selected_type = app.infra_types.get(app.selected_infra_type);
+    let selected_type = app.selected_infra_type();
     let regions: Vec<&str> = selected_type
+        .as_ref()
         .map(|t| t.regions.iter().map(|s| s.as_str()).collect())
         .unwrap_or_default();
 
-    let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
+    let type_name = selected_type
+        .as_ref()
+        .map(|t| t.name.as_str())
+        .unwrap_or("unknown");
 
     let area = frame.area();
     let popup_width = 50u16.min(area.width.saturating_sub(4));
@@ -9473,6 +9598,7 @@ fn render_infra_region_popup(app: &App, frame: &mut Frame) {
         };
 
         let price_suffix = selected_type
+            .as_ref()
             .and_then(|t| t.metadata.get(&format!("price:{}", region)))
             .and_then(|c| c.parse::<u32>().ok())
             .map(|cents| format!("  ${:.2}/hr", cents as f64 / 100.0))
@@ -9502,13 +9628,18 @@ fn render_infra_region_popup(app: &App, frame: &mut Frame) {
 fn render_infra_launch_confirm(app: &App, frame: &mut Frame) {
     use ratatui::widgets::Clear;
 
-    let selected_type = app.infra_types.get(app.selected_infra_type);
-    let type_name = selected_type.map(|t| t.name.as_str()).unwrap_or("unknown");
+    let selected_type = app.selected_infra_type();
+    let type_name = selected_type
+        .as_ref()
+        .map(|t| t.name.as_str())
+        .unwrap_or("unknown");
     let region = selected_type
+        .as_ref()
         .and_then(|t| t.regions.get(app.launch_selected_region))
         .map(|s| s.as_str())
         .unwrap_or("default");
     let type_price = selected_type
+        .as_ref()
         .and_then(|t| {
             t.metadata
                 .get(&format!("price:{}", region))
@@ -9517,6 +9648,7 @@ fn render_infra_launch_confirm(app: &App, frame: &mut Frame) {
         })
         .unwrap_or_else(|| {
             selected_type
+                .as_ref()
                 .map(|t| t.price_display())
                 .unwrap_or_else(|| "?".to_string())
         });
