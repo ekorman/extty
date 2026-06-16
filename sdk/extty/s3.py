@@ -470,7 +470,7 @@ class S3Storage:
         if self._buffer_count == 0:
             return
 
-        logger.info(
+        logger.debug(
             "S3 flush: %d items (%d metric / %d example / %d confusion streams, "
             "%d system samples) — trigger: %s",
             self._buffer_count,
