@@ -6,9 +6,10 @@ import json
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, overload
 
 from extty.storage import (
+    Checkpoint,
     ConfusionMatrixRecord,
     ExampleRecord,
     MetaData,
@@ -57,26 +58,42 @@ class RunData:
         """List all available metric names for this run."""
         return self._storage.list_metric_names()
 
-    def metric(self, name: str) -> list[MetricPoint]:
+    @overload
+    def metric(self, name: str) -> list[MetricPoint]: ...
+
+    @overload
+    def metric(self, name: str, step: int) -> MetricPoint | None: ...
+
+    def metric(
+        self, name: str, step: int | None = None
+    ) -> list[MetricPoint] | MetricPoint | None:
         """
-        Load all data points for a specific metric.
+        Load data points for a specific metric.
 
         Parameters
         ----------
         name : str
             Metric name (e.g., "train/loss").
+        step : int, optional
+            If given, return only the data point logged at this step rather
+            than the full history.
 
         Returns
         -------
-        list[MetricPoint]
-            List of MetricPoint(step, timestamp, value), sorted by step.
+        list[MetricPoint] or MetricPoint or None
+            When ``step`` is omitted, the list of MetricPoint(step, timestamp,
+            value) sorted by step. When ``step`` is given, the matching
+            MetricPoint, or None if no point was logged at that step.
 
         Raises
         ------
         FileNotFoundError
             If the metric does not exist.
         """
-        return self._storage.read_metric(name)
+        points = self._storage.read_metric(name)
+        if step is None:
+            return points
+        return next((p for p in points if p.step == step), None)
 
     @property
     def system_metrics(self) -> list[SystemMetricPoint]:
@@ -143,6 +160,20 @@ class RunData:
             If the confusion matrix file does not exist.
         """
         return self._storage.read_confusion_matrix(name)
+
+    @property
+    def checkpoints(self) -> list[Checkpoint]:
+        """
+        List the checkpoints saved for this run.
+
+        Reads the run's ``checkpoints.json`` index.
+
+        Returns
+        -------
+        list[Checkpoint]
+            Checkpoints sorted by step, or an empty list if none were saved.
+        """
+        return self._storage.read_checkpoints()
 
     @property
     def duration_seconds(self) -> float | None:

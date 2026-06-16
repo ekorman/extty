@@ -66,13 +66,18 @@ class ConfusionMatrixRecord:
 
 @dataclass(frozen=True)
 class CheckpointFile:
+    """A single file belonging to a checkpoint."""
+
     name: str
     size_bytes: int
 
 
 @dataclass(frozen=True)
 class Checkpoint:
+    """A single saved checkpoint, as recorded in ``checkpoints.json``."""
+
     step: int
+    timestamp: str
     files: list[CheckpointFile]
 
 
@@ -173,6 +178,24 @@ def parse_confusion_jsonl(text: str) -> list[ConfusionMatrixRecord]:
     return records
 
 
+def parse_checkpoints_json(text: str) -> list[Checkpoint]:
+    """Parse a ``checkpoints.json`` body into Checkpoint values, sorted by step."""
+    entries = json.loads(text)
+    checkpoints = [
+        Checkpoint(
+            step=entry["step"],
+            timestamp=entry["timestamp"],
+            files=[
+                CheckpointFile(name=f["name"], size_bytes=f["size_bytes"])
+                for f in entry.get("files", [])
+            ],
+        )
+        for entry in entries
+    ]
+    checkpoints.sort(key=lambda c: c.step)
+    return checkpoints
+
+
 class RunStorageReader(Protocol):
     """Read-only surface needed by :class:`extty.query.RunData`.
 
@@ -189,6 +212,7 @@ class RunStorageReader(Protocol):
     def read_examples(self, name: str) -> list[ExampleRecord]: ...
     def list_confusion_matrix_names(self) -> list[str]: ...
     def read_confusion_matrix(self, name: str) -> list[ConfusionMatrixRecord]: ...
+    def read_checkpoints(self) -> list[Checkpoint]: ...
 
 
 @dataclass
@@ -499,5 +523,9 @@ class RunStorage:
             )
         return parse_confusion_jsonl(filepath.read_text())
 
-    def list_checkpoints():
-        pass
+    def read_checkpoints(self) -> list[Checkpoint]:
+        """Read the run's checkpoint index from ``checkpoints.json``."""
+        filepath = self.run_dir / "checkpoints.json"
+        if not filepath.exists():
+            return []
+        return parse_checkpoints_json(filepath.read_text())

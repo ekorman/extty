@@ -30,6 +30,8 @@ from extty.query import RunData, get_run, get_runs
 from extty.run import NoOpRun, Run
 from extty.s3 import S3Config
 from extty.storage import (
+    Checkpoint,
+    CheckpointFile,
     ConfusionMatrixRecord,
     ExampleRecord,
     MetricPoint,
@@ -63,6 +65,8 @@ __all__ = [
     "MetricPoint",
     "SystemMetricPoint",
     "ExampleRecord",
+    "Checkpoint",
+    "CheckpointFile",
     "has_active_run",
     "NoOpRun",
     "ArtifactMeta",

@@ -17,11 +17,13 @@ from extty._logger import _DIM_CYAN, _NEON_CYAN, _NEON_GREEN, _RESET, _supports_
 from extty._logger import log as logger
 from extty.confusion import ConfusionMatrix
 from extty.storage import (
+    Checkpoint,
     ConfusionMatrixRecord,
     ExampleRecord,
     MetaData,
     MetricPoint,
     SystemMetricPoint,
+    parse_checkpoints_json,
     parse_confusion_jsonl,
     parse_examples_jsonl,
     parse_metric_csv,
@@ -1137,3 +1139,9 @@ class S3RunReader:
                 f"Confusion matrix '{name}' not found at s3://{self.config.bucket}/{key}"
             )
         return parse_confusion_jsonl(text)
+
+    def read_checkpoints(self) -> list[Checkpoint]:
+        text = self._get_text(self._s3_key("checkpoints.json"))
+        if text is None:
+            return []
+        return parse_checkpoints_json(text)
