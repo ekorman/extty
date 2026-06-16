@@ -1323,6 +1323,35 @@ pub fn save_archived_projects(archived: &HashSet<String>) {
     }
 }
 
+fn archived_runs_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".extty")
+        .join("archived_runs.json")
+}
+
+pub fn load_archived_runs() -> HashSet<String> {
+    let path = archived_runs_path();
+    let Ok(content) = fs::read_to_string(&path) else {
+        return HashSet::new();
+    };
+    let Ok(names) = serde_json::from_str::<Vec<String>>(&content) else {
+        return HashSet::new();
+    };
+    names.into_iter().collect()
+}
+
+pub fn save_archived_runs(archived: &HashSet<String>) {
+    let path = archived_runs_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let names: Vec<&String> = archived.iter().collect();
+    if let Ok(json) = serde_json::to_string(&names) {
+        let _ = fs::write(&path, json);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ArtifactFile {
     pub path: String,

@@ -43,9 +43,9 @@ mod run;
 mod s3;
 use data::{
     Artifact, Checkpoint, ConfusionMatrixPoint, Example, ExampleGroup, MetricPoint, Reward, Run,
-    artifacts_dir, load_archived_projects, load_artifacts_from_cache, load_run_notes,
-    load_runs_lightweight, load_starred_runs, mark_run_completed, save_archived_projects,
-    save_run_notes, save_starred_runs,
+    artifacts_dir, load_archived_projects, load_archived_runs, load_artifacts_from_cache,
+    load_run_notes, load_runs_lightweight, load_starred_runs, mark_run_completed,
+    save_archived_projects, save_archived_runs, save_run_notes, save_starred_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, ScriptOptions,
@@ -286,6 +286,7 @@ struct App {
     hide_completed: bool,
     show_only_active_projects: bool,
     archived_projects: HashSet<String>,
+    archived_runs: HashSet<String>,
     show_archived: bool,
     // Artifacts
     artifacts: Vec<Artifact>,
@@ -407,6 +408,7 @@ impl App {
             hide_completed: false,
             show_only_active_projects: false,
             archived_projects: load_archived_projects(),
+            archived_runs: load_archived_runs(),
             show_archived: false,
             artifacts: load_artifacts_from_cache(),
             selected_artifact: 0,
@@ -470,6 +472,13 @@ impl App {
                 let mut starred: Vec<usize> = Vec::new();
                 let mut unstarred: Vec<usize> = Vec::new();
                 for run_index in run_indices {
+                    if !self.show_archived
+                        && self
+                            .archived_runs
+                            .contains(&self.runs[run_index].display_name())
+                    {
+                        continue;
+                    }
                     if self
                         .starred_runs
                         .contains(&self.runs[run_index].display_name())
@@ -2774,8 +2783,8 @@ impl App {
                 self.selected_list_item = 0;
                 self.list_state.select(Some(0));
             }
-            KeyCode::Char('A') => {
-                if let Some(ListEntry::Project { name }) = entries.get(self.selected_list_item) {
+            KeyCode::Char('A') => match entries.get(self.selected_list_item) {
+                Some(ListEntry::Project { name }) => {
                     if !self.archived_projects.remove(name) {
                         self.archived_projects.insert(name.clone());
                     }
@@ -2783,7 +2792,17 @@ impl App {
                     self.selected_list_item = 0;
                     self.list_state.select(Some(0));
                 }
-            }
+                Some(ListEntry::Run { run_index }) => {
+                    let name = self.runs[*run_index].display_name();
+                    if !self.archived_runs.remove(&name) {
+                        self.archived_runs.insert(name);
+                    }
+                    save_archived_runs(&self.archived_runs);
+                    self.selected_list_item = 0;
+                    self.list_state.select(Some(0));
+                }
+                _ => {}
+            },
             KeyCode::Char('.') => {
                 self.show_archived = !self.show_archived;
                 self.selected_list_item = 0;
@@ -4866,8 +4885,12 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
                         ("○ ", Color::DarkGray)
                     };
 
+                    let is_archived = app.archived_runs.contains(&run.display_name());
+
                     let name_style = if is_selected {
                         Style::default().fg(NEON_CYAN).bold()
+                    } else if is_archived {
+                        Style::default().fg(Color::DarkGray)
                     } else if is_running {
                         Style::default().fg(NEON_GREEN)
                     } else {
@@ -4919,7 +4942,7 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
                     let note_icon = if has_note { "✎" } else { " " };
                     let note_color = if has_note { NEON_CYAN } else { Color::DarkGray };
 
-                    let spans = vec![
+                    let mut spans = vec![
                         Span::styled(check, Style::default().fg(check_color)),
                         Span::styled(" ", Style::default()),
                         Span::styled(star, Style::default().fg(star_color)),
@@ -4932,6 +4955,12 @@ fn render_runs_list(app: &mut App, frame: &mut Frame) {
                         Span::styled(" → ", Style::default().fg(DIM_CYAN)),
                         Span::styled(end_str, time_style),
                     ];
+                    if is_archived {
+                        spans.push(Span::styled(
+                            "  [archived]",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
                     ListItem::new(Line::from(spans))
                 }
             }
@@ -8534,7 +8563,7 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                     ("M", "move to project"),
                     ("s", "star / unstar"),
                     ("n", "edit note"),
-                    ("A", "archive project"),
+                    ("A", "archive project/run"),
                 ],
             ),
             (
