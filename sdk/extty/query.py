@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, overload
 
 from extty.storage import (
+    ChartRecord,
     Checkpoint,
     ConfusionMatrixRecord,
     ExampleRecord,
@@ -160,6 +161,33 @@ class RunData:
             If the confusion matrix file does not exist.
         """
         return self._storage.read_confusion_matrix(name)
+
+    @property
+    def chart_names(self) -> list[str]:
+        """List all available chart names for this run."""
+        return self._storage.list_chart_names()
+
+    def chart(self, name: str) -> list[ChartRecord]:
+        """
+        Load all chart records for a specific name.
+
+        Parameters
+        ----------
+        name : str
+            Chart name (e.g., "eval/roc").
+
+        Returns
+        -------
+        list[ChartRecord]
+            List of ChartRecord(step, timestamp, x_axis, y_axis, points),
+            sorted by step in the order written.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the chart file does not exist.
+        """
+        return self._storage.read_chart(name)
 
     @property
     def checkpoints(self) -> list[Checkpoint]:

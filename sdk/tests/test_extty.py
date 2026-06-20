@@ -78,6 +78,7 @@ class TestRunStorage:
         assert (temp_run_dir / "test-run" / "metrics").exists()
         assert (temp_run_dir / "test-run" / "examples").exists()
         assert (temp_run_dir / "test-run" / "confusion_matrices").exists()
+        assert (temp_run_dir / "test-run" / "charts").exists()
 
     def test_write_and_read_meta(self, temp_run_dir: Path) -> None:
         storage = RunStorage(run_dir=temp_run_dir / "test-run")
@@ -179,6 +180,47 @@ class TestRunStorage:
         assert records[0].labels == ["a", "b"]
         assert "eval/cm" in storage.list_confusion_matrix_names()
 
+    def test_log_chart_creates_jsonl(self, temp_run_dir: Path) -> None:
+        storage = RunStorage(run_dir=temp_run_dir / "test-run")
+        storage.log_chart(
+            "eval/roc",
+            extty.Chart(
+                points=[(0.0, 0.0), (0.5, 0.7), (1.0, 1.0)], axis_names=("fpr", "tpr")
+            ),
+            step=10,
+        )
+        storage.flush()
+
+        jsonl_path = temp_run_dir / "test-run" / "charts" / "eval" / "roc.jsonl"
+        assert jsonl_path.exists()
+        lines = jsonl_path.read_text().strip().split("\n")
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["step"] == 10
+        assert record["x_axis"] == "fpr"
+        assert record["y_axis"] == "tpr"
+        assert record["points"] == [[0.0, 0.0], [0.5, 0.7], [1.0, 1.0]]
+
+    def test_read_chart_roundtrip(self, temp_run_dir: Path) -> None:
+        storage = RunStorage(run_dir=temp_run_dir / "test-run")
+        for step in range(3):
+            storage.log_chart(
+                "eval/roc",
+                extty.Chart(
+                    points=[(float(i), float(i * step)) for i in range(3)],
+                    axis_names=("x", "y"),
+                ),
+                step=step,
+            )
+        storage.flush()
+
+        records = storage.read_chart("eval/roc")
+        assert [r.step for r in records] == [0, 1, 2]
+        assert records[2].points == [(0.0, 0.0), (1.0, 2.0), (2.0, 4.0)]
+        assert records[0].x_axis == "x"
+        assert records[0].y_axis == "y"
+        assert "eval/roc" in storage.list_chart_names()
+
 
 class TestExttyAPI:
     def test_init_creates_run(self, tmp_path: Path) -> None:
@@ -256,6 +298,34 @@ class TestExttyAPI:
         record = json.loads(cm_path.read_text().strip())
         assert record["labels"] == ["a", "b"]
         assert record["matrix"] == [[5, 1], [0, 6]]
+
+    def test_log_chart(self, tmp_path: Path) -> None:
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="chart-test", system_metrics=False)
+            extty.log(
+                {
+                    "eval/roc": extty.Chart(
+                        points=[(0.0, 0.0), (1.0, 1.0)], axis_names=("fpr", "tpr")
+                    )
+                },
+                step=0,
+            )
+            extty.finish()
+
+        chart_path = (
+            tmp_path
+            / "runs"
+            / "test-project"
+            / "chart-test"
+            / "charts"
+            / "eval"
+            / "roc.jsonl"
+        )
+        assert chart_path.exists()
+        record = json.loads(chart_path.read_text().strip())
+        assert record["x_axis"] == "fpr"
+        assert record["y_axis"] == "tpr"
+        assert record["points"] == [[0.0, 0.0], [1.0, 1.0]]
 
     def test_context_manager(self, tmp_path: Path) -> None:
         import json
@@ -350,6 +420,36 @@ class TestConfusionMatrix:
     def test_from_array_with_plain_list(self) -> None:
         cm = extty.ConfusionMatrix.from_array([[0, 1], [2, 3]], ["a", "b"])
         assert cm.matrix == [[0, 1], [2, 3]]
+
+
+class TestChart:
+    """Tests for Chart construction and validation."""
+
+    def test_basic(self) -> None:
+        chart = extty.Chart(points=[(0.0, 1.0), (2.0, 3.0)], axis_names=("x", "y"))
+        assert chart.points == [(0.0, 1.0), (2.0, 3.0)]
+        assert chart.axis_names == ("x", "y")
+
+    def test_bad_axis_names_raises(self) -> None:
+        with pytest.raises(ValueError, match="axis_names"):
+            extty.Chart(points=[(0.0, 1.0)], axis_names=("x",))  # type: ignore[arg-type]
+
+    def test_bad_point_raises(self) -> None:
+        with pytest.raises(ValueError, match="point"):
+            extty.Chart(points=[(0.0, 1.0, 2.0)], axis_names=("x", "y"))  # type: ignore[list-item]
+
+    def test_from_arrays_with_tolist(self) -> None:
+        class Fake:
+            def tolist(self) -> list[float]:
+                return [1.0, 2.0, 3.0]
+
+        chart = extty.Chart.from_arrays(Fake(), Fake(), ["x", "y"])
+        assert chart.points == [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]
+        assert chart.axis_names == ("x", "y")
+
+    def test_from_arrays_length_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match="length"):
+            extty.Chart.from_arrays([1, 2], [1], ["x", "y"])
 
 
 class TestExampleRewards:

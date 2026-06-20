@@ -125,6 +125,31 @@ impl ConfusionMatrixSeries {
 }
 
 #[derive(Debug, Clone)]
+pub struct ChartPoint {
+    pub step: u64,
+    #[allow(dead_code)]
+    pub timestamp: f64,
+    pub x_axis: String,
+    pub y_axis: String,
+    pub points: Vec<(f64, f64)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChartSeries {
+    pub points: Vec<ChartPoint>,
+}
+
+impl ChartSeries {
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&ChartPoint> {
+        self.points.get(idx)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CheckpointFile {
     pub name: String,
     pub size_bytes: Option<u64>,
@@ -182,6 +207,7 @@ pub struct Run {
     pub metrics: HashMap<String, Vec<MetricPoint>>,
     pub examples: HashMap<String, ExampleGroup>,
     pub confusion_matrices: HashMap<String, ConfusionMatrixSeries>,
+    pub charts: HashMap<String, ChartSeries>,
     pub start_time: Option<DateTime<Local>>,
     pub end_time: Option<DateTime<Local>>,
     pub status: RunStatus,
@@ -310,6 +336,7 @@ fn load_run_lightweight(path: &Path) -> Option<Run> {
         metrics: HashMap::new(),
         examples: HashMap::new(),
         confusion_matrices: HashMap::new(),
+        charts: HashMap::new(),
         start_time,
         end_time,
         status,
@@ -391,6 +418,7 @@ fn load_run(path: &Path) -> Option<Run> {
     metrics.extend(load_system_metrics(path));
     let examples = load_examples(path);
     let confusion_matrices = load_confusion_matrices(path);
+    let charts = load_charts(path);
     let checkpoints = load_checkpoints(path);
 
     let (project, start_time, end_time, status, config) = load_run_meta(path);
@@ -402,6 +430,7 @@ fn load_run(path: &Path) -> Option<Run> {
         metrics,
         examples,
         confusion_matrices,
+        charts,
         start_time,
         end_time,
         status,
@@ -1237,6 +1266,73 @@ fn load_confusion_matrices_recursive(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ChartRow {
+    step: u64,
+    timestamp: f64,
+    x_axis: String,
+    y_axis: String,
+    points: Vec<(f64, f64)>,
+}
+
+fn load_charts(run_path: &Path) -> HashMap<String, ChartSeries> {
+    let mut series: HashMap<String, ChartSeries> = HashMap::new();
+    let chart_dir = run_path.join("charts");
+
+    if !chart_dir.exists() {
+        return series;
+    }
+
+    load_charts_recursive(&chart_dir, &chart_dir, &mut series);
+
+    for s in series.values_mut() {
+        s.points.sort_by_key(|p| p.step);
+    }
+    series
+}
+
+fn load_charts_recursive(
+    base_dir: &Path,
+    current_dir: &Path,
+    series: &mut HashMap<String, ChartSeries>,
+) {
+    let Ok(entries) = fs::read_dir(current_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            load_charts_recursive(base_dir, &path, series);
+        } else if path.extension().map(|e| e == "jsonl").unwrap_or(false)
+            && let Ok(relative) = path.strip_prefix(base_dir)
+        {
+            let name = relative.with_extension("").to_string_lossy().to_string();
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let reader = BufReader::new(file);
+            let entry = series.entry(name).or_default();
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(row) = serde_json::from_str::<ChartRow>(&line) else {
+                    continue;
+                };
+                entry.points.push(ChartPoint {
+                    step: row.step,
+                    timestamp: row.timestamp,
+                    x_axis: row.x_axis,
+                    y_axis: row.y_axis,
+                    points: row.points,
+                });
+            }
+        }
+    }
+}
+
 fn starred_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1493,6 +1589,36 @@ mod tests {
     fn load_confusion_matrices_missing_dir_is_empty() {
         let tmp = TempDir::new().unwrap();
         let series = load_confusion_matrices(tmp.path());
+        assert!(series.is_empty());
+    }
+
+    #[test]
+    fn load_charts_reads_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let run_path = tmp.path();
+        let chart_dir = run_path.join("charts").join("eval");
+        fs::create_dir_all(&chart_dir).unwrap();
+        let jsonl = "\
+{\"step\":1,\"timestamp\":2.0,\"x_axis\":\"fpr\",\"y_axis\":\"tpr\",\"points\":[[0.0,0.0],[1.0,1.0]]}
+{\"step\":0,\"timestamp\":1.0,\"x_axis\":\"fpr\",\"y_axis\":\"tpr\",\"points\":[[0.0,0.0],[0.5,0.7]]}
+";
+        fs::write(chart_dir.join("roc.jsonl"), jsonl).unwrap();
+
+        let series = load_charts(run_path);
+        let s = series.get("eval/roc").expect("eval/roc loaded");
+        assert_eq!(s.len(), 2);
+        // sorted by step
+        assert_eq!(s.get(0).unwrap().step, 0);
+        assert_eq!(s.get(0).unwrap().x_axis, "fpr");
+        assert_eq!(s.get(0).unwrap().y_axis, "tpr");
+        assert_eq!(s.get(0).unwrap().points, vec![(0.0, 0.0), (0.5, 0.7)]);
+        assert_eq!(s.get(1).unwrap().points, vec![(0.0, 0.0), (1.0, 1.0)]);
+    }
+
+    #[test]
+    fn load_charts_missing_dir_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let series = load_charts(tmp.path());
         assert!(series.is_empty());
     }
 }

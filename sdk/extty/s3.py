@@ -15,14 +15,17 @@ from typing import Any
 
 from extty._logger import _DIM_CYAN, _NEON_CYAN, _NEON_GREEN, _RESET, _supports_color
 from extty._logger import log as logger
+from extty.chart import Chart
 from extty.confusion import ConfusionMatrix
 from extty.storage import (
+    ChartRecord,
     Checkpoint,
     ConfusionMatrixRecord,
     ExampleRecord,
     MetaData,
     MetricPoint,
     SystemMetricPoint,
+    parse_chart_jsonl,
     parse_checkpoints_json,
     parse_confusion_jsonl,
     parse_examples_jsonl,
@@ -358,6 +361,9 @@ class S3Storage:
     _confusion_buffer: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict, repr=False
     )
+    _chart_buffer: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
     _system_buffer: list[
         tuple[float, float, float, float | None, float | None, float | None]
     ] = field(default_factory=list, repr=False)
@@ -376,6 +382,9 @@ class S3Storage:
         default_factory=dict, repr=False
     )
     _cumulative_confusion_rows: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
+    _cumulative_chart_rows: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict, repr=False
     )
     _cumulative_system_rows: list[
@@ -427,6 +436,22 @@ class S3Storage:
             self._buffer_count += 1
             self._maybe_flush()
 
+    def log_chart(self, name: str, chart: Chart, step: int) -> None:
+        timestamp = time.time()
+        record = {
+            "step": step,
+            "timestamp": timestamp,
+            "x_axis": chart.axis_names[0],
+            "y_axis": chart.axis_names[1],
+            "points": [[x, y] for x, y in chart.points],
+        }
+        with self._lock:
+            if name not in self._chart_buffer:
+                self._chart_buffer[name] = []
+            self._chart_buffer[name].append(record)
+            self._buffer_count += 1
+            self._maybe_flush()
+
     def log_system(
         self,
         ram_used_gb: float,
@@ -473,12 +498,13 @@ class S3Storage:
             return
 
         logger.debug(
-            "S3 flush: %d items (%d metric / %d example / %d confusion streams, "
-            "%d system samples) — trigger: %s",
+            "S3 flush: %d items (%d metric / %d example / %d confusion / %d chart "
+            "streams, %d system samples) — trigger: %s",
             self._buffer_count,
             len(self._metric_buffer),
             len(self._example_buffer),
             len(self._confusion_buffer),
+            len(self._chart_buffer),
             len(self._system_buffer),
             reason,
         )
@@ -526,6 +552,21 @@ class S3Storage:
         self._confusion_buffer.clear()
         self._confusion_buffer.update(failed_confusion)
 
+        failed_chart: dict[str, list[dict[str, Any]]] = {}
+        for name, records in self._chart_buffer.items():
+            try:
+                self._upload_chart(name, records)
+            except _S3_ERRORS:
+                logger.warning(
+                    "Failed to upload chart '%s' to S3",
+                    name,
+                    exc_info=True,
+                )
+                failed_chart[name] = records
+                had_failure = True
+        self._chart_buffer.clear()
+        self._chart_buffer.update(failed_chart)
+
         if self._system_buffer:
             try:
                 self._upload_system(self._system_buffer)
@@ -543,6 +584,7 @@ class S3Storage:
             sum(len(v) for v in self._metric_buffer.values())
             + sum(len(v) for v in self._example_buffer.values())
             + sum(len(v) for v in self._confusion_buffer.values())
+            + sum(len(v) for v in self._chart_buffer.values())
             + len(self._system_buffer)
         )
         self._last_flush = time.time()
@@ -619,6 +661,13 @@ class S3Storage:
         )
         self._put_jsonl(key, all_records)
         self._cumulative_confusion_rows[name] = all_records
+
+    def _upload_chart(self, name: str, records: list[dict[str, Any]]) -> None:
+        safe_name = sanitize_metric_name(name)
+        key = self._s3_key("charts", f"{safe_name}.jsonl")
+        all_records = list(self._cumulative_chart_rows.get(name, [])) + list(records)
+        self._put_jsonl(key, all_records)
+        self._cumulative_chart_rows[name] = all_records
 
     def _upload_system(
         self,
@@ -1139,6 +1188,18 @@ class S3RunReader:
                 f"Confusion matrix '{name}' not found at s3://{self.config.bucket}/{key}"
             )
         return parse_confusion_jsonl(text)
+
+    def list_chart_names(self) -> list[str]:
+        return self._list_stream_names("charts", ".jsonl")
+
+    def read_chart(self, name: str) -> list[ChartRecord]:
+        key = self._s3_key("charts", sanitize_metric_name(name) + ".jsonl")
+        text = self._get_text(key)
+        if text is None:
+            raise FileNotFoundError(
+                f"Chart '{name}' not found at s3://{self.config.bucket}/{key}"
+            )
+        return parse_chart_jsonl(text)
 
     def read_checkpoints(self) -> list[Checkpoint]:
         text = self._get_text(self._s3_key("checkpoints.json"))

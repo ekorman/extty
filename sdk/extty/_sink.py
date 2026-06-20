@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+from extty.chart import Chart
 from extty.confusion import ConfusionMatrix
 
 
@@ -16,6 +17,8 @@ class StorageSink(Protocol):
     def log_confusion_matrix(
         self, name: str, cm: ConfusionMatrix, step: int
     ) -> None: ...
+
+    def log_chart(self, name: str, chart: Chart, step: int) -> None: ...
 
     def log_system(
         self,

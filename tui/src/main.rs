@@ -13,7 +13,7 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table},
 };
 
 // Cyberpunk color palette
@@ -42,10 +42,11 @@ mod prune;
 mod run;
 mod s3;
 use data::{
-    Artifact, Checkpoint, ConfusionMatrixPoint, Example, ExampleGroup, MetricPoint, Reward, Run,
-    artifacts_dir, load_archived_projects, load_archived_runs, load_artifacts_from_cache,
-    load_run_notes, load_runs_lightweight, load_starred_runs, mark_run_completed,
-    save_archived_projects, save_archived_runs, save_run_notes, save_starred_runs,
+    Artifact, ChartPoint, Checkpoint, ConfusionMatrixPoint, Example, ExampleGroup, MetricPoint,
+    Reward, Run, artifacts_dir, load_archived_projects, load_archived_runs,
+    load_artifacts_from_cache, load_run_notes, load_runs_lightweight, load_starred_runs,
+    mark_run_completed, save_archived_projects, save_archived_runs, save_run_notes,
+    save_starred_runs,
 };
 use infra::{
     InfraConfig, Instance, InstanceStatus, InstanceType, LocalMachine, Provider, ScriptOptions,
@@ -159,6 +160,7 @@ enum Card {
     Chart { name: String },
     Examples { name: String },
     ConfusionMatrix { name: String },
+    XyChart { name: String },
     Checkpoints,
     Artifacts,
 }
@@ -301,6 +303,8 @@ struct App {
     help_overlay_open: bool,
     help_overlay_scroll: u16,
     confusion_step_idx: HashMap<String, usize>,
+    chart_step_idx: HashMap<String, usize>,
+    chart_table_view: HashSet<String>,
 }
 
 impl App {
@@ -425,6 +429,8 @@ impl App {
             help_overlay_open: false,
             help_overlay_scroll: 0,
             confusion_step_idx: HashMap::new(),
+            chart_step_idx: HashMap::new(),
+            chart_table_view: HashSet::new(),
         }
     }
 
@@ -558,6 +564,7 @@ impl App {
                     new_run.metrics = old_run.metrics;
                     new_run.examples = old_run.examples;
                     new_run.confusion_matrices = old_run.confusion_matrices;
+                    new_run.charts = old_run.charts;
                     new_run.checkpoints = old_run.checkpoints;
                     new_run.data_loaded = true;
                     new_run.data_loaded_at = old_run.data_loaded_at;
@@ -1940,6 +1947,12 @@ impl App {
                 cards.push(Card::ConfusionMatrix { name: name.clone() });
             }
 
+            let mut chart_names: Vec<&String> = run.charts.keys().collect();
+            chart_names.sort();
+            for name in chart_names {
+                cards.push(Card::XyChart { name: name.clone() });
+            }
+
             if !run.checkpoints.is_empty() {
                 cards.push(Card::Checkpoints);
             }
@@ -2008,20 +2021,10 @@ impl App {
     }
 
     fn card_count(&self) -> usize {
-        let Some(run) = self.current_run() else {
-            return 0;
-        };
-        let has_checkpoints = if run.checkpoints.is_empty() { 0 } else { 1 };
-        let has_artifacts = if self.run_artifacts(run).is_empty() {
-            0
-        } else {
-            1
-        };
-        run.metrics.len()
-            + run.examples.len()
-            + run.confusion_matrices.len()
-            + has_checkpoints
-            + has_artifacts
+        // Source of truth must match `cards()` exactly (which filters by
+        // `show_system_metrics`), otherwise navigation can strand
+        // `selected_card` past the end of the rendered grid.
+        self.cards().len()
     }
 
     fn get_or_load_example(&mut self, name: &str, idx: usize) -> Option<&Example> {
@@ -3279,6 +3282,14 @@ impl App {
             _ => None,
         };
 
+        let chart_state = match current_card {
+            Some(Card::XyChart { name }) => self
+                .current_run()
+                .and_then(|r| r.charts.get(name))
+                .map(|s| (name.clone(), s.len())),
+            _ => None,
+        };
+
         let prompt_count = match current_card {
             Some(Card::Examples { name }) if self.compare_focused => {
                 let steps = self.compare_example_steps(name);
@@ -3566,6 +3577,56 @@ impl App {
             KeyCode::End if confusion_state.is_some() => {
                 if let Some((name, len)) = confusion_state.clone() {
                     self.confusion_step_idx.insert(name, len.saturating_sub(1));
+                }
+            }
+            // Chart step scrubbing
+            KeyCode::Up if chart_state.is_some() => {
+                if let Some((name, len)) = chart_state.clone() {
+                    let cur = self
+                        .chart_step_idx
+                        .get(&name)
+                        .copied()
+                        .unwrap_or_else(|| len.saturating_sub(1));
+                    let step = if modifiers.contains(KeyModifiers::SHIFT) {
+                        10
+                    } else {
+                        1
+                    };
+                    self.chart_step_idx.insert(name, cur.saturating_sub(step));
+                }
+            }
+            KeyCode::Down if chart_state.is_some() => {
+                if let Some((name, len)) = chart_state.clone() {
+                    let cur = self
+                        .chart_step_idx
+                        .get(&name)
+                        .copied()
+                        .unwrap_or_else(|| len.saturating_sub(1));
+                    let step = if modifiers.contains(KeyModifiers::SHIFT) {
+                        10
+                    } else {
+                        1
+                    };
+                    let next = (cur + step).min(len.saturating_sub(1));
+                    self.chart_step_idx.insert(name, next);
+                }
+            }
+            KeyCode::Home if chart_state.is_some() => {
+                if let Some((name, _)) = chart_state.clone() {
+                    self.chart_step_idx.insert(name, 0);
+                }
+            }
+            KeyCode::End if chart_state.is_some() => {
+                if let Some((name, len)) = chart_state.clone() {
+                    self.chart_step_idx.insert(name, len.saturating_sub(1));
+                }
+            }
+            // Toggle plot/table view for a chart
+            KeyCode::Char('v') if chart_state.is_some() => {
+                if let Some((name, _)) = chart_state.clone()
+                    && !self.chart_table_view.remove(&name)
+                {
+                    self.chart_table_view.insert(name);
                 }
             }
             // Shift+Up/Down jump 10 examples at a time
@@ -5648,6 +5709,27 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                     }
                 }
             }
+            Card::XyChart { name } => {
+                if let Some(series) = run.charts.get(name) {
+                    let idx = app
+                        .chart_step_idx
+                        .get(name)
+                        .copied()
+                        .unwrap_or_else(|| series.len().saturating_sub(1))
+                        .min(series.len().saturating_sub(1));
+                    if let Some(point) = series.get(idx) {
+                        let table_view = app.chart_table_view.contains(name);
+                        render_xy_chart_card(
+                            frame,
+                            card_area,
+                            name,
+                            point,
+                            is_selected,
+                            table_view,
+                        );
+                    }
+                }
+            }
             Card::Checkpoints => {
                 render_checkpoints_card(
                     frame,
@@ -7417,6 +7499,202 @@ fn render_focused_confusion_matrix(
     }
 }
 
+fn render_xy_plot(frame: &mut Frame, area: Rect, point: &ChartPoint, block: Block, fg: Color) {
+    use ratatui::symbols::Marker;
+    use ratatui::widgets::{Axis, Chart, Dataset, GraphType};
+
+    let inner = block.inner(area);
+
+    if point.points.is_empty() || inner.width == 0 || inner.height == 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "No data",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    let max_points = (inner.width as usize) * 2;
+    let data = lttb_downsample(&point.points, max_points);
+
+    let x_min = point
+        .points
+        .iter()
+        .map(|p| p.0)
+        .fold(f64::INFINITY, f64::min);
+    let x_max = point
+        .points
+        .iter()
+        .map(|p| p.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let y_data_min = point
+        .points
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::INFINITY, f64::min);
+    let y_data_max = point
+        .points
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let y_range = (y_data_max - y_data_min).max(0.001);
+    let y_min = y_data_min - y_range * 0.1;
+    let y_max = y_data_max + y_range * 0.1;
+    let (x_lo, x_hi) = if (x_max - x_min).abs() < f64::EPSILON {
+        (x_min - 0.5, x_max + 0.5)
+    } else {
+        (x_min, x_max)
+    };
+
+    let dataset = Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(NEON_GREEN))
+        .data(&data);
+
+    let axis_style = Style::default().fg(DIM_CYAN);
+    let label_style = Style::default().fg(Color::DarkGray);
+    let title_style = Style::default().fg(fg);
+
+    let x_span = x_hi - x_lo;
+    let num_ticks = 5;
+    let x_labels: Vec<Span> = (0..num_ticks)
+        .map(|i| {
+            let v = x_lo + x_span * i as f64 / (num_ticks - 1) as f64;
+            Span::styled(format_y_label(v, x_span), label_style)
+        })
+        .collect();
+    let y_labels: Vec<Span> = (0..num_ticks)
+        .map(|i| {
+            let v = y_data_min + y_range * i as f64 / (num_ticks - 1) as f64;
+            Span::styled(format_y_label(v, y_range), label_style)
+        })
+        .collect();
+
+    let chart = Chart::new(vec![dataset])
+        .block(block)
+        .x_axis(
+            Axis::default()
+                .title(Span::styled(point.x_axis.clone(), title_style))
+                .style(axis_style)
+                .bounds([x_lo, x_hi])
+                .labels(x_labels),
+        )
+        .y_axis(
+            Axis::default()
+                .title(Span::styled(point.y_axis.clone(), title_style))
+                .style(axis_style)
+                .bounds([y_min, y_max])
+                .labels(y_labels),
+        );
+
+    frame.render_widget(chart, area);
+}
+
+fn render_xy_table(frame: &mut Frame, area: Rect, point: &ChartPoint, block: Block) {
+    let header = Row::new(vec![
+        Cell::from(point.x_axis.clone()),
+        Cell::from(point.y_axis.clone()),
+    ])
+    .style(Style::default().fg(NEON_MAGENTA).bold());
+
+    let rows: Vec<Row> = point
+        .points
+        .iter()
+        .map(|(x, y)| {
+            Row::new(vec![
+                Cell::from(format_scalar_value(*x)),
+                Cell::from(format_scalar_value(*y)),
+            ])
+        })
+        .collect();
+
+    let widths = [Constraint::Percentage(50), Constraint::Percentage(50)];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(1)
+        .block(block);
+    frame.render_widget(table, area);
+}
+
+fn render_xy_chart_card(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    point: &ChartPoint,
+    selected: bool,
+    table_view: bool,
+) {
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    let title = Line::from(vec![
+        Span::styled(format!(" {} ", name), title_style),
+        Span::styled(
+            format!("@ step {} ", point.step),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    if table_view {
+        render_xy_table(frame, area, point, block);
+    } else {
+        let fg = if selected { NEON_CYAN } else { NEON_GREEN };
+        render_xy_plot(frame, area, point, block, fg);
+    }
+}
+
+fn render_focused_xy_chart(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    point: &ChartPoint,
+    step_idx: usize,
+    total_steps: usize,
+    table_view: bool,
+) {
+    let view_label = if table_view { "table" } else { "plot" };
+    let title = Line::from(vec![
+        Span::styled(format!(" {} ", name), Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(
+            format!(
+                "step {}  [{}/{}]  ({}) ",
+                point.step,
+                step_idx + 1,
+                total_steps,
+                view_label
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(NEON_CYAN));
+
+    if table_view {
+        render_xy_table(frame, area, point, block);
+    } else {
+        render_xy_plot(frame, area, point, block, NEON_CYAN);
+    }
+}
+
 fn render_focused_checkpoints(
     frame: &mut Frame,
     area: Rect,
@@ -8037,6 +8315,54 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                         format!("{}/{}  ", idx + 1, series.len()),
                         Style::default().fg(NEON_YELLOW),
                     ),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("?", Style::default().fg(NEON_YELLOW)),
+                    Span::styled("] help", Style::default().fg(Color::DarkGray)),
+                ]);
+                frame.render_widget(Paragraph::new(footer), chunks[1]);
+            }
+        }
+        Card::XyChart { name } => {
+            if let Some(series) = run.charts.get(name) {
+                let idx = app
+                    .chart_step_idx
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| series.len().saturating_sub(1));
+                let idx = idx.min(series.len().saturating_sub(1));
+                let table_view = app.chart_table_view.contains(name);
+                if let Some(point) = series.get(idx) {
+                    render_focused_xy_chart(
+                        frame,
+                        chunks[0],
+                        name,
+                        point,
+                        idx,
+                        series.len(),
+                        table_view,
+                    );
+                }
+                let footer = Line::from(vec![
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+                    Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}  ", app.selected_card + 1, cards.len()),
+                        Style::default().fg(NEON_GREEN),
+                    ),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] step ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}  ", idx + 1, series.len()),
+                        Style::default().fg(NEON_YELLOW),
+                    ),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("v", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] plot/table  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("?", Style::default().fg(NEON_YELLOW)),
                     Span::styled("] help", Style::default().fg(Color::DarkGray)),
@@ -8954,6 +9280,14 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                     ("space", "toggle checkpoint selection"),
                     ("a", "select / deselect all"),
                     ("D", "delete selected (or current)"),
+                ],
+            ),
+            (
+                "Charts",
+                vec![
+                    ("↑↓", "previous / next step"),
+                    ("Home / End", "first / last step"),
+                    ("v", "toggle plot / table"),
                 ],
             ),
         ],
@@ -10767,6 +11101,78 @@ mod tests {
         terminal
             .draw(|f| {
                 render_focused_confusion_matrix(f, Rect::new(0, 0, 20, 8), "eval/cm", &point, 0, 1);
+            })
+            .unwrap();
+    }
+
+    fn sample_chart_point() -> ChartPoint {
+        ChartPoint {
+            step: 3,
+            timestamp: 0.0,
+            x_axis: "fpr".to_string(),
+            y_axis: "tpr".to_string(),
+            points: vec![(0.0, 0.0), (0.25, 0.5), (0.5, 0.7), (1.0, 1.0)],
+        }
+    }
+
+    #[test]
+    fn xy_chart_card_renders_plot_and_table_without_panic() {
+        let point = sample_chart_point();
+        for table_view in [false, true] {
+            let backend = TestBackend::new(40, 12);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    render_xy_chart_card(
+                        f,
+                        Rect::new(0, 0, 40, 12),
+                        "eval/roc",
+                        &point,
+                        true,
+                        table_view,
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn focused_xy_chart_renders_plot_and_table_without_panic() {
+        let point = sample_chart_point();
+        for table_view in [false, true] {
+            let backend = TestBackend::new(120, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    render_focused_xy_chart(
+                        f,
+                        Rect::new(0, 0, 120, 30),
+                        "eval/roc",
+                        &point,
+                        3,
+                        20,
+                        table_view,
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn xy_chart_tiny_area_and_empty_points_do_not_panic() {
+        let empty = ChartPoint {
+            step: 0,
+            timestamp: 0.0,
+            x_axis: "x".to_string(),
+            y_axis: "y".to_string(),
+            points: vec![],
+        };
+        let backend = TestBackend::new(8, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_xy_chart_card(f, Rect::new(0, 0, 8, 4), "roc", &empty, false, false);
+                render_focused_xy_chart(f, Rect::new(0, 0, 8, 4), "roc", &empty, 0, 1, true);
             })
             .unwrap();
     }

@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from extty.chart import Chart
 from extty.confusion import ConfusionMatrix
 
 
@@ -62,6 +63,17 @@ class ConfusionMatrixRecord:
     timestamp: float
     labels: list[str]
     matrix: list[list[int]]
+
+
+@dataclass(frozen=True)
+class ChartRecord:
+    """A single logged chart record."""
+
+    step: int
+    timestamp: float
+    x_axis: str
+    y_axis: str
+    points: list[tuple[float, float]]
 
 
 @dataclass(frozen=True)
@@ -178,6 +190,26 @@ def parse_confusion_jsonl(text: str) -> list[ConfusionMatrixRecord]:
     return records
 
 
+def parse_chart_jsonl(text: str) -> list[ChartRecord]:
+    """Parse a chart JSONL body into ChartRecord values."""
+    records: list[ChartRecord] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        records.append(
+            ChartRecord(
+                step=obj["step"],
+                timestamp=obj["timestamp"],
+                x_axis=obj["x_axis"],
+                y_axis=obj["y_axis"],
+                points=[(float(x), float(y)) for x, y in obj["points"]],
+            )
+        )
+    return records
+
+
 def parse_checkpoints_json(text: str) -> list[Checkpoint]:
     """Parse a ``checkpoints.json`` body into Checkpoint values, sorted by step."""
     entries = json.loads(text)
@@ -212,6 +244,8 @@ class RunStorageReader(Protocol):
     def read_examples(self, name: str) -> list[ExampleRecord]: ...
     def list_confusion_matrix_names(self) -> list[str]: ...
     def read_confusion_matrix(self, name: str) -> list[ConfusionMatrixRecord]: ...
+    def list_chart_names(self) -> list[str]: ...
+    def read_chart(self, name: str) -> list[ChartRecord]: ...
     def read_checkpoints(self) -> list[Checkpoint]: ...
 
 
@@ -270,6 +304,9 @@ class RunStorage:
     _confusion_buffer: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict, repr=False
     )
+    _chart_buffer: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
     _buffer_size: int = 200
     _last_flush: float = field(default_factory=time.time, repr=False)
     _flush_interval: float = 1.0
@@ -280,6 +317,7 @@ class RunStorage:
             (self.run_dir / "metrics").mkdir(exist_ok=True)
             (self.run_dir / "examples").mkdir(exist_ok=True)
             (self.run_dir / "confusion_matrices").mkdir(exist_ok=True)
+            (self.run_dir / "charts").mkdir(exist_ok=True)
 
     @classmethod
     def open_readonly(cls, run_dir: Path) -> RunStorage:
@@ -312,6 +350,7 @@ class RunStorage:
             len(self._buffer)
             + sum(len(v) for v in self._example_buffer.values())
             + sum(len(v) for v in self._confusion_buffer.values())
+            + sum(len(v) for v in self._chart_buffer.values())
         )
         if total == 0:
             return
@@ -346,6 +385,11 @@ class RunStorage:
                 self._write_confusion_batch(name, records)
             self._confusion_buffer.clear()
 
+        if self._chart_buffer:
+            for name, records in self._chart_buffer.items():
+                self._write_chart_batch(name, records)
+            self._chart_buffer.clear()
+
         self._last_flush = time.time()
 
     def _write_metric_batch(
@@ -377,6 +421,16 @@ class RunStorage:
         """Write a batch of confusion matrix records to the JSONL file."""
         relative_path = sanitize_metric_name(name) + ".jsonl"
         filepath = self.run_dir / "confusion_matrices" / relative_path
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(filepath, "a") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+    def _write_chart_batch(self, name: str, records: list[dict[str, Any]]) -> None:
+        """Write a batch of chart records to the JSONL file."""
+        relative_path = sanitize_metric_name(name) + ".jsonl"
+        filepath = self.run_dir / "charts" / relative_path
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         with open(filepath, "a") as f:
@@ -447,6 +501,30 @@ class RunStorage:
         if name not in self._confusion_buffer:
             self._confusion_buffer[name] = []
         self._confusion_buffer[name].append(record)
+        self._maybe_flush()
+
+    def log_chart(self, name: str, chart: Chart, step: int) -> None:
+        """Buffer a chart for later writing.
+
+        Parameters
+        ----------
+        name : str
+            Stream name (e.g., "eval/roc").
+        chart : Chart
+            The points and axis names to log.
+        step : int
+            The training step.
+        """
+        record = {
+            "step": step,
+            "timestamp": time.time(),
+            "x_axis": chart.axis_names[0],
+            "y_axis": chart.axis_names[1],
+            "points": [[x, y] for x, y in chart.points],
+        }
+        if name not in self._chart_buffer:
+            self._chart_buffer[name] = []
+        self._chart_buffer[name].append(record)
         self._maybe_flush()
 
     def close(self) -> None:
@@ -522,6 +600,25 @@ class RunStorage:
                 f"Confusion matrix '{name}' not found at {filepath}"
             )
         return parse_confusion_jsonl(filepath.read_text())
+
+    def list_chart_names(self) -> list[str]:
+        """List all chart stream names by scanning charts/."""
+        chart_dir = self.run_dir / "charts"
+        if not chart_dir.exists():
+            return []
+        names = []
+        for jsonl_file in sorted(chart_dir.rglob("*.jsonl")):
+            relative = jsonl_file.relative_to(chart_dir)
+            names.append(relative.with_suffix("").as_posix())
+        return names
+
+    def read_chart(self, name: str) -> list[ChartRecord]:
+        """Read all chart records for a named stream."""
+        relative_path = sanitize_metric_name(name) + ".jsonl"
+        filepath = self.run_dir / "charts" / relative_path
+        if not filepath.exists():
+            raise FileNotFoundError(f"Chart '{name}' not found at {filepath}")
+        return parse_chart_jsonl(filepath.read_text())
 
     def read_checkpoints(self) -> list[Checkpoint]:
         """Read the run's checkpoint index from ``checkpoints.json``."""
