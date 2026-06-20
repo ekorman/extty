@@ -878,18 +878,13 @@ class S3Storage:
         FileNotFoundError
             If the checkpoint step does not exist in the index.
         """
-        from extty.storage import get_runs_dir
-
         meta = self._checkpoint_meta(step)
 
         import torch
 
         map_location = map_location or torch.device("cpu")
 
-        project_dir = self.project if self.project else "_default"
-        local_dir = (
-            get_runs_dir() / project_dir / self.run_name / "checkpoints" / str(step)
-        )
+        local_dir = self._local_checkpoint_dir(step)
         local_dir.mkdir(parents=True, exist_ok=True)
         files_raw = meta.get("files", [])
 
@@ -1071,6 +1066,13 @@ class S3Storage:
             )
         except Exception:
             pass
+
+    def _local_checkpoint_dir(self, step: int) -> Path:
+        """Local cache directory for a checkpoint step."""
+        from extty.storage import get_runs_dir
+
+        project_dir = self.project if self.project else "_default"
+        return get_runs_dir() / project_dir / self.run_name / "checkpoints" / str(step)
 
     def list_checkpoints(self) -> list[dict[str, Any]]:
         """

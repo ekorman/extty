@@ -1230,6 +1230,24 @@ class TestSaveCheckpoint:
         with pytest.raises(FileNotFoundError):
             storage.delete_checkpoint_optimizer(step=999)
 
+    def test_delete_local_checkpoint_removes_cache(self, tmp_path: Path) -> None:
+        """delete_local_checkpoint removes the local cache directory."""
+        runs_dir = tmp_path / "runs"
+        local_dir = runs_dir / "proj" / "run-local" / "checkpoints" / "3"
+        local_dir.mkdir(parents=True)
+        (local_dir / "model.pt").write_bytes(b"cached")
+
+        with mock.patch("extty.storage.get_runs_dir", return_value=runs_dir):
+            removed = extty.delete_local_checkpoint("proj", "run-local", step=3)
+
+        assert removed is True
+        assert not local_dir.exists()
+
+    def test_delete_local_checkpoint_noop_when_absent(self, tmp_path: Path) -> None:
+        """delete_local_checkpoint returns False when nothing is cached."""
+        with mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"):
+            assert extty.delete_local_checkpoint("proj", "run-empty", step=42) is False
+
     def test_module_level_save_checkpoint_without_init_raises(self) -> None:
         """Test that calling extty.save_checkpoint without init raises RuntimeError."""
         extty._active_run = None

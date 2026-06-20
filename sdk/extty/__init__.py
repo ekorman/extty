@@ -49,6 +49,7 @@ __all__ = [
     "save_checkpoint",
     "load_checkpoint",
     "load_checkpoint_from",
+    "delete_local_checkpoint",
     "finish",
     "Run",
     "RunData",
@@ -308,6 +309,45 @@ def load_checkpoint_from(
         )
     storage = S3Storage(s3_config, project, run_name)
     return storage.load_checkpoint(step, load_optimizer=load_optimizer)
+
+
+def delete_local_checkpoint(
+    project: str,
+    run_name: str,
+    step: int,
+) -> bool:
+    """
+    Delete a checkpoint's locally cached files, leaving the S3 copy intact.
+
+    The local files are only a download cache for ``load_checkpoint``; the
+    checkpoint remains in S3 and is re-downloaded on next load. This is the
+    inverse of :func:`load_checkpoint_from`, using the same addressing.
+
+    Parameters
+    ----------
+    project : str
+        The project name.
+    run_name : str
+        The run name.
+    step : int
+        The training step whose local cache should be removed.
+
+    Returns
+    -------
+    bool
+        True if a local directory was found and removed, False if there was
+        nothing cached locally.
+    """
+    import shutil
+
+    from extty.storage import get_runs_dir
+
+    project_dir = project if project else "_default"
+    local_dir = get_runs_dir() / project_dir / run_name / "checkpoints" / str(step)
+    if not local_dir.exists():
+        return False
+    shutil.rmtree(local_dir)
+    return True
 
 
 def finish() -> None:
