@@ -1,6 +1,7 @@
 """Tests for extty library."""
 
 import dataclasses
+import io
 import json
 import logging
 import os
@@ -79,6 +80,7 @@ class TestRunStorage:
         assert (temp_run_dir / "test-run" / "examples").exists()
         assert (temp_run_dir / "test-run" / "confusion_matrices").exists()
         assert (temp_run_dir / "test-run" / "charts").exists()
+        assert (temp_run_dir / "test-run" / "images").exists()
 
     def test_write_and_read_meta(self, temp_run_dir: Path) -> None:
         storage = RunStorage(run_dir=temp_run_dir / "test-run")
@@ -221,6 +223,68 @@ class TestRunStorage:
         assert records[0].y_axis == "y"
         assert "eval/roc" in storage.list_chart_names()
 
+    def test_log_image_creates_png_and_index(self, temp_run_dir: Path) -> None:
+        from PIL import Image as PILImage
+
+        storage = RunStorage(run_dir=temp_run_dir / "test-run")
+        img = PILImage.new("RGB", (8, 4), "blue")
+        storage.log_image("val/dets", extty.Image(img, caption="boxes"), step=10)
+        storage.flush()
+
+        png_path = temp_run_dir / "test-run" / "images" / "val" / "dets" / "step_10.png"
+        assert png_path.exists()
+        assert PILImage.open(png_path).size == (8, 4)
+
+        index_path = temp_run_dir / "test-run" / "images" / "val" / "dets.jsonl"
+        assert index_path.exists()
+        record = json.loads(index_path.read_text().strip())
+        assert record["step"] == 10
+        assert record["file"] == "val/dets/step_10.png"
+        assert record["width"] == 8
+        assert record["height"] == 4
+        assert record["caption"] == "boxes"
+
+    def test_read_images_dedupes_keep_last(self, temp_run_dir: Path) -> None:
+        from PIL import Image as PILImage
+
+        storage = RunStorage(run_dir=temp_run_dir / "test-run")
+        for step, color in [(0, "red"), (1, "green"), (1, "blue")]:
+            storage.log_image(
+                "val/dets", extty.Image(PILImage.new("RGB", (4, 4), color)), step=step
+            )
+        storage.flush()
+
+        records = storage.read_images("val/dets")
+        assert [r.step for r in records] == [0, 1]
+        assert records[0].caption is None
+        assert "val/dets" in storage.list_image_names()
+
+        png = storage.read_image_bytes(records[1].file)
+        reread = PILImage.open(io.BytesIO(png)).convert("RGB")
+        assert reread.getpixel((0, 0)) == (0, 0, 255)
+
+
+class TestImage:
+    def test_rejects_non_pil_input(self) -> None:
+        with pytest.raises(TypeError, match="PIL.Image.Image"):
+            extty.Image("not-an-image")  # type: ignore[arg-type]
+
+    def test_encodes_png_with_metadata(self) -> None:
+        from PIL import Image as PILImage
+
+        img = extty.Image(PILImage.new("RGB", (16, 9), "red"), caption="c")
+        assert img.width == 16
+        assert img.height == 9
+        assert img.mode == "RGB"
+        assert img.caption == "c"
+        assert img.png_bytes.startswith(b"\x89PNG")
+
+    def test_float_mode_converts(self) -> None:
+        from PIL import Image as PILImage
+
+        img = extty.Image(PILImage.new("F", (4, 4)))
+        assert img.png_bytes.startswith(b"\x89PNG")
+
 
 class TestExttyAPI:
     def test_init_creates_run(self, tmp_path: Path) -> None:
@@ -326,6 +390,31 @@ class TestExttyAPI:
         assert record["x_axis"] == "fpr"
         assert record["y_axis"] == "tpr"
         assert record["points"] == [[0.0, 0.0], [1.0, 1.0]]
+
+    def test_log_image(self, tmp_path: Path) -> None:
+        from PIL import Image as PILImage
+
+        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            extty.init("test-project", name="image-test", system_metrics=False)
+            extty.log(
+                {"val/dets": extty.Image(PILImage.new("RGB", (6, 3), "green"))},
+                step=5,
+            )
+            extty.finish()
+
+        images_dir = tmp_path / "runs" / "test-project" / "image-test" / "images"
+        assert (images_dir / "val" / "dets" / "step_5.png").exists()
+        record = json.loads((images_dir / "val" / "dets.jsonl").read_text().strip())
+        assert record["step"] == 5
+        assert record["width"] == 6
+        assert "caption" not in record
+
+        with mock.patch("extty.query.get_runs_dir", return_value=tmp_path / "runs"):
+            run = extty.get_run("test-project", "image-test", local_only=True)
+            assert run.image_names == ["val/dets"]
+            records = run.images("val/dets")
+            assert [r.step for r in records] == [5]
+            assert run.image_bytes(records[0]).startswith(b"\x89PNG")
 
     def test_context_manager(self, tmp_path: Path) -> None:
         import json
@@ -2164,8 +2253,30 @@ class TestS3UploadAvoidsReads:
         assert storage._cumulative_metric_rows["loss"]
         assert len(storage._cumulative_metric_rows["loss"]) == 8
 
+    def test_image_upload_writes_png_and_cumulative_index(self) -> None:
+        from PIL import Image as PILImage
 
-class TestGetRunS3Fallback:
+        client, stored, storage = self._make_storage()
+
+        for step in (0, 1):
+            storage.log_image(
+                "val/dets", extty.Image(PILImage.new("RGB", (2, 2), "red")), step=step
+            )
+        storage.flush()
+        storage.log_image(
+            "val/dets", extty.Image(PILImage.new("RGB", (2, 2), "blue")), step=2
+        )
+        storage.flush()
+
+        client.get_object.assert_not_called()
+
+        prefix = "test/runs/myproject/run-001/images"
+        for step in range(3):
+            assert stored[f"{prefix}/val/dets/step_{step}.png"].startswith(b"\x89PNG")
+
+        index_lines = stored[f"{prefix}/val/dets.jsonl"].decode().strip().split("\n")
+        assert [json.loads(line)["step"] for line in index_lines] == [0, 1, 2]
+
     """``extty.get_run`` reads runs directly from S3 when not local."""
 
     def _seed_s3_client(self, stored: dict[str, bytes]) -> mock.MagicMock:

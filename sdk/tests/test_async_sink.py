@@ -18,6 +18,9 @@ class _FakeSink:
 
     metrics: list[tuple[str, float, int]] = field(default_factory=list)
     examples: list[tuple[str, dict[str, Any], int]] = field(default_factory=list)
+    confusions: list[tuple[str, Any, int]] = field(default_factory=list)
+    charts: list[tuple[str, Any, int]] = field(default_factory=list)
+    images: list[tuple[str, Any, int]] = field(default_factory=list)
     systems: list[tuple[Any, ...]] = field(default_factory=list)
     flushes: int = 0
     closed: bool = False
@@ -42,6 +45,18 @@ class _FakeSink:
     def log_example(self, name: str, data: dict[str, Any], step: int) -> None:
         with self._lock:
             self.examples.append((name, data, step))
+
+    def log_confusion_matrix(self, name: str, cm: Any, step: int) -> None:
+        with self._lock:
+            self.confusions.append((name, cm, step))
+
+    def log_chart(self, name: str, chart: Any, step: int) -> None:
+        with self._lock:
+            self.charts.append((name, chart, step))
+
+    def log_image(self, name: str, image: Any, step: int) -> None:
+        with self._lock:
+            self.images.append((name, image, step))
 
     def log_system(
         self,
@@ -156,6 +171,19 @@ class TestAsyncSink:
             sink.log_example("val/ex", {"prompt": "hi"}, step=7)
             sink.flush()
             assert inner.examples == [("val/ex", {"prompt": "hi"}, 7)]
+        finally:
+            sink.close()
+
+    def test_log_image_dispatched(self) -> None:
+        from PIL import Image as PILImage
+
+        inner = _FakeSink()
+        sink = AsyncSink(inner)
+        try:
+            image = extty.Image(PILImage.new("RGB", (2, 2), "red"))
+            sink.log_image("val/dets", image, step=3)
+            sink.flush()
+            assert inner.images == [("val/dets", image, 3)]
         finally:
             sink.close()
 

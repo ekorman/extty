@@ -13,6 +13,7 @@ from extty.storage import (
     Checkpoint,
     ConfusionMatrixRecord,
     ExampleRecord,
+    ImageRecord,
     MetaData,
     MetricPoint,
     RunStorage,
@@ -188,6 +189,56 @@ class RunData:
             If the chart file does not exist.
         """
         return self._storage.read_chart(name)
+
+    @property
+    def image_names(self) -> list[str]:
+        """List all available image stream names for this run."""
+        return self._storage.list_image_names()
+
+    def images(self, name: str) -> list[ImageRecord]:
+        """
+        Load all image records for a specific name.
+
+        Parameters
+        ----------
+        name : str
+            Image stream name (e.g., "val/detections").
+
+        Returns
+        -------
+        list[ImageRecord]
+            List of ImageRecord(step, timestamp, file, width, height, caption),
+            sorted by step with one record per step (latest write wins).
+
+        Raises
+        ------
+        FileNotFoundError
+            If the image stream does not exist.
+        """
+        return self._storage.read_images(name)
+
+    def image_bytes(self, record: ImageRecord | str) -> bytes:
+        """
+        Load the PNG bytes for a logged image.
+
+        Parameters
+        ----------
+        record : ImageRecord or str
+            An :class:`ImageRecord` from :meth:`images`, or the record's
+            ``file`` path relative to the run's ``images/`` directory.
+
+        Returns
+        -------
+        bytes
+            The PNG-encoded image.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the image file does not exist.
+        """
+        file = record.file if isinstance(record, ImageRecord) else record
+        return self._storage.read_image_bytes(file)
 
     @property
     def checkpoints(self) -> list[Checkpoint]:

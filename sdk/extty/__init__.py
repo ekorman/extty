@@ -27,6 +27,7 @@ from extty.chart import Chart
 from extty.compare import compare, config_diff, plot_metric, reduce_metric
 from extty.confusion import ConfusionMatrix
 from extty.example import BatchExample, Example
+from extty.image import Image
 from extty.query import RunData, get_run, get_runs
 from extty.run import NoOpRun, Run
 from extty.s3 import S3Config
@@ -36,6 +37,7 @@ from extty.storage import (
     CheckpointFile,
     ConfusionMatrixRecord,
     ExampleRecord,
+    ImageRecord,
     MetricPoint,
     SystemMetricPoint,
     get_runs_dir,
@@ -67,6 +69,8 @@ __all__ = [
     "ConfusionMatrixRecord",
     "Chart",
     "ChartRecord",
+    "Image",
+    "ImageRecord",
     "MetricPoint",
     "SystemMetricPoint",
     "ExampleRecord",
@@ -204,6 +208,7 @@ def log(metrics: dict[str, Any], *, step: int) -> None:
         - BatchExample: batch of prompts with grouped responses
         - ConfusionMatrix: N×N matrix with class labels
         - Chart: a 2D chart of (x, y) points with axis names
+        - Image: a PIL image wrapped in extty.Image, stored as PNG
     step : int
         The current training step.
     """
@@ -654,6 +659,19 @@ def _push_run_to_s3(
             s3_key = f"{s3_prefix}/charts/{relative_path}"
             _push_jsonl_file(client, bucket, s3_key, jsonl_file, force=force)
 
+    images_dir = local_run_dir / "images"
+    if images_dir.exists():
+        for jsonl_file in images_dir.rglob("*.jsonl"):
+            relative_path = jsonl_file.relative_to(images_dir)
+            s3_key = f"{s3_prefix}/images/{relative_path}"
+            _push_jsonl_file(client, bucket, s3_key, jsonl_file, force=force)
+        for png_file in images_dir.rglob("*.png"):
+            relative_path = png_file.relative_to(images_dir)
+            s3_key = f"{s3_prefix}/images/{relative_path}"
+            _push_binary_file(
+                client, bucket, s3_key, png_file, "image/png", force=force
+            )
+
     system_csv = local_run_dir / "system.csv"
     if system_csv.exists():
         s3_key = f"{s3_prefix}/system.csv"
@@ -730,6 +748,22 @@ def _push_csv_file(client, bucket: str, s3_key: str, local_path, force: bool) ->
         Body=output.getvalue().encode("utf-8"),
         ContentType="text/csv",
     )
+
+
+def _push_binary_file(
+    client, bucket: str, s3_key: str, local_path, content_type: str, force: bool
+) -> None:
+    """Push an immutable binary file to S3, skipping if the key already exists."""
+    if not force:
+        try:
+            client.head_object(Bucket=bucket, Key=s3_key)
+            return
+        except Exception:
+            pass
+    with open(local_path, "rb") as f:
+        client.put_object(
+            Bucket=bucket, Key=s3_key, Body=f.read(), ContentType=content_type
+        )
 
 
 def _push_jsonl_file(client, bucket: str, s3_key: str, local_path, force: bool) -> None:

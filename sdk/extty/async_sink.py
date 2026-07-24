@@ -10,6 +10,7 @@ from extty._logger import log as logger
 from extty._sink import StorageSink
 from extty.chart import Chart
 from extty.confusion import ConfusionMatrix
+from extty.image import Image
 
 _HIGH_WATER_MARK = 100_000
 _STOP = object()
@@ -62,6 +63,9 @@ class AsyncSink:
 
     def log_chart(self, name: str, chart: Chart, step: int) -> None:
         self._enqueue(("chart", name, chart, step))
+
+    def log_image(self, name: str, image: Image, step: int) -> None:
+        self._enqueue(("image", name, image, step))
 
     def log_system(
         self,
@@ -143,6 +147,9 @@ class AsyncSink:
         elif tag == "chart":
             _, name, chart, step = item
             self._inner.log_chart(name, chart, step)
+        elif tag == "image":
+            _, name, image, step = item
+            self._inner.log_image(name, image, step)
         elif tag == "system":
             _, ram_u, ram_t, gpu_u, gpu_t, gpu_p = item
             self._inner.log_system(ram_u, ram_t, gpu_u, gpu_t, gpu_p)

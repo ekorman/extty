@@ -1,4 +1,130 @@
-S3 Sync Usage
+# Logging
+
+Everything is logged through `extty.log`, which takes a dict of names to
+values plus a `step`. The value's type determines how it is stored and how
+the TUI renders it:
+
+```python
+import extty
+
+run = extty.init("my-project", name="run-1", config={"lr": 1e-3})
+extty.log({"train/loss": 0.5}, step=0)
+extty.finish()
+```
+
+Names may contain `/` to group related streams (e.g. `train/loss`,
+`val/loss`). Each type below gets its own card in the TUI run view; focus a
+card with Enter and scrub through steps with `↑↓` (Shift jumps 10).
+
+## Scalar metrics
+
+Any `float` or `int` is logged as a time-series metric and plotted as a line
+chart.
+
+```python
+extty.log({"train/loss": loss, "val/acc": 0.93}, step=step)
+```
+
+## Text examples (`Example` / `BatchExample`)
+
+Prompt/response pairs, e.g. for LLM training or evals. Each response can
+carry an optional reward (a float, or a dict of named reward components),
+and each prompt an optional groundtruth answer. The TUI shows a browsable
+prompt/response/groundtruth panel.
+
+```python
+extty.log(
+    {
+        "val/samples": extty.Example(
+            prompt="Capital of France?",
+            responses=["Paris", "Lyon"],
+            rewards=[1.0, 0.0],
+            groundtruth="Paris",
+        )
+    },
+    step=step,
+)
+
+# Batched variant: one entry per prompt
+extty.log(
+    {
+        "val/samples": extty.BatchExample(
+            prompts=["1+1?", "2+2?"],
+            responses=[["2"], ["4", "5"]],
+            rewards=[[1.0], [{"correct": 1.0, "format": 0.5}, {"correct": 0.0, "format": 0.5}]],
+            groundtruth=["2", "4"],
+        )
+    },
+    step=step,
+)
+```
+
+## Confusion matrices (`ConfusionMatrix`)
+
+An N×N integer matrix with class labels (rows = true class, columns =
+predicted). `from_array` accepts numpy/torch arrays.
+
+```python
+extty.log(
+    {"eval/cm": extty.ConfusionMatrix(matrix=[[5, 1], [0, 6]], labels=["cat", "dog"])},
+    step=step,
+)
+
+extty.log({"eval/cm": extty.ConfusionMatrix.from_array(cm_array, labels)}, step=step)
+```
+
+## 2D charts (`Chart`)
+
+An ordered series of `(x, y)` points with axis names — for per-step curves
+like ROC or precision/recall that aren't a single scalar over time.
+`from_arrays` accepts numpy/torch arrays. The TUI renders a plot with a
+table toggle (`v`).
+
+```python
+extty.log(
+    {"eval/roc": extty.Chart(points=[(0.0, 0.0), (0.5, 0.7), (1.0, 1.0)], axis_names=("fpr", "tpr"))},
+    step=step,
+)
+
+extty.log({"eval/roc": extty.Chart.from_arrays(fpr, tpr, ("fpr", "tpr"))}, step=step)
+```
+
+## Images (`Image`)
+
+Wraps a `PIL.Image` and stores it as a PNG — e.g. detection frames with
+bounding boxes drawn on (draw annotations yourself with `PIL.ImageDraw`
+before logging). Requires pillow (`pip install extty[image]`). The TUI
+renders images inline in terminals with graphics support (kitty, iTerm2,
+sixel) and falls back to a metadata panel elsewhere; `o` opens the current
+image in the system viewer. Logging the same name/step again overwrites
+that step's image.
+
+```python
+from PIL import Image, ImageDraw
+
+frame = Image.fromarray(pixels)
+draw = ImageDraw.Draw(frame)
+draw.rectangle((x0, y0, x1, y1), outline="red", width=3)
+
+extty.log({"val/detections": extty.Image(frame, caption="epoch 3 detections")}, step=step)
+```
+
+## Reading data back
+
+```python
+run = extty.get_run("my-project", "run-1")
+run.metric_names            # ["train/loss", ...]
+run.metric("train/loss")    # [MetricPoint(step, timestamp, value), ...]
+run.examples("val/samples")
+run.confusion_matrix("eval/cm")
+run.chart("eval/roc")
+run.images("val/detections")            # [ImageRecord(step, file, width, height, caption), ...]
+run.image_bytes(run.images("val/detections")[-1])  # PNG bytes
+```
+
+---
+
+# S3 Sync Usage
 
 Python SDK
 

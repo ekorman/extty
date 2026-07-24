@@ -161,6 +161,7 @@ enum Card {
     Examples { name: String },
     ConfusionMatrix { name: String },
     XyChart { name: String },
+    Image { name: String },
     Checkpoints,
     Artifacts,
 }
@@ -305,6 +306,14 @@ struct App {
     confusion_step_idx: HashMap<String, usize>,
     chart_step_idx: HashMap<String, usize>,
     chart_table_view: HashSet<String>,
+    image_step_idx: HashMap<String, usize>,
+    image_picker: Option<ratatui_image::picker::Picker>,
+    // Cached encoded image protocols keyed by (run name, stream, step).
+    // RefCell because render takes &App but StatefulImage needs &mut protocol;
+    // rendering is single-threaded so local borrow_mut() is safe.
+    image_states: std::cell::RefCell<
+        HashMap<(String, String, u64), ratatui_image::protocol::StatefulProtocol>,
+    >,
 }
 
 impl App {
@@ -431,6 +440,9 @@ impl App {
             confusion_step_idx: HashMap::new(),
             chart_step_idx: HashMap::new(),
             chart_table_view: HashSet::new(),
+            image_step_idx: HashMap::new(),
+            image_picker: None,
+            image_states: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -565,6 +577,7 @@ impl App {
                     new_run.examples = old_run.examples;
                     new_run.confusion_matrices = old_run.confusion_matrices;
                     new_run.charts = old_run.charts;
+                    new_run.images = old_run.images;
                     new_run.checkpoints = old_run.checkpoints;
                     new_run.data_loaded = true;
                     new_run.data_loaded_at = old_run.data_loaded_at;
@@ -1953,6 +1966,12 @@ impl App {
                 cards.push(Card::XyChart { name: name.clone() });
             }
 
+            let mut image_names: Vec<&String> = run.images.keys().collect();
+            image_names.sort();
+            for name in image_names {
+                cards.push(Card::Image { name: name.clone() });
+            }
+
             if !run.checkpoints.is_empty() {
                 cards.push(Card::Checkpoints);
             }
@@ -3290,6 +3309,14 @@ impl App {
             _ => None,
         };
 
+        let image_state = match current_card {
+            Some(Card::Image { name }) => self
+                .current_run()
+                .and_then(|r| r.images.get(name))
+                .map(|s| (name.clone(), s.len())),
+            _ => None,
+        };
+
         let prompt_count = match current_card {
             Some(Card::Examples { name }) if self.compare_focused => {
                 let steps = self.compare_example_steps(name);
@@ -3627,6 +3654,67 @@ impl App {
                     && !self.chart_table_view.remove(&name)
                 {
                     self.chart_table_view.insert(name);
+                }
+            }
+            // Image step scrubbing
+            KeyCode::Up if image_state.is_some() => {
+                if let Some((name, len)) = image_state.clone() {
+                    let cur = self
+                        .image_step_idx
+                        .get(&name)
+                        .copied()
+                        .unwrap_or_else(|| len.saturating_sub(1));
+                    let step = if modifiers.contains(KeyModifiers::SHIFT) {
+                        10
+                    } else {
+                        1
+                    };
+                    self.image_step_idx.insert(name, cur.saturating_sub(step));
+                }
+            }
+            KeyCode::Down if image_state.is_some() => {
+                if let Some((name, len)) = image_state.clone() {
+                    let cur = self
+                        .image_step_idx
+                        .get(&name)
+                        .copied()
+                        .unwrap_or_else(|| len.saturating_sub(1));
+                    let step = if modifiers.contains(KeyModifiers::SHIFT) {
+                        10
+                    } else {
+                        1
+                    };
+                    let next = (cur + step).min(len.saturating_sub(1));
+                    self.image_step_idx.insert(name, next);
+                }
+            }
+            KeyCode::Home if image_state.is_some() => {
+                if let Some((name, _)) = image_state.clone() {
+                    self.image_step_idx.insert(name, 0);
+                }
+            }
+            KeyCode::End if image_state.is_some() => {
+                if let Some((name, len)) = image_state.clone() {
+                    self.image_step_idx.insert(name, len.saturating_sub(1));
+                }
+            }
+            // Open the current image in the system viewer
+            KeyCode::Char('o') if image_state.is_some() => {
+                if let Some((name, len)) = image_state.clone() {
+                    let idx = self
+                        .image_step_idx
+                        .get(&name)
+                        .copied()
+                        .unwrap_or_else(|| len.saturating_sub(1))
+                        .min(len.saturating_sub(1));
+                    let path = self
+                        .current_run()
+                        .and_then(|r| r.images.get(&name))
+                        .and_then(|s| s.get(idx))
+                        .map(|e| e.path.clone());
+                    if let Some(path) = path {
+                        let _ = open_in_system_viewer(&path);
+                    }
                 }
             }
             // Shift+Up/Down jump 10 examples at a time
@@ -4459,6 +4547,11 @@ fn main() -> Result<()> {
 fn run_tui(_options: TuiOptions) -> Result<()> {
     // Set up terminal
     enable_raw_mode()?;
+    // Probe the terminal's image protocol (kitty/iTerm2/sixel) before the alt
+    // screen and event loop start: the probe reads query responses from stdin,
+    // which would otherwise arrive as garbage key events. None = no protocol
+    // support; image cards fall back to a metadata panel.
+    let image_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -4466,6 +4559,7 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
 
     // Create app and run event loop
     let mut app = App::new();
+    app.image_picker = image_picker;
     let mut last_list_refresh = Instant::now();
     let list_refresh_interval = Duration::from_secs(3);
 
@@ -5727,6 +5821,19 @@ fn render_cards_grid(app: &App, frame: &mut Frame, area: Rect, cards: &[Card]) {
                             is_selected,
                             table_view,
                         );
+                    }
+                }
+            }
+            Card::Image { name } => {
+                if let Some(series) = run.images.get(name) {
+                    let idx = app
+                        .image_step_idx
+                        .get(name)
+                        .copied()
+                        .unwrap_or_else(|| series.len().saturating_sub(1))
+                        .min(series.len().saturating_sub(1));
+                    if let Some(entry) = series.get(idx) {
+                        render_image_card(frame, card_area, name, entry, series.len(), is_selected);
                     }
                 }
             }
@@ -7695,6 +7802,198 @@ fn render_focused_xy_chart(
     }
 }
 
+fn render_image_card(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    entry: &data::ImageEntry,
+    total_steps: usize,
+    selected: bool,
+) {
+    let border_color = if selected { NEON_CYAN } else { DIM_CYAN };
+    let title_style = if selected {
+        Style::default().fg(NEON_CYAN).bold()
+    } else {
+        Style::default().fg(NEON_GREEN)
+    };
+
+    let title = Line::from(vec![
+        Span::styled(format!(" {} ", name), title_style),
+        Span::styled(
+            format!("@ step {} ", entry.step),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("🖼  ", Style::default()),
+            Span::styled(
+                format!("{}×{} PNG", entry.width, entry.height),
+                Style::default().fg(NEON_GREEN),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!("{} steps logged", total_steps),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    if let Some(caption) = &entry.caption {
+        lines.push(Line::from(Span::styled(
+            caption.clone(),
+            Style::default().fg(Color::Gray).italic(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Enter to view",
+        Style::default().fg(DIM_CYAN),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
+        inner,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_focused_image(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    run_name: &str,
+    name: &str,
+    entry: &data::ImageEntry,
+    step_idx: usize,
+    total_steps: usize,
+) {
+    let title = Line::from(vec![
+        Span::styled(format!(" {} ", name), Style::default().fg(NEON_CYAN).bold()),
+        Span::styled(
+            format!(
+                "step {}  [{}/{}]  {}×{} ",
+                entry.step,
+                step_idx + 1,
+                total_steps,
+                entry.width,
+                entry.height
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(NEON_CYAN));
+
+    // Reserve a caption line inside the block when present
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let (image_area, caption_area) = if entry.caption.is_some() && inner.height > 2 {
+        (
+            Rect::new(inner.x, inner.y, inner.width, inner.height - 1),
+            Some(Rect::new(
+                inner.x,
+                inner.y + inner.height - 1,
+                inner.width,
+                1,
+            )),
+        )
+    } else {
+        (inner, None)
+    };
+
+    if let (Some(caption), Some(caption_area)) = (&entry.caption, caption_area) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                caption.clone(),
+                Style::default().fg(Color::Gray).italic(),
+            ))),
+            caption_area,
+        );
+    }
+
+    let Some(picker) = &app.image_picker else {
+        render_image_fallback(frame, image_area, entry, "no terminal image protocol");
+        return;
+    };
+
+    let key = (run_name.to_string(), name.to_string(), entry.step);
+    let mut states = app.image_states.borrow_mut();
+    if !states.contains_key(&key) {
+        // Bound memory: encoded protocols for large images are expensive, so
+        // keep only a handful and evict everything else before decoding a new one.
+        if states.len() >= 8 {
+            states.clear();
+        }
+        match image::ImageReader::open(&entry.path)
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r.decode().map_err(anyhow::Error::from))
+        {
+            Ok(dyn_img) => {
+                states.insert(key.clone(), picker.new_resize_protocol(dyn_img));
+            }
+            Err(_) => {
+                render_image_fallback(frame, image_area, entry, "failed to decode PNG");
+                return;
+            }
+        }
+    }
+    let Some(protocol) = states.get_mut(&key) else {
+        return;
+    };
+    let widget = ratatui_image::StatefulImage::new().resize(ratatui_image::Resize::Fit(None));
+    frame.render_stateful_widget(widget, image_area, protocol);
+}
+
+fn render_image_fallback(frame: &mut Frame, area: Rect, entry: &data::ImageEntry, reason: &str) {
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("{}×{} PNG", entry.width, entry.height),
+            Style::default().fg(NEON_GREEN),
+        )),
+        Line::from(Span::styled(
+            format!("cannot render inline: {}", reason),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "press o to open in system viewer",
+            Style::default().fg(NEON_YELLOW),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        area,
+    );
+}
+
+fn open_in_system_viewer(path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "linux")]
+    let cmd = "xdg-open";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let cmd = "open";
+
+    std::process::Command::new(cmd)
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
 fn render_focused_checkpoints(
     frame: &mut Frame,
     area: Rect,
@@ -8363,6 +8662,54 @@ fn render_focused_run(app: &App, frame: &mut Frame, area: Rect) {
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("v", Style::default().fg(NEON_CYAN)),
                     Span::styled("] plot/table  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("?", Style::default().fg(NEON_YELLOW)),
+                    Span::styled("] help", Style::default().fg(Color::DarkGray)),
+                ]);
+                frame.render_widget(Paragraph::new(footer), chunks[1]);
+            }
+        }
+        Card::Image { name } => {
+            if let Some(series) = run.images.get(name) {
+                let idx = app
+                    .image_step_idx
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| series.len().saturating_sub(1));
+                let idx = idx.min(series.len().saturating_sub(1));
+                if let Some(entry) = series.get(idx) {
+                    render_focused_image(
+                        frame,
+                        chunks[0],
+                        app,
+                        &run.name,
+                        name,
+                        entry,
+                        idx,
+                        series.len(),
+                    );
+                }
+                let footer = Line::from(vec![
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("q", Style::default().fg(NEON_MAGENTA)),
+                    Span::styled("] back  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("←→", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] card ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}  ", app.selected_card + 1, cards.len()),
+                        Style::default().fg(NEON_GREEN),
+                    ),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("↑↓", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] step ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}  ", idx + 1, series.len()),
+                        Style::default().fg(NEON_YELLOW),
+                    ),
+                    Span::styled("[", Style::default().fg(DIM_CYAN)),
+                    Span::styled("o", Style::default().fg(NEON_CYAN)),
+                    Span::styled("] open  ", Style::default().fg(Color::DarkGray)),
                     Span::styled("[", Style::default().fg(DIM_CYAN)),
                     Span::styled("?", Style::default().fg(NEON_YELLOW)),
                     Span::styled("] help", Style::default().fg(Color::DarkGray)),
@@ -9288,6 +9635,14 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                     ("↑↓", "previous / next step"),
                     ("Home / End", "first / last step"),
                     ("v", "toggle plot / table"),
+                ],
+            ),
+            (
+                "Images",
+                vec![
+                    ("↑↓", "previous / next step"),
+                    ("Home / End", "first / last step"),
+                    ("o", "open in system viewer"),
                 ],
             ),
         ],
@@ -11173,6 +11528,104 @@ mod tests {
             .draw(|f| {
                 render_xy_chart_card(f, Rect::new(0, 0, 8, 4), "roc", &empty, false, false);
                 render_focused_xy_chart(f, Rect::new(0, 0, 8, 4), "roc", &empty, 0, 1, true);
+            })
+            .unwrap();
+    }
+
+    fn sample_image_entry() -> data::ImageEntry {
+        data::ImageEntry {
+            step: 5,
+            path: PathBuf::from("/nonexistent/step_5.png"),
+            width: 480,
+            height: 320,
+            caption: Some("boxes at step 5".to_string()),
+        }
+    }
+
+    #[test]
+    fn run_detail_shows_image_card() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run_dir = tmp.path().join("demo-run");
+        fs::create_dir_all(run_dir.join("metrics")).unwrap();
+        fs::write(
+            run_dir.join("metrics").join("loss.csv"),
+            "step,timestamp,value\n0,1.0,2.0\n1,2.0,1.0\n",
+        )
+        .unwrap();
+        let png_dir = run_dir.join("images").join("val").join("dets");
+        fs::create_dir_all(&png_dir).unwrap();
+        fs::write(png_dir.join("step_1.png"), b"fake").unwrap();
+        fs::write(
+            run_dir.join("images").join("val").join("dets.jsonl"),
+            "{\"step\":1,\"timestamp\":1.0,\"file\":\"val/dets/step_1.png\",\"width\":480,\"height\":320,\"caption\":\"boxes\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            run_dir.join("meta.json"),
+            "{\"project\":\"p\",\"run_name\":\"demo-run\",\"config\":{},\"started_at\":\"2026-01-01T00:00:00Z\",\"status\":\"completed\"}",
+        )
+        .unwrap();
+
+        let run = data::reload_run(&run_dir).expect("run loads");
+        assert!(run.images.contains_key("val/dets"));
+
+        let mut app = App::new();
+        app.runs = vec![run];
+        app.selected_run = 0;
+        app.view = View::RunDetail;
+
+        let backend = TestBackend::new(200, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+        let buffer_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(buffer_text.contains("val/dets"), "image card title missing");
+        assert!(
+            buffer_text.contains("480×320 PNG"),
+            "image card body missing"
+        );
+        assert!(
+            buffer_text.contains("Enter to view"),
+            "image card hint missing"
+        );
+    }
+
+    #[test]
+    fn image_card_renders_without_panic() {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let entry = sample_image_entry();
+        terminal
+            .draw(|f| {
+                render_image_card(f, Rect::new(0, 0, 40, 12), "val/dets", &entry, 10, true);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn focused_image_without_picker_renders_fallback() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::new();
+        let entry = sample_image_entry();
+        terminal
+            .draw(|f| {
+                render_focused_image(
+                    f,
+                    Rect::new(0, 0, 120, 30),
+                    &app,
+                    "run-1",
+                    "val/dets",
+                    &entry,
+                    2,
+                    10,
+                );
             })
             .unwrap();
     }

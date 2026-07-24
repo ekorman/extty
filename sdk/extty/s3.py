@@ -17,18 +17,22 @@ from extty._logger import _DIM_CYAN, _NEON_CYAN, _NEON_GREEN, _RESET, _supports_
 from extty._logger import log as logger
 from extty.chart import Chart
 from extty.confusion import ConfusionMatrix
+from extty.image import Image
 from extty.storage import (
     ChartRecord,
     Checkpoint,
     ConfusionMatrixRecord,
     ExampleRecord,
+    ImageRecord,
     MetaData,
     MetricPoint,
     SystemMetricPoint,
+    dedupe_image_records,
     parse_chart_jsonl,
     parse_checkpoints_json,
     parse_confusion_jsonl,
     parse_examples_jsonl,
+    parse_images_jsonl,
     parse_metric_csv,
     parse_system_csv,
     sanitize_metric_name,
@@ -364,6 +368,9 @@ class S3Storage:
     _chart_buffer: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict, repr=False
     )
+    _image_buffer: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
     _system_buffer: list[
         tuple[float, float, float, float | None, float | None, float | None]
     ] = field(default_factory=list, repr=False)
@@ -385,6 +392,9 @@ class S3Storage:
         default_factory=dict, repr=False
     )
     _cumulative_chart_rows: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
+    _cumulative_image_rows: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict, repr=False
     )
     _cumulative_system_rows: list[
@@ -452,6 +462,25 @@ class S3Storage:
             self._buffer_count += 1
             self._maybe_flush()
 
+    def log_image(self, name: str, image: Image, step: int) -> None:
+        timestamp = time.time()
+        safe_name = sanitize_metric_name(name)
+        record: dict[str, Any] = {
+            "step": step,
+            "timestamp": timestamp,
+            "file": f"{safe_name}/step_{step}.png",
+            "width": image.width,
+            "height": image.height,
+        }
+        if image.caption is not None:
+            record["caption"] = image.caption
+        with self._lock:
+            if name not in self._image_buffer:
+                self._image_buffer[name] = []
+            self._image_buffer[name].append({"record": record, "png": image.png_bytes})
+            self._buffer_count += 1
+            self._maybe_flush()
+
     def log_system(
         self,
         ram_used_gb: float,
@@ -499,12 +528,13 @@ class S3Storage:
 
         logger.debug(
             "S3 flush: %d items (%d metric / %d example / %d confusion / %d chart "
-            "streams, %d system samples) — trigger: %s",
+            "/ %d image streams, %d system samples) — trigger: %s",
             self._buffer_count,
             len(self._metric_buffer),
             len(self._example_buffer),
             len(self._confusion_buffer),
             len(self._chart_buffer),
+            len(self._image_buffer),
             len(self._system_buffer),
             reason,
         )
@@ -567,6 +597,21 @@ class S3Storage:
         self._chart_buffer.clear()
         self._chart_buffer.update(failed_chart)
 
+        failed_images: dict[str, list[dict[str, Any]]] = {}
+        for name, items in self._image_buffer.items():
+            try:
+                self._upload_images(name, items)
+            except _S3_ERRORS:
+                logger.warning(
+                    "Failed to upload images '%s' to S3",
+                    name,
+                    exc_info=True,
+                )
+                failed_images[name] = items
+                had_failure = True
+        self._image_buffer.clear()
+        self._image_buffer.update(failed_images)
+
         if self._system_buffer:
             try:
                 self._upload_system(self._system_buffer)
@@ -585,6 +630,7 @@ class S3Storage:
             + sum(len(v) for v in self._example_buffer.values())
             + sum(len(v) for v in self._confusion_buffer.values())
             + sum(len(v) for v in self._chart_buffer.values())
+            + sum(len(v) for v in self._image_buffer.values())
             + len(self._system_buffer)
         )
         self._last_flush = time.time()
@@ -668,6 +714,26 @@ class S3Storage:
         all_records = list(self._cumulative_chart_rows.get(name, [])) + list(records)
         self._put_jsonl(key, all_records)
         self._cumulative_chart_rows[name] = all_records
+
+    def _upload_images(self, name: str, items: list[dict[str, Any]]) -> None:
+        """Upload pending PNGs (write-once objects) then rewrite the index JSONL.
+
+        PNG uploads are idempotent (deterministic key per step), so if the
+        index rewrite fails the whole batch is retried safely on next flush.
+        """
+        for item in items:
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=self._s3_key("images", item["record"]["file"]),
+                Body=item["png"],
+                ContentType="image/png",
+            )
+        safe_name = sanitize_metric_name(name)
+        key = self._s3_key("images", f"{safe_name}.jsonl")
+        new_records = [item["record"] for item in items]
+        all_records = list(self._cumulative_image_rows.get(name, [])) + new_records
+        self._put_jsonl(key, all_records)
+        self._cumulative_image_rows[name] = all_records
 
     def _upload_system(
         self,
@@ -1211,6 +1277,28 @@ class S3RunReader:
                 f"Chart '{name}' not found at s3://{self.config.bucket}/{key}"
             )
         return parse_chart_jsonl(text)
+
+    def list_image_names(self) -> list[str]:
+        return self._list_stream_names("images", ".jsonl")
+
+    def read_images(self, name: str) -> list[ImageRecord]:
+        key = self._s3_key("images", sanitize_metric_name(name) + ".jsonl")
+        text = self._get_text(key)
+        if text is None:
+            raise FileNotFoundError(
+                f"Images '{name}' not found at s3://{self.config.bucket}/{key}"
+            )
+        return dedupe_image_records(parse_images_jsonl(text))
+
+    def read_image_bytes(self, file: str) -> bytes:
+        key = self._s3_key("images", file)
+        try:
+            response = self._client.get_object(Bucket=self.config.bucket, Key=key)
+        except self._client.exceptions.NoSuchKey:
+            raise FileNotFoundError(
+                f"Image file '{file}' not found at s3://{self.config.bucket}/{key}"
+            ) from None
+        return response["Body"].read()
 
     def read_checkpoints(self) -> list[Checkpoint]:
         text = self._get_text(self._s3_key("checkpoints.json"))

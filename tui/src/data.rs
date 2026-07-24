@@ -150,6 +150,30 @@ impl ChartSeries {
 }
 
 #[derive(Debug, Clone)]
+pub struct ImageEntry {
+    pub step: u64,
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ImageSeries {
+    pub entries: Vec<ImageEntry>,
+}
+
+impl ImageSeries {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&ImageEntry> {
+        self.entries.get(idx)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CheckpointFile {
     pub name: String,
     pub size_bytes: Option<u64>,
@@ -208,6 +232,7 @@ pub struct Run {
     pub examples: HashMap<String, ExampleGroup>,
     pub confusion_matrices: HashMap<String, ConfusionMatrixSeries>,
     pub charts: HashMap<String, ChartSeries>,
+    pub images: HashMap<String, ImageSeries>,
     pub start_time: Option<DateTime<Local>>,
     pub end_time: Option<DateTime<Local>>,
     pub status: RunStatus,
@@ -337,6 +362,7 @@ fn load_run_lightweight(path: &Path) -> Option<Run> {
         examples: HashMap::new(),
         confusion_matrices: HashMap::new(),
         charts: HashMap::new(),
+        images: HashMap::new(),
         start_time,
         end_time,
         status,
@@ -419,6 +445,7 @@ fn load_run(path: &Path) -> Option<Run> {
     let examples = load_examples(path);
     let confusion_matrices = load_confusion_matrices(path);
     let charts = load_charts(path);
+    let images = load_images(path);
     let checkpoints = load_checkpoints(path);
 
     let (project, start_time, end_time, status, config) = load_run_meta(path);
@@ -431,6 +458,7 @@ fn load_run(path: &Path) -> Option<Run> {
         examples,
         confusion_matrices,
         charts,
+        images,
         start_time,
         end_time,
         status,
@@ -1333,6 +1361,84 @@ fn load_charts_recursive(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ImageRow {
+    step: u64,
+    #[allow(dead_code)]
+    timestamp: f64,
+    file: String,
+    width: u32,
+    height: u32,
+    caption: Option<String>,
+}
+
+fn load_images(run_path: &Path) -> HashMap<String, ImageSeries> {
+    let mut series: HashMap<String, ImageSeries> = HashMap::new();
+    let images_dir = run_path.join("images");
+
+    if !images_dir.exists() {
+        return series;
+    }
+
+    load_images_recursive(&images_dir, &images_dir, &mut series);
+
+    // Sort by step and keep only the last record per step (repeated logs at
+    // the same step overwrite the PNG, so the newest index record wins).
+    for s in series.values_mut() {
+        s.entries.sort_by_key(|e| e.step);
+        s.entries.reverse();
+        s.entries.dedup_by_key(|e| e.step);
+        s.entries.reverse();
+    }
+    series
+}
+
+fn load_images_recursive(
+    base_dir: &Path,
+    current_dir: &Path,
+    series: &mut HashMap<String, ImageSeries>,
+) {
+    let Ok(entries) = fs::read_dir(current_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            load_images_recursive(base_dir, &path, series);
+        } else if path.extension().map(|e| e == "jsonl").unwrap_or(false)
+            && let Ok(relative) = path.strip_prefix(base_dir)
+        {
+            let name = relative.with_extension("").to_string_lossy().to_string();
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let reader = BufReader::new(file);
+            let entry = series.entry(name).or_default();
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(row) = serde_json::from_str::<ImageRow>(&line) else {
+                    continue;
+                };
+                let png_path = base_dir.join(&row.file);
+                if !png_path.exists() {
+                    continue;
+                }
+                entry.entries.push(ImageEntry {
+                    step: row.step,
+                    path: png_path,
+                    width: row.width,
+                    height: row.height,
+                    caption: row.caption,
+                });
+            }
+        }
+    }
+}
+
 fn starred_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1619,6 +1725,44 @@ mod tests {
     fn load_charts_missing_dir_is_empty() {
         let tmp = TempDir::new().unwrap();
         let series = load_charts(tmp.path());
+        assert!(series.is_empty());
+    }
+
+    #[test]
+    fn load_images_reads_index_and_dedupes() {
+        let tmp = TempDir::new().unwrap();
+        let run_path = tmp.path();
+        let png_dir = run_path.join("images").join("val").join("dets");
+        fs::create_dir_all(&png_dir).unwrap();
+        fs::write(png_dir.join("step_0.png"), b"fake-png").unwrap();
+        fs::write(png_dir.join("step_1.png"), b"fake-png").unwrap();
+        let jsonl = "\
+{\"step\":1,\"timestamp\":2.0,\"file\":\"val/dets/step_1.png\",\"width\":8,\"height\":4}
+{\"step\":0,\"timestamp\":1.0,\"file\":\"val/dets/step_0.png\",\"width\":8,\"height\":4,\"caption\":\"first\"}
+{\"step\":1,\"timestamp\":3.0,\"file\":\"val/dets/step_1.png\",\"width\":16,\"height\":8}
+{\"step\":2,\"timestamp\":4.0,\"file\":\"val/dets/step_2.png\",\"width\":8,\"height\":4}
+";
+        fs::write(
+            run_path.join("images").join("val").join("dets.jsonl"),
+            jsonl,
+        )
+        .unwrap();
+
+        let series = load_images(run_path);
+        let s = series.get("val/dets").expect("val/dets loaded");
+        // step 2's PNG is missing so its row is skipped; step 1 dedupes keep-last
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.get(0).unwrap().step, 0);
+        assert_eq!(s.get(0).unwrap().caption.as_deref(), Some("first"));
+        assert_eq!(s.get(1).unwrap().step, 1);
+        assert_eq!(s.get(1).unwrap().width, 16);
+        assert!(s.get(1).unwrap().path.ends_with("val/dets/step_1.png"));
+    }
+
+    #[test]
+    fn load_images_missing_dir_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let series = load_images(tmp.path());
         assert!(series.is_empty());
     }
 }

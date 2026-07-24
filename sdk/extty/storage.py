@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 from extty.chart import Chart
 from extty.confusion import ConfusionMatrix
+from extty.image import Image
 
 
 def get_runs_dir() -> Path:
@@ -74,6 +75,21 @@ class ChartRecord:
     x_axis: str
     y_axis: str
     points: list[tuple[float, float]]
+
+
+@dataclass(frozen=True)
+class ImageRecord:
+    """A single logged image record, pointing at a PNG file.
+
+    ``file`` is relative to the run's ``images/`` directory.
+    """
+
+    step: int
+    timestamp: float
+    file: str
+    width: int
+    height: int
+    caption: str | None = None
 
 
 @dataclass(frozen=True)
@@ -210,6 +226,35 @@ def parse_chart_jsonl(text: str) -> list[ChartRecord]:
     return records
 
 
+def parse_images_jsonl(text: str) -> list[ImageRecord]:
+    """Parse an images index JSONL body into ImageRecord values."""
+    records: list[ImageRecord] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        records.append(
+            ImageRecord(
+                step=obj["step"],
+                timestamp=obj["timestamp"],
+                file=obj["file"],
+                width=obj["width"],
+                height=obj["height"],
+                caption=obj.get("caption"),
+            )
+        )
+    return records
+
+
+def dedupe_image_records(records: list[ImageRecord]) -> list[ImageRecord]:
+    """Sort image records by step, keeping only the last record per step."""
+    by_step: dict[int, ImageRecord] = {}
+    for record in records:
+        by_step[record.step] = record
+    return [by_step[step] for step in sorted(by_step)]
+
+
 def parse_checkpoints_json(text: str) -> list[Checkpoint]:
     """Parse a ``checkpoints.json`` body into Checkpoint values, sorted by step."""
     entries = json.loads(text)
@@ -246,6 +291,9 @@ class RunStorageReader(Protocol):
     def read_confusion_matrix(self, name: str) -> list[ConfusionMatrixRecord]: ...
     def list_chart_names(self) -> list[str]: ...
     def read_chart(self, name: str) -> list[ChartRecord]: ...
+    def list_image_names(self) -> list[str]: ...
+    def read_images(self, name: str) -> list[ImageRecord]: ...
+    def read_image_bytes(self, file: str) -> bytes: ...
     def read_checkpoints(self) -> list[Checkpoint]: ...
 
 
@@ -307,6 +355,9 @@ class RunStorage:
     _chart_buffer: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict, repr=False
     )
+    _image_index_buffer: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict, repr=False
+    )
     _buffer_size: int = 200
     _last_flush: float = field(default_factory=time.time, repr=False)
     _flush_interval: float = 1.0
@@ -318,6 +369,7 @@ class RunStorage:
             (self.run_dir / "examples").mkdir(exist_ok=True)
             (self.run_dir / "confusion_matrices").mkdir(exist_ok=True)
             (self.run_dir / "charts").mkdir(exist_ok=True)
+            (self.run_dir / "images").mkdir(exist_ok=True)
 
     @classmethod
     def open_readonly(cls, run_dir: Path) -> RunStorage:
@@ -351,6 +403,7 @@ class RunStorage:
             + sum(len(v) for v in self._example_buffer.values())
             + sum(len(v) for v in self._confusion_buffer.values())
             + sum(len(v) for v in self._chart_buffer.values())
+            + sum(len(v) for v in self._image_index_buffer.values())
         )
         if total == 0:
             return
@@ -389,6 +442,11 @@ class RunStorage:
             for name, records in self._chart_buffer.items():
                 self._write_chart_batch(name, records)
             self._chart_buffer.clear()
+
+        if self._image_index_buffer:
+            for name, records in self._image_index_buffer.items():
+                self._write_image_index_batch(name, records)
+            self._image_index_buffer.clear()
 
         self._last_flush = time.time()
 
@@ -431,6 +489,18 @@ class RunStorage:
         """Write a batch of chart records to the JSONL file."""
         relative_path = sanitize_metric_name(name) + ".jsonl"
         filepath = self.run_dir / "charts" / relative_path
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(filepath, "a") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+    def _write_image_index_batch(
+        self, name: str, records: list[dict[str, Any]]
+    ) -> None:
+        """Write a batch of image index records to the JSONL file."""
+        relative_path = sanitize_metric_name(name) + ".jsonl"
+        filepath = self.run_dir / "images" / relative_path
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         with open(filepath, "a") as f:
@@ -527,6 +597,43 @@ class RunStorage:
         self._chart_buffer[name].append(record)
         self._maybe_flush()
 
+    def log_image(self, name: str, image: Image, step: int) -> None:
+        """Write an image's PNG file immediately and buffer its index record.
+
+        The PNG is written eagerly (this runs on the async writer thread, so
+        blocking is fine) at ``images/<safe_name>/step_<step>.png``; repeated
+        logs at the same name/step overwrite the file. Only the small index
+        record goes through the flush buffer.
+
+        Parameters
+        ----------
+        name : str
+            Stream name (e.g., "val/detections").
+        image : Image
+            The encoded image to log.
+        step : int
+            The training step.
+        """
+        safe_name = sanitize_metric_name(name)
+        relative_file = f"{safe_name}/step_{step}.png"
+        filepath = self.run_dir / "images" / relative_file
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_bytes(image.png_bytes)
+
+        record: dict[str, Any] = {
+            "step": step,
+            "timestamp": time.time(),
+            "file": relative_file,
+            "width": image.width,
+            "height": image.height,
+        }
+        if image.caption is not None:
+            record["caption"] = image.caption
+        if name not in self._image_index_buffer:
+            self._image_index_buffer[name] = []
+        self._image_index_buffer[name].append(record)
+        self._maybe_flush()
+
     def close(self) -> None:
         """Flush remaining data and close any open file handles."""
         self.flush()
@@ -619,6 +726,36 @@ class RunStorage:
         if not filepath.exists():
             raise FileNotFoundError(f"Chart '{name}' not found at {filepath}")
         return parse_chart_jsonl(filepath.read_text())
+
+    def list_image_names(self) -> list[str]:
+        """List all image stream names by scanning images/ for index files."""
+        images_dir = self.run_dir / "images"
+        if not images_dir.exists():
+            return []
+        names = []
+        for jsonl_file in sorted(images_dir.rglob("*.jsonl")):
+            relative = jsonl_file.relative_to(images_dir)
+            names.append(relative.with_suffix("").as_posix())
+        return names
+
+    def read_images(self, name: str) -> list[ImageRecord]:
+        """Read all image records for a named stream, deduped keep-last per step."""
+        relative_path = sanitize_metric_name(name) + ".jsonl"
+        filepath = self.run_dir / "images" / relative_path
+        if not filepath.exists():
+            raise FileNotFoundError(f"Images '{name}' not found at {filepath}")
+        return dedupe_image_records(parse_images_jsonl(filepath.read_text()))
+
+    def read_image_bytes(self, file: str) -> bytes:
+        """Read a PNG's bytes given its path relative to the images/ directory."""
+        filepath = self.run_dir / "images" / file
+        if not filepath.exists():
+            raise FileNotFoundError(f"Image file '{file}' not found at {filepath}")
+        return filepath.read_bytes()
+
+    def image_path(self, record: ImageRecord) -> Path:
+        """Return the absolute path of the PNG behind an :class:`ImageRecord`."""
+        return self.run_dir / "images" / record.file
 
     def read_checkpoints(self) -> list[Checkpoint]:
         """Read the run's checkpoint index from ``checkpoints.json``."""

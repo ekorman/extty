@@ -15,6 +15,7 @@ from extty.artifact import save_artifact as _save_artifact
 from extty.async_sink import AsyncSink
 from extty.chart import Chart
 from extty.confusion import ConfusionMatrix
+from extty.image import Image
 from extty.s3 import S3Config, S3Storage
 from extty.storage import (
     MetaData,
@@ -60,6 +61,11 @@ class MultiSink:
         self._primary.log_chart(name, chart, step)
         if self._secondary:
             self._secondary.log_chart(name, chart, step)
+
+    def log_image(self, name: str, image: Image, step: int) -> None:
+        self._primary.log_image(name, image, step)
+        if self._secondary:
+            self._secondary.log_image(name, image, step)
 
     def log_system(
         self,
@@ -239,6 +245,7 @@ class Run:
             - Example/BatchExample: logged as structured example
             - ConfusionMatrix: logged as a confusion matrix
             - Chart: logged as a 2D chart of (x, y) points
+            - Image: logged as a PNG image
         step : int
             The current training step.
 
@@ -255,6 +262,8 @@ class Run:
                 self._storage.log_confusion_matrix(name, value, step)
             elif isinstance(value, Chart):
                 self._storage.log_chart(name, value, step)
+            elif isinstance(value, Image):
+                self._storage.log_image(name, value, step)
             elif hasattr(value, "to_dict"):
                 self._storage.log_example(name, value.to_dict(), step)
             else:

@@ -6,6 +6,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from extty.chart import Chart
 from extty.confusion import ConfusionMatrix
+from extty.image import Image
 
 
 @runtime_checkable
@@ -19,6 +20,8 @@ class StorageSink(Protocol):
     ) -> None: ...
 
     def log_chart(self, name: str, chart: Chart, step: int) -> None: ...
+
+    def log_image(self, name: str, image: Image, step: int) -> None: ...
 
     def log_system(
         self,
