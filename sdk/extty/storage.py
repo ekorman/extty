@@ -626,3 +626,30 @@ class RunStorage:
         if not filepath.exists():
             return []
         return parse_checkpoints_json(filepath.read_text())
+
+    def record_checkpoint(self, entry: dict[str, Any]) -> None:
+        """Merge one checkpoint entry into the local ``checkpoints.json`` index.
+
+        Mirrors the S3-side index update: an existing entry for the same
+        step is replaced, otherwise the entry is appended, and the index
+        stays sorted by step.
+
+        Parameters
+        ----------
+        entry : dict[str, Any]
+            Index entry with ``step``, ``timestamp``, and ``files`` keys, as
+            produced by :meth:`extty.s3.S3Storage.save_checkpoint`.
+        """
+        filepath = self.run_dir / "checkpoints.json"
+        existing: list[dict[str, Any]] = []
+        if filepath.exists():
+            try:
+                existing = json.loads(filepath.read_text())
+            except json.JSONDecodeError:
+                existing = []
+        if entry["step"] in {e["step"] for e in existing}:
+            existing = [entry if e["step"] == entry["step"] else e for e in existing]
+        else:
+            existing.append(entry)
+        existing.sort(key=lambda e: e["step"])
+        filepath.write_text(json.dumps(existing, indent=2))

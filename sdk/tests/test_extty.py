@@ -1127,6 +1127,37 @@ class TestSaveCheckpoint:
         with pytest.raises(ValueError, match="Exactly one"):
             storage.save_checkpoint(step=1, path="/a", state_dict={"k": "v"})
 
+    def test_save_checkpoint_returns_index_entry(self, tmp_path: Path) -> None:
+        """Test that save_checkpoint returns the checkpoints.json entry."""
+        client, stored = self._make_mock_s3_client()
+        storage = self._make_storage(
+            client, prefix="pfx", project="proj", run_name="run-e"
+        )
+
+        fake_file = tmp_path / "ckpt.pt"
+        fake_file.write_bytes(b"data")
+
+        entry = storage.save_checkpoint(step=7, path=str(fake_file))
+
+        assert entry is not None
+        assert entry["step"] == 7
+        assert entry["files"] == [{"name": "checkpoint.pt", "size_bytes": 4}]
+        index = json.loads(stored["pfx/runs/proj/run-e/checkpoints.json"])
+        assert index == [entry]
+
+    def test_save_checkpoint_returns_none_on_s3_error(self, tmp_path: Path) -> None:
+        """Test that a failed S3 upload yields None instead of an entry."""
+        client, _ = self._make_mock_s3_client()
+        client.upload_file.side_effect = BotoCoreError()
+        storage = self._make_storage(
+            client, prefix="pfx", project="proj", run_name="run-f"
+        )
+
+        fake_file = tmp_path / "ckpt.pt"
+        fake_file.write_bytes(b"data")
+
+        assert storage.save_checkpoint(step=7, path=str(fake_file)) is None
+
     def test_list_checkpoints_empty(self) -> None:
         """Test list_checkpoints returns empty list when no checkpoints exist."""
         client, _ = self._make_mock_s3_client()
@@ -1264,6 +1295,85 @@ class TestSaveCheckpoint:
             with pytest.raises(RuntimeError, match="S3 storage is not configured"):
                 run.save_checkpoint(step=1, path="/nonexistent")
             extty.finish()
+
+
+class TestLocalCheckpointIndex:
+    """Tests for mirroring the checkpoint index into the local run dir."""
+
+    def test_record_checkpoint_merges_and_sorts(self, tmp_path: Path) -> None:
+        storage = RunStorage(run_dir=tmp_path / "run")
+
+        storage.record_checkpoint(
+            {"step": 100, "timestamp": "t1", "files": [{"name": "a", "size_bytes": 1}]}
+        )
+        storage.record_checkpoint(
+            {"step": 50, "timestamp": "t2", "files": [{"name": "b", "size_bytes": 2}]}
+        )
+        storage.record_checkpoint(
+            {"step": 100, "timestamp": "t3", "files": [{"name": "c", "size_bytes": 3}]}
+        )
+
+        checkpoints = storage.read_checkpoints()
+        assert [c.step for c in checkpoints] == [50, 100]
+        assert checkpoints[1].timestamp == "t3"
+        assert checkpoints[1].files[0].name == "c"
+
+    def test_run_save_checkpoint_mirrors_local_index(self, tmp_path: Path) -> None:
+        """A checkpoint saved on the training machine must be visible to
+        get_run() there, which prefers the local run dir over S3."""
+        client, stored = TestSaveCheckpoint()._make_mock_s3_client()
+        runs_dir = tmp_path / "runs"
+
+        fake_file = tmp_path / "ckpt.pt"
+        fake_file.write_bytes(b"fake model data")
+
+        with (
+            mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
+            mock.patch("boto3.client", return_value=client),
+        ):
+            run = extty.run.Run(
+                "proj",
+                name="run-1",
+                system_metrics=False,
+                s3_config=S3Config(bucket="b", prefix="pfx"),
+            )
+            run.save_checkpoint(100, path=str(fake_file))
+            run.finish()
+
+        local_index = runs_dir / "proj" / "run-1" / "checkpoints.json"
+        assert json.loads(local_index.read_text()) == json.loads(
+            stored["pfx/runs/proj/run-1/checkpoints.json"]
+        )
+
+        with mock.patch("extty.query.get_runs_dir", return_value=runs_dir):
+            run_data = extty.get_run("proj", "run-1", local_only=True)
+            assert [c.step for c in run_data.checkpoints] == [100]
+
+    def test_run_save_checkpoint_skips_local_index_on_s3_error(
+        self, tmp_path: Path
+    ) -> None:
+        """A failed S3 save must not record the checkpoint locally."""
+        client, _ = TestSaveCheckpoint()._make_mock_s3_client()
+        client.upload_file.side_effect = BotoCoreError()
+        runs_dir = tmp_path / "runs"
+
+        fake_file = tmp_path / "ckpt.pt"
+        fake_file.write_bytes(b"fake model data")
+
+        with (
+            mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
+            mock.patch("boto3.client", return_value=client),
+        ):
+            run = extty.run.Run(
+                "proj",
+                name="run-2",
+                system_metrics=False,
+                s3_config=S3Config(bucket="b", prefix="pfx"),
+            )
+            run.save_checkpoint(100, path=str(fake_file))
+            run.finish()
+
+        assert not (runs_dir / "proj" / "run-2" / "checkpoints.json").exists()
 
 
 class TestLoadCheckpoint:

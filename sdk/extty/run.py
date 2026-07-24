@@ -295,12 +295,16 @@ class Run:
                 "S3 storage is not configured. "
                 "Set EXTTY_S3_BUCKET or provide s3_config to save checkpoints."
             )
-        self._s3_storage.save_checkpoint(
+        entry = self._s3_storage.save_checkpoint(
             step,
             path=path,
             state_dict=state_dict,
             optimizer_state_dict=optimizer_state_dict,
         )
+        # Mirror the entry into the local run dir's checkpoints.json so readers
+        # that prefer local storage (get_run) see the same index as S3.
+        if entry is not None:
+            self._local_storage.record_checkpoint(entry)
 
     def load_checkpoint(
         self,

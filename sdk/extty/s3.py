@@ -698,7 +698,7 @@ class S3Storage:
         path: str | None = None,
         state_dict: Any = None,
         optimizer_state_dict: Any = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """
         Save a checkpoint to S3.
 
@@ -716,6 +716,12 @@ class S3Storage:
             Model state dict to serialize with torch.save.
         optimizer_state_dict : Any or None
             Optimizer state dict to include when using state_dict.
+
+        Returns
+        -------
+        dict[str, Any] or None
+            The ``checkpoints.json`` index entry (``step``, ``timestamp``,
+            ``files``) written to S3, or None if the save failed.
 
         Raises
         ------
@@ -753,6 +759,7 @@ class S3Storage:
                     ContentType="application/json",
                 )
                 self._update_checkpoints_index(meta_entry)
+                return meta_entry
             else:
                 import torch
 
@@ -808,6 +815,7 @@ class S3Storage:
                         ContentType="application/json",
                     )
                     self._update_checkpoints_index(meta_entry)
+                    return meta_entry
                 finally:
                     for f in tmp_files:
                         os.unlink(f)
@@ -815,6 +823,7 @@ class S3Storage:
             logger.warning(
                 "Failed to save checkpoint (step %d) to S3", step, exc_info=True
             )
+            return None
 
     def _update_checkpoints_index(self, entry: dict[str, Any]) -> None:
         index_key = self._s3_key("checkpoints.json")
