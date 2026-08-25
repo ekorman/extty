@@ -9505,6 +9505,7 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                     ("Tab", "expand/collapse project"),
                     ("Enter", "open run"),
                     ("a / i", "artifacts / infra"),
+                    ("S", "S3 config"),
                 ],
             ),
             (
@@ -9561,6 +9562,7 @@ fn help_sections_for(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'stati
                     ("Tab", "switch panel (Instances/Types)"),
                     ("1-4", "switch provider"),
                     ("r / a", "runs / artifacts"),
+                    ("c", "provider API keys"),
                 ],
             ),
             (
