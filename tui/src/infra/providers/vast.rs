@@ -34,6 +34,30 @@ fn normalize_status(raw: &str) -> InstanceStatus {
     }
 }
 
+fn direct_address(instance: &VastInstance) -> Option<String> {
+    let host = instance.public_ipaddr.as_deref()?;
+    let port = instance
+        .ports
+        .as_ref()?
+        .get("22/tcp")?
+        .iter()
+        .find_map(|binding| binding.host_port.as_deref())?;
+    Some(format!("{}:{}", host, port))
+}
+
+/// Vast's SSH proxy reserves `ssh_port` for the host machine's sshd and forwards
+/// `ssh_port + 1` into the container whenever the image exposes Jupyter, which is
+/// why the raw `ssh_port` field is off by one from the port the console shows.
+fn proxy_address(instance: &VastInstance) -> Option<String> {
+    let host = instance.ssh_host.as_deref()?;
+    let base = instance.ssh_port?;
+    let port = match instance.image_runtype.as_deref() {
+        Some(runtype) if runtype.contains("jupyter") => base.saturating_add(1),
+        _ => base,
+    };
+    Some(format!("{}:{}", host, port))
+}
+
 pub struct VastProvider {
     client: Client,
     headers: HeaderMap,
@@ -143,11 +167,21 @@ struct VastInstance {
     label: Option<String>,
     ssh_host: Option<String>,
     ssh_port: Option<u16>,
+    public_ipaddr: Option<String>,
+    #[serde(default)]
+    ports: Option<HashMap<String, Vec<PortBinding>>>,
+    image_runtype: Option<String>,
     actual_status: Option<String>,
     status_msg: Option<String>,
     gpu_name: Option<String>,
     geolocation: Option<String>,
     dph_total: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct PortBinding {
+    #[serde(rename = "HostPort")]
+    host_port: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -187,14 +221,11 @@ impl CloudProvider for VastProvider {
             .instances
             .into_iter()
             .map(|i| {
+                let ip = direct_address(&i).or_else(|| proxy_address(&i));
                 let raw_status = i
                     .actual_status
                     .or(i.status_msg)
                     .unwrap_or_else(|| "unknown".to_string());
-                let ip = i.ssh_host.map(|host| {
-                    let port = i.ssh_port.unwrap_or(22);
-                    format!("{}:{}", host, port)
-                });
 
                 Instance {
                     id: i.id.to_string(),
@@ -341,5 +372,76 @@ impl CloudProvider for VastProvider {
             self.delete(&format!("/instances/{}/", id))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> VastInstance {
+        serde_json::from_str(json).expect("valid instance json")
+    }
+
+    #[test]
+    fn test_direct_address_prefers_mapped_ssh_port() {
+        let instance = parse(
+            r#"{
+                "id": 49019841,
+                "ssh_host": "ssh6.vast.ai",
+                "ssh_port": 19840,
+                "public_ipaddr": "151.237.25.16",
+                "image_runtype": "jupyter_direc ssh_direc ssh_proxy",
+                "ports": {
+                    "8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "29061"}],
+                    "22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "29283"}, {"HostIp": "::", "HostPort": "29283"}]
+                }
+            }"#,
+        );
+        assert_eq!(
+            direct_address(&instance).as_deref(),
+            Some("151.237.25.16:29283")
+        );
+    }
+
+    #[test]
+    fn test_proxy_address_offsets_jupyter_images() {
+        let instance = parse(
+            r#"{
+                "id": 49019841,
+                "ssh_host": "ssh6.vast.ai",
+                "ssh_port": 19840,
+                "image_runtype": "jupyter_direc ssh_direc ssh_proxy",
+                "ports": null
+            }"#,
+        );
+        assert_eq!(direct_address(&instance), None);
+        assert_eq!(
+            proxy_address(&instance).as_deref(),
+            Some("ssh6.vast.ai:19841")
+        );
+    }
+
+    #[test]
+    fn test_proxy_address_without_jupyter_uses_raw_port() {
+        let instance = parse(
+            r#"{
+                "id": 1,
+                "ssh_host": "ssh3.vast.ai",
+                "ssh_port": 19880,
+                "image_runtype": "ssh_direc ssh_proxy"
+            }"#,
+        );
+        assert_eq!(
+            proxy_address(&instance).as_deref(),
+            Some("ssh3.vast.ai:19880")
+        );
+    }
+
+    #[test]
+    fn test_no_address_without_host() {
+        let instance = parse(r#"{"id": 1}"#);
+        assert_eq!(direct_address(&instance), None);
+        assert_eq!(proxy_address(&instance), None);
     }
 }
