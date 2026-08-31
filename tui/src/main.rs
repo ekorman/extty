@@ -1029,15 +1029,17 @@ impl App {
                     .download_run(&project, &name, &runs_dir, false, false)
                     .await
                 {
-                    Ok(false) => {
+                    Ok(None) => {
                         let _ = tx.send(S3PullMessage::Done(format!(
                             "{}/{} already completed",
                             project, name
                         )));
                     }
-                    Ok(true) => {
-                        let _ =
-                            tx.send(S3PullMessage::Done(format!("Pulled {}/{}", project, name)));
+                    Ok(Some(summary)) => {
+                        let _ = tx.send(S3PullMessage::Done(format!(
+                            "Pulled {}/{} ({} downloaded, {} up to date)",
+                            project, name, summary.downloaded, summary.skipped
+                        )));
                     }
                     Err(e) => {
                         let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
@@ -1181,8 +1183,8 @@ impl App {
                         .download_run(project, name, &runs_dir, false, false)
                         .await
                     {
-                        Ok(false) => skipped += 1,
-                        Ok(true) => {}
+                        Ok(None) => skipped += 1,
+                        Ok(Some(_)) => {}
                         Err(e) => {
                             let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
                             return;
@@ -1266,8 +1268,8 @@ impl App {
                         .download_run(&project, &rr.name, &runs_dir, false, false)
                         .await
                     {
-                        Ok(false) => skipped += 1,
-                        Ok(true) => {}
+                        Ok(None) => skipped += 1,
+                        Ok(Some(_)) => {}
                         Err(e) => {
                             let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
                             return;
@@ -1347,15 +1349,17 @@ impl App {
                     .download_run(&project, &name, &runs_dir, false, false)
                     .await
                 {
-                    Ok(false) => {
+                    Ok(None) => {
                         let _ = tx.send(S3PullMessage::Done(format!(
                             "{}/{} already completed",
                             project, name
                         )));
                     }
-                    Ok(true) => {
-                        let _ =
-                            tx.send(S3PullMessage::Done(format!("Pulled {}/{}", project, name)));
+                    Ok(Some(summary)) => {
+                        let _ = tx.send(S3PullMessage::Done(format!(
+                            "Pulled {}/{} ({} downloaded, {} up to date)",
+                            project, name, summary.downloaded, summary.skipped
+                        )));
                     }
                     Err(e) => {
                         let _ = tx.send(S3PullMessage::Error(format!("Pull failed: {}", e)));
@@ -4742,7 +4746,7 @@ fn run_s3_command(cmd: &str, options: SyncOptions) -> Result<()> {
                 }
 
                 for run in runs_to_sync {
-                    client
+                    let summary = client
                         .download_run(
                             &run.project,
                             &run.name,
@@ -4751,8 +4755,18 @@ fn run_s3_command(cmd: &str, options: SyncOptions) -> Result<()> {
                             options.dry_run,
                         )
                         .await?;
-                    if !options.dry_run {
-                        println!("Pulled: {}/{}", run.project, run.name);
+                    if options.dry_run {
+                        continue;
+                    }
+                    match summary {
+                        Some(summary) => println!(
+                            "Pulled: {}/{} ({} downloaded, {} up to date)",
+                            run.project, run.name, summary.downloaded, summary.skipped
+                        ),
+                        None => println!(
+                            "Skipped: {}/{} (already completed locally)",
+                            run.project, run.name
+                        ),
                     }
                 }
             }

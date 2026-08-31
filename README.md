@@ -1,3 +1,5 @@
+# extty: terminal first MLOps
+
 # Logging
 
 Everything is logged through `extty.log`, which takes a dict of names to

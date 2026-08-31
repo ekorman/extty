@@ -5,9 +5,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::types::Object;
+use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
 use super::config::S3Config;
+
+/// Maximum number of objects fetched concurrently by [`S3Client::download_run`].
+const DOWNLOAD_CONCURRENCY: usize = 16;
+
+/// Outcome of a [`S3Client::download_run`] that was not short-circuited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PullSummary {
+    /// Objects fetched from S3.
+    pub downloaded: usize,
+    /// Objects whose local copy was already current and left untouched.
+    pub skipped: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteRun {
@@ -159,8 +173,13 @@ impl S3Client {
         Ok(projects)
     }
 
-    /// Downloads a run from S3. Returns `Ok(true)` if files were downloaded,
-    /// or `Ok(false)` if the run was skipped because it is already completed locally.
+    /// Downloads a run from S3.
+    ///
+    /// Returns `Ok(None)` if the run was skipped because it is already completed
+    /// locally. Otherwise every object under the run prefix (checkpoints aside) is
+    /// compared against its local copy and only stale or missing ones are fetched,
+    /// up to [`DOWNLOAD_CONCURRENCY`] at a time. Pass `force` to re-download
+    /// everything.
     pub async fn download_run(
         &self,
         project: &str,
@@ -168,7 +187,7 @@ impl S3Client {
         dest: &Path,
         force: bool,
         dry_run: bool,
-    ) -> Result<bool> {
+    ) -> Result<Option<PullSummary>> {
         let prefix = self.s3_prefix(&format!("runs/{}/{}/", project, run));
         let run_dir = dest.join(project).join(run);
 
@@ -181,7 +200,7 @@ impl S3Client {
                 let _ = self
                     .sync_checkpoints_index_if_newer(project, run, &run_dir)
                     .await;
-                return Ok(false);
+                return Ok(None);
             }
         }
 
@@ -192,11 +211,50 @@ impl S3Client {
                 run,
                 run_dir.display()
             );
-            return Ok(true);
+            return Ok(Some(PullSummary::default()));
         }
 
         fs::create_dir_all(&run_dir)?;
 
+        let mut pending: Vec<(String, PathBuf)> = Vec::new();
+        let mut skipped = 0usize;
+        for object in self.list_objects(&prefix).await? {
+            let Some(key) = object.key() else {
+                continue;
+            };
+            let relative_path = key.strip_prefix(&prefix).unwrap_or(key);
+            if relative_path.is_empty() || relative_path.starts_with("checkpoints/") {
+                continue;
+            }
+
+            let local_path = run_dir.join(relative_path);
+            if !force && local_is_current(&local_path, &object, is_mergeable(key)) {
+                skipped += 1;
+                continue;
+            }
+            if let Some(parent) = local_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            pending.push((key.to_string(), local_path));
+        }
+
+        let downloaded = pending.len();
+        futures_util::stream::iter(pending)
+            .map(move |(key, local_path)| async move {
+                self.download_file(&key, &local_path, force).await
+            })
+            .buffer_unordered(DOWNLOAD_CONCURRENCY)
+            .try_collect::<()>()
+            .await?;
+
+        Ok(Some(PullSummary {
+            downloaded,
+            skipped,
+        }))
+    }
+
+    async fn list_objects(&self, prefix: &str) -> Result<Vec<Object>> {
+        let mut objects = Vec::new();
         let mut continuation_token: Option<String> = None;
 
         loop {
@@ -204,33 +262,14 @@ impl S3Client {
                 .client
                 .list_objects_v2()
                 .bucket(&self.config.bucket)
-                .prefix(&prefix);
+                .prefix(prefix);
 
             if let Some(token) = continuation_token.take() {
                 request = request.continuation_token(token);
             }
 
             let response = request.send().await?;
-
-            for object in response.contents() {
-                if let Some(key) = object.key() {
-                    let relative_path = key.strip_prefix(&prefix).unwrap_or(key);
-                    if relative_path.is_empty() {
-                        continue;
-                    }
-
-                    if relative_path.starts_with("checkpoints/") {
-                        continue;
-                    }
-
-                    let local_path = run_dir.join(relative_path);
-                    if let Some(parent) = local_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-
-                    self.download_file(key, &local_path, force).await?;
-                }
-            }
+            objects.extend(response.contents().iter().cloned());
 
             if response.is_truncated() == Some(true) {
                 continuation_token = response.next_continuation_token().map(|s| s.to_string());
@@ -239,7 +278,7 @@ impl S3Client {
             }
         }
 
-        Ok(true)
+        Ok(objects)
     }
 
     async fn download_file(&self, key: &str, local_path: &Path, force: bool) -> Result<()> {
@@ -557,6 +596,42 @@ impl S3Client {
             .await?;
         Ok(())
     }
+}
+
+/// Keys whose local copy is merged with the remote rather than overwritten.
+/// Must agree with the branches in [`S3Client::download_file`].
+fn is_mergeable(key: &str) -> bool {
+    key.ends_with(".csv") || key.ends_with(".jsonl") || key.ends_with("meta.json")
+}
+
+/// Whether the local copy of `object` can be left alone.
+///
+/// A file is current when it was written after the remote object was last
+/// modified (local mtimes are set at download or merge time, so a remote rewrite
+/// always lands strictly later) and, for write-once blobs such as logged images,
+/// when it has the same byte length. Mergeable text files are re-serialised on
+/// merge and so are legitimately a different size from the remote object.
+fn local_is_current(local_path: &Path, object: &Object, mergeable: bool) -> bool {
+    let Ok(metadata) = fs::metadata(local_path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let Some(remote_modified) = object.last_modified() else {
+        return false;
+    };
+    let Some(local_modified) = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+    else {
+        return false;
+    };
+    if remote_modified.secs() >= local_modified.as_secs() as i64 {
+        return false;
+    }
+    mergeable || matches!(object.size(), Some(size) if i64::try_from(metadata.len()) == Ok(size))
 }
 
 fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1088,4 +1163,92 @@ fn merge_meta_bytes(local: &[u8], remote: &[u8]) -> Result<Vec<u8>> {
     };
 
     Ok(serde_json::to_vec_pretty(&merged)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::primitives::DateTime;
+
+    fn object(secs_ago: i64, size: i64) -> Object {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        Object::builder()
+            .key("runs/p/r/images/val/dets/step_1000.png")
+            .last_modified(DateTime::from_secs(now - secs_ago))
+            .size(size)
+            .build()
+    }
+
+    #[test]
+    fn blob_is_current_when_older_remote_and_same_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("step_1000.png");
+        fs::write(&path, b"12345").unwrap();
+
+        assert!(local_is_current(&path, &object(60, 5), false));
+    }
+
+    #[test]
+    fn blob_is_stale_when_size_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("step_1000.png");
+        fs::write(&path, b"12345").unwrap();
+
+        assert!(!local_is_current(&path, &object(60, 4), false));
+    }
+
+    #[test]
+    fn mergeable_file_ignores_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loss.csv");
+        fs::write(&path, b"step,value\n1,0.5\n").unwrap();
+
+        assert!(local_is_current(&path, &object(60, 4), true));
+    }
+
+    #[test]
+    fn newer_or_same_second_remote_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("step_1000.png");
+        fs::write(&path, b"12345").unwrap();
+
+        assert!(!local_is_current(&path, &object(-60, 5), false));
+        assert!(!local_is_current(&path, &object(0, 5), false));
+        assert!(!local_is_current(&path, &object(0, 5), true));
+    }
+
+    #[test]
+    fn missing_local_or_remote_metadata_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("step_1000.png");
+        fs::write(&path, b"12345").unwrap();
+
+        assert!(!local_is_current(
+            &dir.path().join("missing.png"),
+            &object(60, 5),
+            false
+        ));
+        assert!(!local_is_current(dir.path(), &object(60, 5), false));
+        let no_mtime = Object::builder().key("k").size(5).build();
+        assert!(!local_is_current(&path, &no_mtime, false));
+        let no_size = Object::builder()
+            .key("k")
+            .last_modified(DateTime::from_secs(0))
+            .build();
+        assert!(!local_is_current(&path, &no_size, false));
+        assert!(local_is_current(&path, &no_size, true));
+    }
+
+    #[test]
+    fn mergeable_keys() {
+        assert!(is_mergeable("runs/p/r/metrics/train/loss.csv"));
+        assert!(is_mergeable("runs/p/r/system.csv"));
+        assert!(is_mergeable("runs/p/r/images/val/dets.jsonl"));
+        assert!(is_mergeable("runs/p/r/meta.json"));
+        assert!(!is_mergeable("runs/p/r/checkpoints.json"));
+        assert!(!is_mergeable("runs/p/r/images/val/dets/step_1000.png"));
+    }
 }

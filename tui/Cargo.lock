@@ -976,6 +976,7 @@ dependencies = [
  "csv",
  "dialoguer",
  "dirs",
+ "futures-util",
  "image",
  "ratatui",
  "ratatui-image",
