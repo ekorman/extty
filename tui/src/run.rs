@@ -32,10 +32,7 @@ struct LogFile {
 
 impl LogFile {
     fn create() -> Result<Self> {
-        let dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".extty")
-            .join("logs");
+        let dir = crate::paths::extty_home().join("logs");
         fs::create_dir_all(&dir)?;
 
         let timestamp = Local::now().format("%Y%m%d-%H%M%S");
@@ -450,11 +447,7 @@ fn copy_s3_config(
     ssh_user: &str,
     log: &mut LogFile,
 ) -> Result<()> {
-    let s3_config_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("s3")
-        .join("config.toml");
+    let s3_config_path = crate::paths::extty_home().join("s3").join("config.toml");
 
     if !s3_config_path.exists() {
         return Ok(());

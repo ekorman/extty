@@ -124,6 +124,45 @@ run.images("val/detections")            # [ImageRecord(step, file, width, height
 run.image_bytes(run.images("val/detections")[-1])  # PNG bytes
 ```
 
+## Checkpoints
+
+Checkpoints are saved into the run directory, at
+`<extty home>/runs/<project>/<run>/checkpoints/<step>/`, so they work with no
+S3 configured.
+
+```python
+extty.save_checkpoint(step, state_dict=model.state_dict(), optimizer_state_dict=opt.state_dict())
+extty.save_checkpoint(step, path="ckpt.pt")   # or a file written by torch.save
+
+ckpt = extty.load_checkpoint(step)                              # active run
+ckpt = extty.load_checkpoint_from("my-project", "run-1", step)  # any run
+model.load_state_dict(ckpt["model_state_dict"])
+```
+
+With S3 configured (see below), each checkpoint is also uploaded, and the
+local copy is deleted once the upload succeeds; pass `keep_local=True` to keep
+it. If an upload fails, the local copy is kept and an error is logged, so a
+flaky bucket never costs you a checkpoint. Loads use a complete local copy
+when there is one and download from S3 otherwise; a checkpoint downloaded once
+reloads without contacting S3.
+
+`extty.delete_local_checkpoint(project, run, step)` frees disk by deleting a
+local copy that is also in S3. It refuses to delete a checkpoint's only copy
+unless you pass `force=True`.
+
+## Where data is stored
+
+Everything extty keeps locally (runs, checkpoints, the artifact cache, and the
+S3 config file) lives under `~/.extty`. Set `EXTTY_HOME` to move it, e.g. to
+scratch space on a cluster with a small home quota:
+
+```bash
+export EXTTY_HOME=/scratch/$USER/extty
+```
+
+The Python SDK and the `extty` TUI both honor it. The Python SDK makes no
+network requests unless S3 is configured.
+
 ---
 
 # S3 Sync Usage

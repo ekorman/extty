@@ -24,6 +24,7 @@ from extty.artifact import (
     save_artifact as _save_artifact_raw,
 )
 from extty.chart import Chart
+from extty.checkpoints import local_checkpoint_dir, read_local_checkpoint
 from extty.compare import compare, config_diff, plot_metric, reduce_metric
 from extty.confusion import ConfusionMatrix
 from extty.example import BatchExample, Example
@@ -223,20 +224,26 @@ def save_checkpoint(
     path: str | None = None,
     state_dict: Any = None,
     optimizer_state_dict: Any = None,
+    keep_local: bool = False,
 ) -> None:
     """
-    Save a checkpoint to S3 for the active run.
+    Save a checkpoint for the active run.
+
+    The checkpoint is written to the run directory, then uploaded to S3 when
+    configured; see :meth:`extty.Run.save_checkpoint`.
 
     Parameters
     ----------
     step : int
         The training step for this checkpoint.
     path : str or None
-        Path to a local file to upload directly.
+        Path to an existing checkpoint file to save.
     state_dict : Any or None
         Model state dict to serialize with torch.save.
     optimizer_state_dict : Any or None
         Optimizer state dict to include when using state_dict.
+    keep_local : bool, default False
+        Keep the local copy after a successful S3 upload.
     """
     if _active_run is None:
         raise RuntimeError("No active run. Call extty.init() first.")
@@ -245,6 +252,7 @@ def save_checkpoint(
         path=path,
         state_dict=state_dict,
         optimizer_state_dict=optimizer_state_dict,
+        keep_local=keep_local,
     )
 
 
@@ -285,6 +293,9 @@ def load_checkpoint_from(
     """
     Load a checkpoint from any run, downloading from S3 if needed.
 
+    A complete copy in the local runs directory is used without contacting
+    S3.
+
     Parameters
     ----------
     project : str
@@ -303,14 +314,25 @@ def load_checkpoint_from(
     dict[str, Any]
         Contains ``"model_state_dict"`` and optionally
         ``"optimizer_state_dict"``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the checkpoint is not available locally and S3 is not configured
+        or does not have it.
     """
     from extty.s3 import S3Storage
 
+    local_dir = local_checkpoint_dir(project, run_name, step)
+    local = read_local_checkpoint(local_dir, load_optimizer=load_optimizer)
+    if local is not None:
+        return local
     if s3_config is None:
         s3_config = S3Config.load()
     if s3_config is None:
-        raise RuntimeError(
-            "S3 storage is not configured. Set EXTTY_S3_BUCKET or provide s3_config."
+        raise FileNotFoundError(
+            f"Checkpoint {project}/{run_name} step {step} not found in {local_dir} "
+            "and S3 is not configured."
         )
     storage = S3Storage(s3_config, project, run_name)
     return storage.load_checkpoint(step, load_optimizer=load_optimizer)
@@ -320,13 +342,17 @@ def delete_local_checkpoint(
     project: str,
     run_name: str,
     step: int,
+    *,
+    force: bool = False,
+    s3_config: S3Config | None = None,
 ) -> bool:
     """
-    Delete a checkpoint's locally cached files, leaving the S3 copy intact.
+    Delete a checkpoint's local files, leaving any S3 copy intact.
 
-    The local files are only a download cache for ``load_checkpoint``; the
-    checkpoint remains in S3 and is re-downloaded on next load. This is the
-    inverse of :func:`load_checkpoint_from`, using the same addressing.
+    The local copy may be the only one (no S3 configured, or its upload
+    failed), so unless ``force`` is set this refuses to delete a checkpoint
+    that S3 does not have. This is the inverse of
+    :func:`load_checkpoint_from`, using the same addressing.
 
     Parameters
     ----------
@@ -335,22 +361,41 @@ def delete_local_checkpoint(
     run_name : str
         The run name.
     step : int
-        The training step whose local cache should be removed.
+        The training step whose local files should be removed.
+    force : bool, default False
+        Delete even if the checkpoint is not in S3.
+    s3_config : S3Config, optional
+        S3 configuration. Loaded from environment if not provided.
 
     Returns
     -------
     bool
         True if a local directory was found and removed, False if there was
-        nothing cached locally.
+        nothing locally.
+
+    Raises
+    ------
+    RuntimeError
+        If the local files are the only copy and ``force`` is not set.
     """
     import shutil
 
-    from extty.storage import get_runs_dir
+    from extty.s3 import S3Storage
 
-    project_dir = project if project else "_default"
-    local_dir = get_runs_dir() / project_dir / run_name / "checkpoints" / str(step)
+    local_dir = local_checkpoint_dir(project, run_name, step)
     if not local_dir.exists():
         return False
+    if not force:
+        if s3_config is None:
+            s3_config = S3Config.load()
+        if s3_config is None or not S3Storage(
+            s3_config, project, run_name
+        ).has_checkpoint(step):
+            raise RuntimeError(
+                f"Refusing to delete {local_dir}: checkpoint {project}/{run_name} "
+                f"step {step} is not in S3, so this is its only copy. "
+                "Pass force=True to delete it anyway."
+            )
     shutil.rmtree(local_dir)
     return True
 

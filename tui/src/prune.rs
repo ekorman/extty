@@ -41,9 +41,10 @@ pub fn run_local(opts: PruneLocalOptions) -> Result<()> {
 
     let config = s3::load_config()?.ok_or_else(|| {
         anyhow::anyhow!(
-            "S3 not configured. Create ~/.extty/s3/config.toml with:\n\n\
+            "S3 not configured. Create {} with:\n\n\
              bucket = \"your-bucket\"\n\
-             region = \"us-west-2\"\n"
+             region = \"us-west-2\"\n",
+            s3::config_path().display()
         )
     })?;
 
@@ -134,10 +135,7 @@ fn parse_target(target: &Option<String>) -> (Option<String>, Option<String>) {
 }
 
 fn runs_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("runs")
+    crate::paths::extty_home().join("runs")
 }
 
 fn find_local_checkpoint_runs(

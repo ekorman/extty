@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from extty._logger import log as logger
 from extty._sink import StorageSink
 from extty.artifact import ArtifactMeta
 from extty.artifact import save_artifact as _save_artifact
 from extty.async_sink import AsyncSink
 from extty.chart import Chart
+from extty.checkpoints import (
+    checkpoint_dir,
+    read_local_checkpoint,
+    write_checkpoint,
+)
 from extty.confusion import ConfusionMatrix
 from extty.image import Image
 from extty.s3 import S3Config, S3Storage
@@ -276,44 +283,58 @@ class Run:
         path: str | None = None,
         state_dict: Any = None,
         optimizer_state_dict: Any = None,
+        keep_local: bool = False,
     ) -> None:
         """
-        Save a checkpoint to S3.
+        Save a checkpoint to the run directory, and to S3 when configured.
+
+        The checkpoint is always written to ``<run dir>/checkpoints/<step>/``
+        first. With S3 configured it is then uploaded, and the local copy is
+        removed once the upload succeeds unless ``keep_local`` is set. If the
+        upload fails, the local copy is kept.
 
         Parameters
         ----------
         step : int
             The training step for this checkpoint.
         path : str or None
-            Path to a local file to upload directly.
+            Path to an existing checkpoint file to save.
         state_dict : Any or None
             Model state dict to serialize with torch.save.
         optimizer_state_dict : Any or None
             Optimizer state dict to include when using state_dict.
+        keep_local : bool, default False
+            Keep the local copy after a successful S3 upload.
 
         Raises
         ------
         RuntimeError
-            If no S3 storage is configured or the run is finished.
+            If the run is finished.
         """
         with self._lock:
             if self._finished:
                 raise RuntimeError("Cannot save checkpoint on a finished run.")
-        if self._s3_storage is None:
-            raise RuntimeError(
-                "S3 storage is not configured. "
-                "Set EXTTY_S3_BUCKET or provide s3_config to save checkpoints."
-            )
-        entry = self._s3_storage.save_checkpoint(
+        local_dir = checkpoint_dir(self._local_storage.run_dir, step)
+        entry = write_checkpoint(
+            local_dir,
             step,
             path=path,
             state_dict=state_dict,
             optimizer_state_dict=optimizer_state_dict,
         )
-        # Mirror the entry into the local run dir's checkpoints.json so readers
-        # that prefer local storage (get_run) see the same index as S3.
-        if entry is not None:
-            self._local_storage.record_checkpoint(entry)
+        self._local_storage.record_checkpoint(entry)
+        if self._s3_storage is None:
+            logger.info("checkpoint step %d: saved to %s", step, local_dir)
+            return
+        if not self._s3_storage.upload_checkpoint(local_dir, entry):
+            logger.error(
+                "checkpoint step %d: S3 upload failed, local copy kept at %s",
+                step,
+                local_dir,
+            )
+            return
+        if not keep_local:
+            shutil.rmtree(local_dir)
 
     def load_checkpoint(
         self,
@@ -321,7 +342,7 @@ class Run:
         load_optimizer: bool = True,
     ) -> dict[str, Any]:
         """
-        Load a checkpoint, downloading from S3 if not cached locally.
+        Load a checkpoint from the run directory, falling back to S3.
 
         Parameters
         ----------
@@ -338,15 +359,17 @@ class Run:
 
         Raises
         ------
-        RuntimeError
-            If no S3 storage is configured.
         FileNotFoundError
-            If the checkpoint step does not exist.
+            If the checkpoint is neither in the run directory nor in S3.
         """
+        local_dir = checkpoint_dir(self._local_storage.run_dir, step)
+        local = read_local_checkpoint(local_dir, load_optimizer=load_optimizer)
+        if local is not None:
+            return local
         if self._s3_storage is None:
-            raise RuntimeError(
-                "S3 storage is not configured. "
-                "Set EXTTY_S3_BUCKET or provide s3_config to load checkpoints."
+            raise FileNotFoundError(
+                f"Checkpoint step {step} not found in {local_dir} "
+                "and S3 is not configured."
             )
         return self._s3_storage.load_checkpoint(step, load_optimizer=load_optimizer)
 
@@ -465,6 +488,7 @@ class NoOpRun(Run):
         path: str | None = None,
         state_dict: Any = None,
         optimizer_state_dict: Any = None,
+        keep_local: bool = False,
     ) -> None:
         pass
 

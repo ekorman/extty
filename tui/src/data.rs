@@ -296,18 +296,12 @@ struct RunMeta {
 
 // Get the directory where local runs are stored
 fn runs_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("runs")
+    crate::paths::extty_home().join("runs")
 }
 
 // Get the directory where artifact metadata is cached
 pub fn artifacts_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("artifacts")
+    crate::paths::extty_home().join("artifacts")
 }
 
 // Load all runs with only metadata (no metrics/examples/checkpoints)
@@ -1440,10 +1434,7 @@ fn load_images_recursive(
 }
 
 fn starred_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("starred.json")
+    crate::paths::extty_home().join("starred.json")
 }
 
 pub fn load_starred_runs() -> HashSet<String> {
@@ -1469,10 +1460,7 @@ pub fn save_starred_runs(starred: &HashSet<String>) {
 }
 
 fn notes_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("notes.json")
+    crate::paths::extty_home().join("notes.json")
 }
 
 pub fn load_run_notes() -> HashMap<String, String> {
@@ -1497,10 +1485,7 @@ pub fn save_run_notes(notes: &HashMap<String, String>) {
 }
 
 fn archived_projects_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("archived_projects.json")
+    crate::paths::extty_home().join("archived_projects.json")
 }
 
 pub fn load_archived_projects() -> HashSet<String> {
@@ -1526,10 +1511,7 @@ pub fn save_archived_projects(archived: &HashSet<String>) {
 }
 
 fn archived_runs_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("archived_runs.json")
+    crate::paths::extty_home().join("archived_runs.json")
 }
 
 pub fn load_archived_runs() -> HashSet<String> {

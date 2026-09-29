@@ -16,14 +16,29 @@ from extty.confusion import ConfusionMatrix
 from extty.image import Image
 
 
+def get_extty_home() -> Path:
+    """
+    Get the root directory for extty's local data.
+
+    Returns
+    -------
+    Path
+        ``$EXTTY_HOME`` if set and non-empty, otherwise ``~/.extty``.
+    """
+    override = os.environ.get("EXTTY_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".extty"
+
+
 def get_runs_dir() -> Path:
-    """Get the default runs directory (~/.ex/runs/)."""
-    return Path.home() / ".extty" / "runs"
+    """Get the default runs directory (``<extty home>/runs``)."""
+    return get_extty_home() / "runs"
 
 
 def get_artifacts_dir() -> Path:
-    """Get the default artifacts directory (~/.extty/artifacts/)."""
-    return Path.home() / ".extty" / "artifacts"
+    """Get the default artifacts directory (``<extty home>/artifacts``)."""
+    return get_extty_home() / "artifacts"
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,7 @@ const COMPARE_COLORS: [Color; 8] = [
 
 mod data;
 mod infra;
+mod paths;
 mod prune;
 mod run;
 mod s3;
@@ -1712,11 +1713,7 @@ impl App {
                 }
             }
 
-            let s3_config_path = dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".extty")
-                .join("s3")
-                .join("config.toml");
+            let s3_config_path = crate::paths::extty_home().join("s3").join("config.toml");
 
             if s3_config_path.exists() {
                 let mut scp_cmd = std::process::Command::new("bash");
@@ -4719,9 +4716,10 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
 fn run_s3_command(cmd: &str, options: SyncOptions) -> Result<()> {
     let config = s3::load_config()?.ok_or_else(|| {
         anyhow::anyhow!(
-            "S3 not configured. Create ~/.extty/s3/config.toml with:\n\n\
+            "S3 not configured. Create {} with:\n\n\
              bucket = \"your-bucket\"\n\
-             region = \"us-west-2\"\n"
+             region = \"us-west-2\"\n",
+            s3::config_path().display()
         )
     })?;
 
@@ -4847,10 +4845,7 @@ fn parse_target(target: &Option<String>) -> (Option<String>, Option<String>) {
 }
 
 fn runs_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("runs")
+    crate::paths::extty_home().join("runs")
 }
 
 fn list_local_runs(
@@ -11308,7 +11303,10 @@ fn render_s3_config(app: &App, frame: &mut Frame) {
         Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
         Span::styled("S3 Configuration", Style::default().fg(NEON_CYAN).bold()),
         Span::styled(" (", Style::default().fg(Color::DarkGray)),
-        Span::styled("~/.extty/s3/config.toml", Style::default().fg(Color::Gray)),
+        Span::styled(
+            s3::config_path().display().to_string(),
+            Style::default().fg(Color::Gray),
+        ),
         Span::styled(")", Style::default().fg(Color::DarkGray)),
     ]);
 

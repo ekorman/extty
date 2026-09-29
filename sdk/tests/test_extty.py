@@ -9,17 +9,22 @@ import shutil
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
 from botocore.exceptions import BotoCoreError
 
 import extty
+from extty.checkpoints import META_FILE, read_local_checkpoint, write_checkpoint
 from extty.s3 import S3Config, S3Storage
 from extty.storage import (
     MetaData,
     RunStorage,
     generate_random_name,
+    get_artifacts_dir,
+    get_extty_home,
+    get_runs_dir,
     sanitize_metric_name,
 )
 
@@ -1092,7 +1097,7 @@ class TestSaveCheckpoint:
         fake_file = tmp_path / "model.pt"
         fake_file.write_bytes(b"fake model data")
 
-        storage.save_checkpoint(step=100, path=str(fake_file))
+        _write_and_upload(storage, step=100, path=str(fake_file))
 
         checkpoint_key = "test/runs/myproject/run-001/checkpoints/100/checkpoint.pt"
         assert checkpoint_key in stored
@@ -1132,7 +1137,8 @@ class TestSaveCheckpoint:
         mock_torch.save.side_effect = fake_save
 
         with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            storage.save_checkpoint(
+            _write_and_upload(
+                storage,
                 step=50,
                 state_dict={"weight": "data"},
                 optimizer_state_dict={"lr": 0.01},
@@ -1170,7 +1176,7 @@ class TestSaveCheckpoint:
         mock_torch.save.side_effect = fake_save
 
         with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            storage.save_checkpoint(step=10, state_dict={"weight": "data"})
+            _write_and_upload(storage, step=10, state_dict={"weight": "data"})
 
         model_key = "pfx/runs/proj/run-2/checkpoints/10/model.pt"
         opt_key = "pfx/runs/proj/run-2/checkpoints/10/optimizer.pt"
@@ -1194,27 +1200,14 @@ class TestSaveCheckpoint:
         file2 = tmp_path / "ckpt2.pt"
         file2.write_bytes(b"ckpt2data")
 
-        storage.save_checkpoint(step=50, path=str(file1))
-        storage.save_checkpoint(step=100, path=str(file2))
+        _write_and_upload(storage, step=50, path=str(file1))
+        _write_and_upload(storage, step=100, path=str(file2))
 
         index_key = "pfx/runs/proj/run-x/checkpoints.json"
         index = json.loads(stored[index_key])
         assert len(index) == 2
         assert index[0]["step"] == 50
         assert index[1]["step"] == 100
-
-    def test_save_checkpoint_requires_exactly_one_source(self) -> None:
-        """Test that providing both or neither path and state_dict raises ValueError."""
-        client, _ = self._make_mock_s3_client()
-        storage = self._make_storage(
-            client, bucket="b", prefix="", project="p", run_name="r"
-        )
-
-        with pytest.raises(ValueError, match="Exactly one"):
-            storage.save_checkpoint(step=1)
-
-        with pytest.raises(ValueError, match="Exactly one"):
-            storage.save_checkpoint(step=1, path="/a", state_dict={"k": "v"})
 
     def test_save_checkpoint_returns_index_entry(self, tmp_path: Path) -> None:
         """Test that save_checkpoint returns the checkpoints.json entry."""
@@ -1226,7 +1219,7 @@ class TestSaveCheckpoint:
         fake_file = tmp_path / "ckpt.pt"
         fake_file.write_bytes(b"data")
 
-        entry = storage.save_checkpoint(step=7, path=str(fake_file))
+        entry = _write_and_upload(storage, step=7, path=str(fake_file))
 
         assert entry is not None
         assert entry["step"] == 7
@@ -1234,8 +1227,8 @@ class TestSaveCheckpoint:
         index = json.loads(stored["pfx/runs/proj/run-e/checkpoints.json"])
         assert index == [entry]
 
-    def test_save_checkpoint_returns_none_on_s3_error(self, tmp_path: Path) -> None:
-        """Test that a failed S3 upload yields None instead of an entry."""
+    def test_upload_checkpoint_returns_false_on_s3_error(self, tmp_path: Path) -> None:
+        """A failed upload reports False and leaves the local files alone."""
         client, _ = self._make_mock_s3_client()
         client.upload_file.side_effect = BotoCoreError()
         storage = self._make_storage(
@@ -1244,8 +1237,11 @@ class TestSaveCheckpoint:
 
         fake_file = tmp_path / "ckpt.pt"
         fake_file.write_bytes(b"data")
+        local_dir = tmp_path / "ckpt"
+        entry = write_checkpoint(local_dir, 7, path=str(fake_file))
 
-        assert storage.save_checkpoint(step=7, path=str(fake_file)) is None
+        assert storage.upload_checkpoint(local_dir, entry) is False
+        assert (local_dir / "checkpoint.pt").read_bytes() == b"data"
 
     def test_list_checkpoints_empty(self) -> None:
         """Test list_checkpoints returns empty list when no checkpoints exist."""
@@ -1263,7 +1259,7 @@ class TestSaveCheckpoint:
         fake_file = tmp_path / "ckpt.pt"
         fake_file.write_bytes(b"data")
 
-        storage.save_checkpoint(step=10, path=str(fake_file))
+        _write_and_upload(storage, step=10, path=str(fake_file))
         result = storage.list_checkpoints()
 
         assert len(result) == 1
@@ -1290,7 +1286,8 @@ class TestSaveCheckpoint:
         mock_torch.save.side_effect = fake_save
 
         with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            storage.save_checkpoint(
+            _write_and_upload(
+                storage,
                 step=42,
                 state_dict={"weight": "data"},
                 optimizer_state_dict={"lr": 0.01},
@@ -1333,7 +1330,7 @@ class TestSaveCheckpoint:
         mock_torch.save.side_effect = fake_save
 
         with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            storage.save_checkpoint(step=7, state_dict={"weight": "data"})
+            _write_and_upload(storage, step=7, state_dict={"weight": "data"})
 
         before = dict(stored)
         storage.delete_checkpoint_optimizer(step=7)
@@ -1350,19 +1347,6 @@ class TestSaveCheckpoint:
         with pytest.raises(FileNotFoundError):
             storage.delete_checkpoint_optimizer(step=999)
 
-    def test_delete_local_checkpoint_removes_cache(self, tmp_path: Path) -> None:
-        """delete_local_checkpoint removes the local cache directory."""
-        runs_dir = tmp_path / "runs"
-        local_dir = runs_dir / "proj" / "run-local" / "checkpoints" / "3"
-        local_dir.mkdir(parents=True)
-        (local_dir / "model.pt").write_bytes(b"cached")
-
-        with mock.patch("extty.storage.get_runs_dir", return_value=runs_dir):
-            removed = extty.delete_local_checkpoint("proj", "run-local", step=3)
-
-        assert removed is True
-        assert not local_dir.exists()
-
     def test_delete_local_checkpoint_noop_when_absent(self, tmp_path: Path) -> None:
         """delete_local_checkpoint returns False when nothing is cached."""
         with mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"):
@@ -1373,17 +1357,6 @@ class TestSaveCheckpoint:
         extty._active_run = None
         with pytest.raises(RuntimeError, match="No active run"):
             extty.save_checkpoint(step=1, path="/nonexistent")
-
-    def test_run_save_checkpoint_without_s3_raises(self, tmp_path: Path) -> None:
-        """Test that save_checkpoint raises when no S3 is configured."""
-        with (
-            mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"),
-            mock.patch("extty.s3.S3Config.load", return_value=None),
-        ):
-            run = extty.init("test-project", name="no-s3-run", system_metrics=False)
-            with pytest.raises(RuntimeError, match="S3 storage is not configured"):
-                run.save_checkpoint(step=1, path="/nonexistent")
-            extty.finish()
 
 
 class TestLocalCheckpointIndex:
@@ -1438,10 +1411,10 @@ class TestLocalCheckpointIndex:
             run_data = extty.get_run("proj", "run-1", local_only=True)
             assert [c.step for c in run_data.checkpoints] == [100]
 
-    def test_run_save_checkpoint_skips_local_index_on_s3_error(
-        self, tmp_path: Path
+    def test_run_save_checkpoint_keeps_local_copy_on_s3_error(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A failed S3 save must not record the checkpoint locally."""
+        """A failed S3 upload keeps the local copy and records it in the index."""
         client, _ = TestSaveCheckpoint()._make_mock_s3_client()
         client.upload_file.side_effect = BotoCoreError()
         runs_dir = tmp_path / "runs"
@@ -1452,6 +1425,7 @@ class TestLocalCheckpointIndex:
         with (
             mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
             mock.patch("boto3.client", return_value=client),
+            caplog.at_level(logging.ERROR, logger="extty"),
         ):
             run = extty.run.Run(
                 "proj",
@@ -1462,7 +1436,12 @@ class TestLocalCheckpointIndex:
             run.save_checkpoint(100, path=str(fake_file))
             run.finish()
 
-        assert not (runs_dir / "proj" / "run-2" / "checkpoints.json").exists()
+        run_dir = runs_dir / "proj" / "run-2"
+        local_file = run_dir / "checkpoints" / "100" / "checkpoint.pt"
+        assert local_file.read_bytes() == b"fake model data"
+        index = json.loads((run_dir / "checkpoints.json").read_text())
+        assert [e["step"] for e in index] == [100]
+        assert "local copy kept at" in caplog.text
 
 
 class TestLoadCheckpoint:
@@ -1544,7 +1523,8 @@ class TestLoadCheckpoint:
         mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
 
         with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            storage.save_checkpoint(
+            _write_and_upload(
+                storage,
                 step=10,
                 state_dict={"w": [1, 2, 3]},
                 optimizer_state_dict={"lr": 0.01},
@@ -1571,7 +1551,8 @@ class TestLoadCheckpoint:
         mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
 
         with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            storage.save_checkpoint(
+            _write_and_upload(
+                storage,
                 step=10,
                 state_dict={"w": [1]},
                 optimizer_state_dict={"lr": 0.1},
@@ -1628,7 +1609,7 @@ class TestLoadCheckpoint:
         mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
 
         with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            storage.save_checkpoint(step=20, state_dict={"w": 1})
+            _write_and_upload(storage, step=20, state_dict={"w": 1})
 
         with (
             mock.patch.dict("sys.modules", {"torch": mock_torch}),
@@ -1661,6 +1642,255 @@ def _pickle_load(path):
 
     with open(path, "rb") as f:
         return pickle.load(f)
+
+
+def _write_and_upload(
+    storage: S3Storage, step: int, **kwargs: Any
+) -> dict[str, Any] | None:
+    """Write a checkpoint to ``storage``'s local dir and upload it, as Run does."""
+    local_dir = storage._local_checkpoint_dir(step)
+    entry = write_checkpoint(local_dir, step, **kwargs)
+    return entry if storage.upload_checkpoint(local_dir, entry) else None
+
+
+@pytest.fixture
+def fake_torch() -> Generator[mock.MagicMock, None, None]:
+    """Stand in for a CPU-only torch with pickle-backed ``save`` / ``load``."""
+    fake = mock.MagicMock()
+    fake.cuda.is_available.return_value = False
+    fake.backends.mps.is_available.return_value = False
+    fake.save.side_effect = _pickle_save
+    fake.load.side_effect = lambda path, **kw: _pickle_load(path)
+    with mock.patch.dict("sys.modules", {"torch": fake}):
+        yield fake
+
+
+class TestLocalCheckpoints:
+    """Tests for the local checkpoint backend and the S3 mirroring policy."""
+
+    def _s3_run(self, client: mock.MagicMock, name: str) -> extty.run.Run:
+        with mock.patch("boto3.client", return_value=client):
+            return extty.run.Run(
+                "proj",
+                name=name,
+                system_metrics=False,
+                s3_config=S3Config(bucket="b", prefix="pfx"),
+            )
+
+    def test_write_checkpoint_layout(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """State dicts become model.pt / optimizer.pt plus a meta.json entry."""
+        dest = tmp_path / "ckpt"
+        entry = write_checkpoint(
+            dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
+        )
+
+        assert entry["step"] == 3
+        assert [f["name"] for f in entry["files"]] == ["model.pt", "optimizer.pt"]
+        assert all(f["size_bytes"] > 0 for f in entry["files"])
+        assert json.loads((dest / META_FILE).read_text()) == entry
+        assert sorted(p.name for p in dest.iterdir()) == [
+            "meta.json",
+            "model.pt",
+            "optimizer.pt",
+        ]
+
+    def test_write_checkpoint_requires_exactly_one_source(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Exactly one"):
+            write_checkpoint(tmp_path, 1)
+
+        with pytest.raises(ValueError, match="Exactly one"):
+            write_checkpoint(tmp_path, 1, path="/a", state_dict={"k": "v"})
+
+    def test_read_local_checkpoint_round_trip(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        dest = tmp_path / "ckpt"
+        write_checkpoint(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
+
+        assert read_local_checkpoint(dest) == {
+            "model_state_dict": {"w": 1},
+            "optimizer_state_dict": {"lr": 0.1},
+        }
+        assert read_local_checkpoint(dest, load_optimizer=False) == {
+            "model_state_dict": {"w": 1}
+        }
+
+    def test_read_local_checkpoint_requires_meta_and_needed_files(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """Only a complete copy counts; a missing optimizer matters only if asked for."""
+        dest = tmp_path / "ckpt"
+        assert read_local_checkpoint(dest) is None
+
+        write_checkpoint(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
+        (dest / "optimizer.pt").unlink()
+        assert read_local_checkpoint(dest) is None
+        assert read_local_checkpoint(dest, load_optimizer=False) == {
+            "model_state_dict": {"w": 1}
+        }
+
+        (dest / META_FILE).unlink()
+        assert read_local_checkpoint(dest, load_optimizer=False) is None
+
+    def test_interrupted_rewrite_is_not_read_as_complete(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """Re-saving a step invalidates its meta.json before writing any file."""
+        dest = tmp_path / "ckpt"
+        write_checkpoint(dest, 3, state_dict={"w": 1})
+        fake_torch.save.side_effect = OSError("disk full")
+
+        with pytest.raises(OSError, match="disk full"):
+            write_checkpoint(dest, 3, state_dict={"w": 2})
+
+        assert read_local_checkpoint(dest) is None
+
+    def test_run_saves_and_loads_without_s3(
+        self,
+        extty_home: Path,
+        fake_torch: mock.MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """With no S3 configured, checkpoints live in the run dir and round-trip."""
+        with caplog.at_level(logging.INFO, logger="extty"):
+            run = extty.run.Run("proj", name="local-run", system_metrics=False)
+            run.save_checkpoint(
+                5, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
+            )
+            loaded = run.load_checkpoint(5)
+            run.finish()
+
+        expected = {"model_state_dict": {"w": 1}, "optimizer_state_dict": {"lr": 0.1}}
+        ckpt_dir = extty_home / "runs" / "proj" / "local-run" / "checkpoints" / "5"
+        assert loaded == expected
+        assert (ckpt_dir / "model.pt").exists()
+        assert f"saved to {ckpt_dir}" in caplog.text
+        run_data = extty.get_run("proj", "local-run", local_only=True)
+        assert [c.step for c in run_data.checkpoints] == [5]
+        assert extty.load_checkpoint_from("proj", "local-run", 5) == expected
+
+    def test_run_load_missing_step_without_s3_raises(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        run = extty.run.Run("proj", name="empty-run", system_metrics=False)
+        with pytest.raises(FileNotFoundError, match="step 9"):
+            run.load_checkpoint(9)
+        run.finish()
+
+    def test_s3_upload_success_removes_local_copy(
+        self, extty_home: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """After a successful upload the local files go; the index entry stays."""
+        client, stored = TestLoadCheckpoint()._make_mock_s3_client()
+        run = self._s3_run(client, "s3-run")
+        run.save_checkpoint(5, state_dict={"w": 1})
+        run.finish()
+
+        run_dir = extty_home / "runs" / "proj" / "s3-run"
+        assert "pfx/runs/proj/s3-run/checkpoints/5/model.pt" in stored
+        assert not (run_dir / "checkpoints" / "5").exists()
+        index = json.loads((run_dir / "checkpoints.json").read_text())
+        assert [e["step"] for e in index] == [5]
+
+    def test_s3_upload_keep_local_loads_without_download(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        client, stored = TestLoadCheckpoint()._make_mock_s3_client()
+        run = self._s3_run(client, "kept-run")
+        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
+
+        assert "pfx/runs/proj/kept-run/checkpoints/5/model.pt" in stored
+        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
+        client.download_file.assert_not_called()
+        run.finish()
+
+    def test_checkpoint_pulled_from_s3_reloads_offline(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """A checkpoint downloaded once is reloaded without contacting S3."""
+        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
+        run = self._s3_run(client, "pulled-run")
+        run.save_checkpoint(5, state_dict={"w": 1})
+        run.finish()
+
+        config = S3Config(bucket="b", prefix="pfx")
+        with mock.patch("boto3.client", return_value=client):
+            first = extty.load_checkpoint_from(
+                "proj", "pulled-run", 5, s3_config=config
+            )
+        with mock.patch("boto3.client", side_effect=AssertionError("S3 contacted")):
+            second = extty.load_checkpoint_from(
+                "proj", "pulled-run", 5, s3_config=config
+            )
+
+        assert first == second == {"model_state_dict": {"w": 1}}
+
+    def test_load_checkpoint_from_missing_without_s3_raises(self) -> None:
+        with pytest.raises(FileNotFoundError, match="S3 is not configured"):
+            extty.load_checkpoint_from("proj", "nope", 1)
+
+    def test_delete_local_checkpoint_refuses_only_copy(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        run = extty.run.Run("proj", name="only-copy", system_metrics=False)
+        run.save_checkpoint(5, state_dict={"w": 1})
+        run.finish()
+
+        with pytest.raises(RuntimeError, match="only copy"):
+            extty.delete_local_checkpoint("proj", "only-copy", 5)
+        assert extty.load_checkpoint_from("proj", "only-copy", 5) == {
+            "model_state_dict": {"w": 1}
+        }
+
+        assert extty.delete_local_checkpoint("proj", "only-copy", 5, force=True)
+        with pytest.raises(FileNotFoundError):
+            extty.load_checkpoint_from("proj", "only-copy", 5)
+
+    def test_delete_local_checkpoint_when_in_s3(
+        self, extty_home: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
+        run = self._s3_run(client, "backed-up")
+        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
+        run.finish()
+
+        config = S3Config(bucket="b", prefix="pfx")
+        with mock.patch("boto3.client", return_value=client):
+            removed = extty.delete_local_checkpoint(
+                "proj", "backed-up", 5, s3_config=config
+            )
+
+        assert removed is True
+        ckpt_dir = extty_home / "runs" / "proj" / "backed-up" / "checkpoints" / "5"
+        assert not ckpt_dir.exists()
+
+
+class TestExttyHome:
+    """Tests for relocating extty's local data with ``EXTTY_HOME``."""
+
+    def test_env_var_relocates_local_data(self, extty_home: Path) -> None:
+        assert get_extty_home() == extty_home
+        assert get_runs_dir() == extty_home / "runs"
+        assert get_artifacts_dir() == extty_home / "artifacts"
+
+    def test_defaults_to_dot_extty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("EXTTY_HOME")
+        assert get_extty_home() == Path.home() / ".extty"
+
+    def test_empty_value_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("EXTTY_HOME", "")
+        assert get_extty_home() == Path.home() / ".extty"
+
+    def test_s3_config_file_read_from_extty_home(self, extty_home: Path) -> None:
+        (extty_home / "s3").mkdir(parents=True)
+        (extty_home / "s3" / "config.toml").write_text('bucket = "home-bucket"\n')
+
+        config = S3Config.load()
+
+        assert config is not None
+        assert config.bucket == "home-bucket"
 
 
 class TestRunDataReading:
@@ -2048,7 +2278,7 @@ class TestS3FailureTolerance:
         client.upload_file.side_effect = BotoCoreError()
 
         with caplog.at_level(logging.WARNING, logger="extty"):
-            storage.save_checkpoint(step=100, path=str(fake_file))
+            _write_and_upload(storage, step=100, path=str(fake_file))
 
         assert "Failed to save checkpoint (step 100) to S3" in caplog.text
 
@@ -2124,13 +2354,18 @@ class TestS3FailureTolerance:
         system_key = "test/runs/myproject/run-001/system.csv"
         assert system_key in stored
 
-    def test_save_checkpoint_propagates_local_fs_errors(self, tmp_path) -> None:
+    def test_upload_checkpoint_propagates_local_fs_errors(self, tmp_path) -> None:
         """Local filesystem errors (e.g. missing file) should NOT be swallowed."""
         client, _ = self._make_mock_s3_client()
         storage = self._make_storage(client)
+        entry = {
+            "step": 100,
+            "timestamp": "t",
+            "files": [{"name": "model.pt", "size_bytes": 1}],
+        }
 
         with pytest.raises(FileNotFoundError):
-            storage.save_checkpoint(step=100, path="/nonexistent/model.pt")
+            storage.upload_checkpoint(tmp_path / "missing", entry)
 
     def test_checkpoint_meta_fallback_propagates_non_404_errors(self) -> None:
         """AccessDenied or other S3 errors should propagate, not become FileNotFoundError."""
