@@ -18,8 +18,9 @@ from extty.async_sink import AsyncSink
 from extty.chart import Chart
 from extty.checkpoints import (
     checkpoint_dir,
+    commit_checkpoint,
     read_local_checkpoint,
-    write_checkpoint,
+    stage_checkpoint,
 )
 from extty.confusion import ConfusionMatrix
 from extty.image import Image
@@ -28,7 +29,7 @@ from extty.storage import (
     MetaData,
     RunStorage,
     generate_random_name,
-    get_runs_dir,
+    get_run_dir,
 )
 from extty.system_monitor import SystemMonitor
 
@@ -202,8 +203,7 @@ class Run:
         if s3_config is not None:
             self._s3_storage = S3Storage(s3_config, project, self.name)
 
-        project_dir = project if project else "_default"
-        run_dir = get_runs_dir() / project_dir / self.name
+        run_dir = get_run_dir(project, self.name)
         local_storage = RunStorage(run_dir=run_dir)
         self._local_storage = local_storage
         self._meta = MetaData(
@@ -286,12 +286,12 @@ class Run:
         keep_local: bool = False,
     ) -> None:
         """
-        Save a checkpoint to the run directory, and to S3 when configured.
+        Save a checkpoint to the run directory, or to S3 when configured.
 
-        The checkpoint is always written to ``<run dir>/checkpoints/<step>/``
-        first. With S3 configured it is then uploaded, and the local copy is
-        removed once the upload succeeds unless ``keep_local`` is set. If the
-        upload fails, the local copy is kept.
+        Without S3, the checkpoint is saved to
+        ``<run dir>/checkpoints/<step>/``. With S3 it is uploaded, and also
+        kept in the run directory if ``keep_local`` is set or the upload
+        fails. A ``path`` is uploaded from where it is, not copied first.
 
         Parameters
         ----------
@@ -315,26 +315,29 @@ class Run:
             if self._finished:
                 raise RuntimeError("Cannot save checkpoint on a finished run.")
         local_dir = checkpoint_dir(self._local_storage.run_dir, step)
-        entry = write_checkpoint(
+        entry, sources = stage_checkpoint(
             local_dir,
             step,
             path=path,
             state_dict=state_dict,
             optimizer_state_dict=optimizer_state_dict,
         )
+        uploaded = self._s3_storage is not None and self._s3_storage.upload_checkpoint(
+            entry, sources
+        )
+        if uploaded and not keep_local:
+            shutil.rmtree(local_dir)
+        else:
+            commit_checkpoint(local_dir, entry, sources)
         self._local_storage.record_checkpoint(entry)
         if self._s3_storage is None:
             logger.info("checkpoint step %d: saved to %s", step, local_dir)
-            return
-        if not self._s3_storage.upload_checkpoint(local_dir, entry):
+        elif not uploaded:
             logger.error(
                 "checkpoint step %d: S3 upload failed, local copy kept at %s",
                 step,
                 local_dir,
             )
-            return
-        if not keep_local:
-            shutil.rmtree(local_dir)
 
     def load_checkpoint(
         self,

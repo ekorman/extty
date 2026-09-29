@@ -329,7 +329,7 @@ impl S3Client {
 
         let prefix = self.s3_prefix(&format!("runs/{}/{}", project, run));
 
-        for entry in walkdir(&run_dir)? {
+        for entry in run_files_to_upload(&run_dir)? {
             let relative_path = entry.strip_prefix(&run_dir)?;
             let s3_key = format!("{}/{}", prefix, relative_path.display());
 
@@ -632,6 +632,24 @@ fn local_is_current(local_path: &Path, object: &Object, mergeable: bool) -> bool
         return false;
     }
     mergeable || matches!(object.size(), Some(size) if i64::try_from(metadata.len()) == Ok(size))
+}
+
+/// Files of a local run that a run upload should push.
+///
+/// Checkpoints are excluded: they reach S3 only through the SDK's
+/// `save_checkpoint`, which uploads the files, their `meta.json` and the index
+/// together. Locally, `checkpoints/` can hold multi-GB payloads that were never
+/// meant to be uploaded (and partial `.part` files), and `checkpoints.json` can
+/// list steps that exist only on this machine.
+fn run_files_to_upload(run_dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(walkdir(run_dir)?
+        .into_iter()
+        .filter(|path| {
+            path.strip_prefix(run_dir).is_ok_and(|relative| {
+                !relative.starts_with("checkpoints") && relative != Path::new("checkpoints.json")
+            })
+        })
+        .collect())
 }
 
 fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1180,6 +1198,41 @@ mod tests {
             .last_modified(DateTime::from_secs(now - secs_ago))
             .size(size)
             .build()
+    }
+
+    #[test]
+    fn run_upload_skips_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        for file in [
+            "meta.json",
+            "metrics/train/loss.csv",
+            "checkpoints.json",
+            "checkpoints/100/model.pt",
+            "checkpoints/100/model.pt.part",
+            "checkpoints/100/meta.json",
+            "checkpoints_notes.txt",
+        ] {
+            let path = run_dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"x").unwrap();
+        }
+
+        let mut uploaded: Vec<String> = run_files_to_upload(run_dir)
+            .unwrap()
+            .iter()
+            .map(|path| path.strip_prefix(run_dir).unwrap().display().to_string())
+            .collect();
+        uploaded.sort();
+
+        assert_eq!(
+            uploaded,
+            [
+                "checkpoints_notes.txt",
+                "meta.json",
+                "metrics/train/loss.csv"
+            ]
+        );
     }
 
     #[test]

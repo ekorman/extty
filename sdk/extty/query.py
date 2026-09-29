@@ -19,6 +19,7 @@ from extty.storage import (
     RunStorage,
     RunStorageReader,
     SystemMetricPoint,
+    get_run_dir,
     get_runs_dir,
 )
 
@@ -351,8 +352,7 @@ def get_run(project: str, name: str, *, local_only: bool = False) -> RunData:
         If the run is not found locally, and either *local_only* is True,
         no S3 configuration is available, or the run is also missing in S3.
     """
-    project_dir = project if project else "_default"
-    run_dir = get_runs_dir() / project_dir / name
+    run_dir = get_run_dir(project, name)
     if run_dir.exists() and (run_dir / "meta.json").exists():
         storage = RunStorage.open_readonly(run_dir)
         meta = storage.read_meta()
@@ -372,7 +372,7 @@ def get_run(project: str, name: str, *, local_only: bool = False) -> RunData:
             "is available (set EXTTY_S3_BUCKET or ~/.extty/s3/config.toml)."
         )
 
-    reader = S3RunReader(config=s3_config, project=project_dir, run_name=name)
+    reader = S3RunReader(config=s3_config, project=project or "_default", run_name=name)
     meta = reader.read_meta()
     if meta is None:
         raise FileNotFoundError(

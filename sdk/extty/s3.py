@@ -9,6 +9,7 @@ import shutil
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -232,9 +233,10 @@ class _TransferProgress:
 
 
 try:
+    from boto3.exceptions import Boto3Error
     from botocore.exceptions import BotoCoreError, ClientError
 
-    _S3_ERRORS: tuple[type[Exception], ...] = (BotoCoreError, ClientError)
+    _S3_ERRORS: tuple[type[Exception], ...] = (BotoCoreError, ClientError, Boto3Error)
 except ImportError:
     _S3_ERRORS = ()
 
@@ -765,19 +767,21 @@ class S3Storage:
         except _S3_ERRORS:
             logger.warning("Failed to write run metadata to S3", exc_info=True)
 
-    def upload_checkpoint(self, local_dir: Path, entry: dict[str, Any]) -> bool:
+    def upload_checkpoint(
+        self, entry: dict[str, Any], sources: Mapping[str, Path]
+    ) -> bool:
         """
-        Upload a checkpoint written by :func:`extty.checkpoints.write_checkpoint`.
+        Upload a checkpoint prepared by :func:`extty.checkpoints.stage_checkpoint`.
 
         S3 errors are non-fatal: they are logged as warnings and reported
         through the return value, so the caller can keep the local copy.
 
         Parameters
         ----------
-        local_dir : Path
-            Directory holding the checkpoint's files.
         entry : dict[str, Any]
-            The index entry returned by ``write_checkpoint``.
+            The index entry returned by ``stage_checkpoint``.
+        sources : Mapping[str, Path]
+            Where each of the checkpoint's files is, keyed by file name.
 
         Returns
         -------
@@ -787,9 +791,9 @@ class S3Storage:
         """
         step = entry["step"]
         try:
-            for name in file_names(entry):
+            for name, source in sources.items():
                 self._client.upload_file(
-                    Filename=str(local_dir / name),
+                    Filename=str(source),
                     Bucket=self.config.bucket,
                     Key=self._s3_key("checkpoints", str(step), name),
                     ExtraArgs={"ContentType": "application/octet-stream"},

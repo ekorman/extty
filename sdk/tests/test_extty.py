@@ -7,16 +7,24 @@ import logging
 import os
 import shutil
 import tempfile
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 import pytest
-from botocore.exceptions import BotoCoreError
+from boto3.exceptions import S3UploadFailedError
+from botocore.exceptions import BotoCoreError, EndpointConnectionError
 
 import extty
-from extty.checkpoints import META_FILE, read_local_checkpoint, write_checkpoint
+from extty.checkpoints import (
+    META_FILE,
+    commit_checkpoint,
+    local_checkpoint_dir,
+    read_local_checkpoint,
+    stage_checkpoint,
+)
 from extty.s3 import S3Config, S3Storage
 from extty.storage import (
     MetaData,
@@ -24,9 +32,18 @@ from extty.storage import (
     generate_random_name,
     get_artifacts_dir,
     get_extty_home,
+    get_run_dir,
     get_runs_dir,
     sanitize_metric_name,
 )
+
+
+@contextmanager
+def _runs_dir_at(runs_dir: Path) -> Iterator[None]:
+    """Point extty's runs dir at ``runs_dir``, which must be named ``runs``."""
+    assert runs_dir.name == "runs"
+    with mock.patch.dict(os.environ, {"EXTTY_HOME": str(runs_dir.parent)}):
+        yield
 
 
 class TestVersion:
@@ -293,7 +310,7 @@ class TestImage:
 
 class TestExttyAPI:
     def test_init_creates_run(self, tmp_path: Path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             run = extty.init("test-project", name="my-run", system_metrics=False)
             assert run.name == "my-run"
             assert (
@@ -302,7 +319,7 @@ class TestExttyAPI:
             extty.finish()
 
     def test_log_writes_metrics(self, tmp_path: Path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             extty.init("test-project", name="log-test", system_metrics=False)
             extty.log({"loss": 0.5, "acc": 0.8}, step=0)
             extty.log({"loss": 0.3, "acc": 0.9}, step=1)
@@ -316,7 +333,7 @@ class TestExttyAPI:
             assert len(lines) == 3
 
     def test_log_examples(self, tmp_path: Path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             extty.init("test-project", name="example-test", system_metrics=False)
             extty.log(
                 {
@@ -342,7 +359,7 @@ class TestExttyAPI:
             assert '"Paris"' in content
 
     def test_log_confusion_matrix(self, tmp_path: Path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             extty.init("test-project", name="cm-test", system_metrics=False)
             extty.log(
                 {
@@ -369,7 +386,7 @@ class TestExttyAPI:
         assert record["matrix"] == [[5, 1], [0, 6]]
 
     def test_log_chart(self, tmp_path: Path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             extty.init("test-project", name="chart-test", system_metrics=False)
             extty.log(
                 {
@@ -399,7 +416,7 @@ class TestExttyAPI:
     def test_log_image(self, tmp_path: Path) -> None:
         from PIL import Image as PILImage
 
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             extty.init("test-project", name="image-test", system_metrics=False)
             extty.log(
                 {"val/dets": extty.Image(PILImage.new("RGB", (6, 3), "green"))},
@@ -414,7 +431,7 @@ class TestExttyAPI:
         assert record["width"] == 6
         assert "caption" not in record
 
-        with mock.patch("extty.query.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             run = extty.get_run("test-project", "image-test", local_only=True)
             assert run.image_names == ["val/dets"]
             records = run.images("val/dets")
@@ -424,7 +441,7 @@ class TestExttyAPI:
     def test_context_manager(self, tmp_path: Path) -> None:
         import json
 
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             with extty.init("test-project", name="ctx-test", system_metrics=False):
                 extty.log({"loss": 0.5}, step=0)
 
@@ -440,7 +457,7 @@ class TestExttyAPI:
 
 class TestInstanceId:
     def test_instance_id_from_env(self, tmp_path: Path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             env = {"EXTTY_INSTANCE_ID": "i-abc123", "EXTTY_INSTANCE_PROVIDER": "lambda"}
             with mock.patch.dict(os.environ, env):
                 extty.init("test-project", name="inst-test", system_metrics=False)
@@ -451,7 +468,7 @@ class TestInstanceId:
             assert meta["config"]["_instance_id"] == "lambda:i-abc123"
 
     def test_instance_id_missing_when_no_env(self, tmp_path: Path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             env_remove = {
                 k: ""
                 for k in ("EXTTY_INSTANCE_ID", "EXTTY_INSTANCE_PROVIDER")
@@ -470,7 +487,7 @@ class TestInstanceId:
             assert "_instance_id" not in meta["config"]
 
     def test_instance_id_missing_when_partial_env(self, tmp_path: Path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             env = {"EXTTY_INSTANCE_ID": "i-abc123"}
             with mock.patch.dict(os.environ, env, clear=False):
                 os.environ.pop("EXTTY_INSTANCE_PROVIDER", None)
@@ -660,7 +677,7 @@ class TestExampleRewards:
 
     def test_log_example_with_rewards(self, tmp_path: Path) -> None:
         """Integration test: log Example with rewards and verify JSONL output."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             extty.init("test-project", name="reward-test", system_metrics=False)
             extty.log(
                 {
@@ -690,7 +707,7 @@ class TestExampleRewards:
 
     def test_log_example_with_component_rewards(self, tmp_path: Path) -> None:
         """Integration test: log Example with component rewards."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             extty.init(
                 "test-project", name="component-reward-test", system_metrics=False
             )
@@ -762,7 +779,7 @@ class TestExampleGroundtruth:
             )
 
     def test_log_example_with_groundtruth(self, tmp_path: Path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             extty.init("test-project", name="gt-test", system_metrics=False)
             extty.log(
                 {
@@ -794,7 +811,7 @@ class TestExampleGroundtruth:
 class TestExperimentDecorator:
     def test_decorator_initializes_and_finishes_run(self, tmp_path: Path) -> None:
         """Test that the decorator properly initializes and finishes a run."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment(
                 "test-project", name="decorator-test", system_metrics=False
@@ -815,7 +832,7 @@ class TestExperimentDecorator:
 
     def test_decorator_logs_kwargs_as_config(self, tmp_path: Path) -> None:
         """Test that kwargs passed to the decorated function are logged as config."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment("test-project", name="config-test", system_metrics=False)
             def my_experiment(lr: float = 0.01, batch_size: int = 32) -> None:
@@ -830,7 +847,7 @@ class TestExperimentDecorator:
 
     def test_decorator_warns_on_positional_args(self, tmp_path: Path) -> None:
         """Test that positional arguments trigger a warning."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment("test-project", name="args-test", system_metrics=False)
             def my_experiment(lr: float, epochs: int) -> None:
@@ -841,7 +858,7 @@ class TestExperimentDecorator:
 
     def test_decorator_finishes_run_on_exception(self, tmp_path: Path) -> None:
         """Test that the run is finished even when an exception is raised."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment(
                 "test-project", name="exception-test", system_metrics=False
@@ -868,7 +885,7 @@ class TestExperimentDecorator:
 
     def test_decorator_returns_correct_value(self, tmp_path: Path) -> None:
         """Test that the decorator returns the function's return value."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment("test-project", name="return-test", system_metrics=False)
             def my_experiment() -> dict:
@@ -880,7 +897,7 @@ class TestExperimentDecorator:
 
     def test_decorator_name_kwarg(self, tmp_path: Path) -> None:
         """Test that name_kwarg uses a kwarg value as the run name."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment(
                 "test-project", name_kwarg="run_name", system_metrics=False
@@ -901,7 +918,7 @@ class TestExperimentDecorator:
 
     def test_decorator_conf_kwargs(self, tmp_path: Path) -> None:
         """Test that conf_kwargs only logs specified kwargs to config."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment(
                 "test-project",
@@ -927,7 +944,7 @@ class TestExperimentDecorator:
 
     def test_decorator_non_conf_kwargs(self, tmp_path: Path) -> None:
         """Test that non_conf_kwargs excludes specified kwargs from config."""
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment(
                 "test-project",
@@ -979,7 +996,7 @@ class TestExperimentDataclassConfig:
             lr: float = 0.01
             momentum: float = 0.9
 
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment("test-project", name="dc-test", system_metrics=False)
             def my_experiment(optimizer: OptimizerConfig, epochs: int = 10) -> None:
@@ -998,7 +1015,7 @@ class TestExperimentDataclassConfig:
             units: int
             activation: str = "relu"
 
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment("test-project", name="dc-list-test", system_metrics=False)
             def my_experiment(layers: list[LayerConfig] | None = None) -> None:
@@ -1021,7 +1038,7 @@ class TestExperimentDataclassConfig:
             step_size: int = 10
             gamma: float = 0.1
 
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
 
             @extty.experiment("test-project", name="dc-dict-test", system_metrics=False)
             def my_experiment(
@@ -1237,11 +1254,10 @@ class TestSaveCheckpoint:
 
         fake_file = tmp_path / "ckpt.pt"
         fake_file.write_bytes(b"data")
-        local_dir = tmp_path / "ckpt"
-        entry = write_checkpoint(local_dir, 7, path=str(fake_file))
+        entry, sources = stage_checkpoint(tmp_path / "ckpt", 7, path=str(fake_file))
 
-        assert storage.upload_checkpoint(local_dir, entry) is False
-        assert (local_dir / "checkpoint.pt").read_bytes() == b"data"
+        assert storage.upload_checkpoint(entry, sources) is False
+        assert fake_file.read_bytes() == b"data"
 
     def test_list_checkpoints_empty(self) -> None:
         """Test list_checkpoints returns empty list when no checkpoints exist."""
@@ -1349,7 +1365,7 @@ class TestSaveCheckpoint:
 
     def test_delete_local_checkpoint_noop_when_absent(self, tmp_path: Path) -> None:
         """delete_local_checkpoint returns False when nothing is cached."""
-        with mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             assert extty.delete_local_checkpoint("proj", "run-empty", step=42) is False
 
     def test_module_level_save_checkpoint_without_init_raises(self) -> None:
@@ -1390,7 +1406,7 @@ class TestLocalCheckpointIndex:
         fake_file.write_bytes(b"fake model data")
 
         with (
-            mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
+            _runs_dir_at(runs_dir),
             mock.patch("boto3.client", return_value=client),
         ):
             run = extty.run.Run(
@@ -1407,23 +1423,37 @@ class TestLocalCheckpointIndex:
             stored["pfx/runs/proj/run-1/checkpoints.json"]
         )
 
-        with mock.patch("extty.query.get_runs_dir", return_value=runs_dir):
+        with _runs_dir_at(runs_dir):
             run_data = extty.get_run("proj", "run-1", local_only=True)
             assert [c.step for c in run_data.checkpoints] == [100]
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            BotoCoreError(),
+            S3UploadFailedError(
+                "Failed to upload ckpt.pt: An error occurred (AccessDenied)"
+            ),
+        ],
+        ids=["botocore", "s3-upload-failed"],
+    )
     def test_run_save_checkpoint_keeps_local_copy_on_s3_error(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, error: Exception
     ) -> None:
-        """A failed S3 upload keeps the local copy and records it in the index."""
+        """A failed S3 upload keeps the local copy and records it in the index.
+
+        ``upload_file`` reports bucket-side failures (403, missing bucket) as
+        ``S3UploadFailedError``, which is not a botocore exception.
+        """
         client, _ = TestSaveCheckpoint()._make_mock_s3_client()
-        client.upload_file.side_effect = BotoCoreError()
+        client.upload_file.side_effect = error
         runs_dir = tmp_path / "runs"
 
         fake_file = tmp_path / "ckpt.pt"
         fake_file.write_bytes(b"fake model data")
 
         with (
-            mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
+            _runs_dir_at(runs_dir),
             mock.patch("boto3.client", return_value=client),
             caplog.at_level(logging.ERROR, logger="extty"),
         ):
@@ -1532,7 +1562,7 @@ class TestLoadCheckpoint:
 
         with (
             mock.patch.dict("sys.modules", {"torch": mock_torch}),
-            mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"),
+            _runs_dir_at(tmp_path / "runs"),
         ):
             result = storage.load_checkpoint(10)
 
@@ -1560,7 +1590,7 @@ class TestLoadCheckpoint:
 
         with (
             mock.patch.dict("sys.modules", {"torch": mock_torch}),
-            mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"),
+            _runs_dir_at(tmp_path / "runs"),
         ):
             result = storage.load_checkpoint(10, load_optimizer=False)
 
@@ -1592,7 +1622,7 @@ class TestLoadCheckpoint:
 
         with (
             mock.patch.dict("sys.modules", {"torch": mock_torch}),
-            mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"),
+            _runs_dir_at(tmp_path / "runs"),
         ):
             result = storage.load_checkpoint(5)
 
@@ -1613,7 +1643,7 @@ class TestLoadCheckpoint:
 
         with (
             mock.patch.dict("sys.modules", {"torch": mock_torch}),
-            mock.patch("extty.storage.get_runs_dir", return_value=tmp_path / "runs"),
+            _runs_dir_at(tmp_path / "runs"),
         ):
             storage.load_checkpoint(20)
             client.download_file.reset_mock()
@@ -1644,13 +1674,21 @@ def _pickle_load(path):
         return pickle.load(f)
 
 
+def _save_local(dest: Path, step: int, **kwargs: Any) -> dict[str, Any]:
+    """Stage and commit a checkpoint into ``dest``, returning its index entry."""
+    entry, sources = stage_checkpoint(dest, step, **kwargs)
+    commit_checkpoint(dest, entry, sources)
+    return entry
+
+
 def _write_and_upload(
     storage: S3Storage, step: int, **kwargs: Any
 ) -> dict[str, Any] | None:
-    """Write a checkpoint to ``storage``'s local dir and upload it, as Run does."""
-    local_dir = storage._local_checkpoint_dir(step)
-    entry = write_checkpoint(local_dir, step, **kwargs)
-    return entry if storage.upload_checkpoint(local_dir, entry) else None
+    """Stage a checkpoint in ``storage``'s local dir and upload it, as Run does."""
+    entry, sources = stage_checkpoint(
+        storage._local_checkpoint_dir(step), step, **kwargs
+    )
+    return entry if storage.upload_checkpoint(entry, sources) else None
 
 
 @pytest.fixture
@@ -1677,12 +1715,12 @@ class TestLocalCheckpoints:
                 s3_config=S3Config(bucket="b", prefix="pfx"),
             )
 
-    def test_write_checkpoint_layout(
+    def test_committed_checkpoint_layout(
         self, tmp_path: Path, fake_torch: mock.MagicMock
     ) -> None:
         """State dicts become model.pt / optimizer.pt plus a meta.json entry."""
         dest = tmp_path / "ckpt"
-        entry = write_checkpoint(
+        entry = _save_local(
             dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
         )
 
@@ -1696,18 +1734,18 @@ class TestLocalCheckpoints:
             "optimizer.pt",
         ]
 
-    def test_write_checkpoint_requires_exactly_one_source(self, tmp_path: Path) -> None:
+    def test_stage_checkpoint_requires_exactly_one_source(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="Exactly one"):
-            write_checkpoint(tmp_path, 1)
+            stage_checkpoint(tmp_path, 1)
 
         with pytest.raises(ValueError, match="Exactly one"):
-            write_checkpoint(tmp_path, 1, path="/a", state_dict={"k": "v"})
+            stage_checkpoint(tmp_path, 1, path="/a", state_dict={"k": "v"})
 
     def test_read_local_checkpoint_round_trip(
         self, tmp_path: Path, fake_torch: mock.MagicMock
     ) -> None:
         dest = tmp_path / "ckpt"
-        write_checkpoint(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
+        _save_local(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
 
         assert read_local_checkpoint(dest) == {
             "model_state_dict": {"w": 1},
@@ -1724,7 +1762,7 @@ class TestLocalCheckpoints:
         dest = tmp_path / "ckpt"
         assert read_local_checkpoint(dest) is None
 
-        write_checkpoint(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
+        _save_local(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
         (dest / "optimizer.pt").unlink()
         assert read_local_checkpoint(dest) is None
         assert read_local_checkpoint(dest, load_optimizer=False) == {
@@ -1739,11 +1777,11 @@ class TestLocalCheckpoints:
     ) -> None:
         """Re-saving a step invalidates its meta.json before writing any file."""
         dest = tmp_path / "ckpt"
-        write_checkpoint(dest, 3, state_dict={"w": 1})
+        _save_local(dest, 3, state_dict={"w": 1})
         fake_torch.save.side_effect = OSError("disk full")
 
         with pytest.raises(OSError, match="disk full"):
-            write_checkpoint(dest, 3, state_dict={"w": 2})
+            _save_local(dest, 3, state_dict={"w": 2})
 
         assert read_local_checkpoint(dest) is None
 
@@ -1866,6 +1904,85 @@ class TestLocalCheckpoints:
         ckpt_dir = extty_home / "runs" / "proj" / "backed-up" / "checkpoints" / "5"
         assert not ckpt_dir.exists()
 
+    def test_delete_local_checkpoint_refuses_when_s3_unreachable(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """An S3 error while looking for the remote copy refuses the delete."""
+        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
+        run = self._s3_run(client, "offline")
+        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
+        run.finish()
+        client.get_object.side_effect = EndpointConnectionError(
+            endpoint_url="https://s3.example.com"
+        )
+
+        with (
+            mock.patch("boto3.client", return_value=client),
+            pytest.raises(RuntimeError, match="Could not check S3"),
+        ):
+            extty.delete_local_checkpoint(
+                "proj", "offline", 5, s3_config=S3Config(bucket="b", prefix="pfx")
+            )
+
+        assert local_checkpoint_dir("proj", "offline", 5).exists()
+
+    def test_run_and_lookups_share_run_dir(self) -> None:
+        """Where a Run saves must be where lookups by project/name look."""
+        run = extty.run.Run("", name="shared", system_metrics=False)
+        run.finish()
+
+        run_dir = Path(run.run_dir)
+        assert run_dir == get_run_dir("", "shared")
+        assert run_dir == get_runs_dir() / "_default" / "shared"
+        assert local_checkpoint_dir("", "shared", 3) == run_dir / "checkpoints" / "3"
+
+    def test_s3_path_checkpoint_uploads_without_local_copy(
+        self, tmp_path: Path
+    ) -> None:
+        """A saved file goes to S3 from where it is; nothing is copied locally."""
+        client, stored = TestLoadCheckpoint()._make_mock_s3_client()
+        user_file = tmp_path / "ckpt.pt"
+        user_file.write_bytes(b"weights")
+        run = self._s3_run(client, "path-run")
+        run.save_checkpoint(5, path=str(user_file))
+        run.finish()
+
+        uploaded_from = [
+            c.kwargs["Filename"] for c in client.upload_file.call_args_list
+        ]
+        assert uploaded_from == [str(user_file)]
+        key = "pfx/runs/proj/path-run/checkpoints/5/checkpoint.pt"
+        assert stored[key] == b"weights"
+        assert not local_checkpoint_dir("proj", "path-run", 5).exists()
+
+    def test_s3_path_checkpoint_keep_local_copies_file(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """With keep_local, the saved file is copied in, independent of the original."""
+        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
+        user_file = tmp_path / "ckpt.pt"
+        _pickle_save({"model_state_dict": {"w": 1}}, user_file)
+        run = self._s3_run(client, "kept-path")
+        run.save_checkpoint(5, path=str(user_file), keep_local=True)
+        user_file.unlink()
+
+        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
+        client.download_file.assert_not_called()
+        run.finish()
+
+    def test_missing_path_leaves_existing_local_copy_intact(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """A bad path fails before touching the step's existing checkpoint."""
+        run = extty.run.Run("proj", name="typo", system_metrics=False)
+        run.save_checkpoint(5, state_dict={"w": 1})
+
+        with pytest.raises(FileNotFoundError):
+            run.save_checkpoint(5, path="/nonexistent/ckpt.pt")
+
+        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
+        run.finish()
+
 
 class TestExttyHome:
     """Tests for relocating extty's local data with ``EXTTY_HOME``."""
@@ -1897,17 +2014,12 @@ class TestRunDataReading:
     """Tests for RunData, get_run(), and get_runs() read-path API."""
 
     def _mock_runs_dir(self, tmp_path: Path):
-        """Context manager that patches get_runs_dir in both modules."""
-        runs_dir = tmp_path / "runs"
-        return (
-            mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
-            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
-        )
+        """Context manager that points extty's runs dir into ``tmp_path``."""
+        return _runs_dir_at(tmp_path / "runs")
 
     def test_get_run_loads_metadata(self, tmp_path: Path) -> None:
         """Test that get_run returns RunData with correct metadata."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init(
                 "myproject", name="run-1", config={"lr": 0.001}, system_metrics=False
             )
@@ -1923,15 +2035,13 @@ class TestRunDataReading:
 
     def test_get_run_not_found_raises(self, tmp_path: Path) -> None:
         """Test that get_run raises FileNotFoundError for missing runs."""
-        _, m2 = self._mock_runs_dir(tmp_path)
-        with m2:
+        with self._mock_runs_dir(tmp_path):
             with pytest.raises(FileNotFoundError):
                 extty.get_run("nonexistent", "no-run")
 
     def test_get_runs_returns_all(self, tmp_path: Path) -> None:
         """Test that get_runs returns all runs across projects."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj-a", name="run-1", system_metrics=False)
             extty.finish()
             extty.init("proj-b", name="run-2", system_metrics=False)
@@ -1944,8 +2054,7 @@ class TestRunDataReading:
 
     def test_get_runs_filters_by_project(self, tmp_path: Path) -> None:
         """Test that get_runs filters by project name."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj-a", name="run-1", system_metrics=False)
             extty.finish()
             extty.init("proj-b", name="run-2", system_metrics=False)
@@ -1957,8 +2066,7 @@ class TestRunDataReading:
 
     def test_get_runs_sorted_by_started_at(self, tmp_path: Path) -> None:
         """Test that get_runs returns runs sorted most recent first."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj", name="older-run", system_metrics=False)
             extty.finish()
             extty.init("proj", name="newer-run", system_metrics=False)
@@ -1971,15 +2079,12 @@ class TestRunDataReading:
 
     def test_get_runs_empty_dir(self, tmp_path: Path) -> None:
         """Test get_runs with no runs dir returns empty list."""
-        with mock.patch(
-            "extty.query.get_runs_dir", return_value=tmp_path / "nonexistent"
-        ):
+        with _runs_dir_at(tmp_path / "nonexistent" / "runs"):
             assert extty.get_runs() == []
 
     def test_get_runs_skips_corrupt_meta(self, tmp_path: Path) -> None:
         """Test that get_runs skips runs with corrupt meta.json."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj", name="good-run", system_metrics=False)
             extty.finish()
 
@@ -1998,8 +2103,7 @@ class TestRunDataReading:
 
     def test_metric_names(self, tmp_path: Path) -> None:
         """Test that metric_names discovers all logged metrics."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj", name="run-1", system_metrics=False)
             extty.log({"train/loss": 0.5, "train/acc": 0.8}, step=0)
             extty.finish()
@@ -2011,8 +2115,7 @@ class TestRunDataReading:
 
     def test_metric_returns_points(self, tmp_path: Path) -> None:
         """Test that metric() returns correct MetricPoint values."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj", name="run-1", system_metrics=False)
             extty.log({"loss": 0.5}, step=0)
             extty.log({"loss": 0.3}, step=1)
@@ -2029,8 +2132,7 @@ class TestRunDataReading:
 
     def test_metric_not_found_raises(self, tmp_path: Path) -> None:
         """Test that metric() raises FileNotFoundError for missing metrics."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj", name="run-1", system_metrics=False)
             extty.finish()
 
@@ -2040,8 +2142,7 @@ class TestRunDataReading:
 
     def test_system_metrics(self, tmp_path: Path) -> None:
         """Test reading system metrics from a run."""
-        _, m2 = self._mock_runs_dir(tmp_path)
-        with m2:
+        with self._mock_runs_dir(tmp_path):
             run_dir = tmp_path / "runs" / "proj" / "run-1"
             storage = RunStorage(run_dir=run_dir)
             meta = MetaData(
@@ -2064,8 +2165,7 @@ class TestRunDataReading:
 
     def test_system_metrics_empty(self, tmp_path: Path) -> None:
         """Test that system_metrics returns empty list when no system.csv."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj", name="run-1", system_metrics=False)
             extty.finish()
 
@@ -2074,8 +2174,7 @@ class TestRunDataReading:
 
     def test_example_names_and_data(self, tmp_path: Path) -> None:
         """Test reading example data from a run."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj", name="run-1", system_metrics=False)
             extty.log(
                 {"val/example": extty.Example(prompt="Hello", responses=["Hi"])},
@@ -2092,8 +2191,7 @@ class TestRunDataReading:
 
     def test_duration_seconds(self, tmp_path: Path) -> None:
         """Test duration_seconds computation."""
-        m1, m2 = self._mock_runs_dir(tmp_path)
-        with m1, m2:
+        with self._mock_runs_dir(tmp_path):
             extty.init("proj", name="run-1", system_metrics=False)
             extty.finish()
 
@@ -2103,8 +2201,7 @@ class TestRunDataReading:
 
     def test_duration_seconds_none_when_running(self, tmp_path: Path) -> None:
         """Test duration_seconds returns None for unfinished runs."""
-        _, m2 = self._mock_runs_dir(tmp_path)
-        with m2:
+        with self._mock_runs_dir(tmp_path):
             run_dir = tmp_path / "runs" / "proj" / "run-1"
             storage = RunStorage(run_dir=run_dir)
             meta = MetaData(
@@ -2365,7 +2462,7 @@ class TestS3FailureTolerance:
         }
 
         with pytest.raises(FileNotFoundError):
-            storage.upload_checkpoint(tmp_path / "missing", entry)
+            storage.upload_checkpoint(entry, {"model.pt": tmp_path / "missing.pt"})
 
     def test_checkpoint_meta_fallback_propagates_non_404_errors(self) -> None:
         """AccessDenied or other S3 errors should propagate, not become FileNotFoundError."""
@@ -2572,8 +2669,8 @@ class TestS3UploadAvoidsReads:
     def test_local_run_does_not_touch_s3(self, tmp_path: Path) -> None:
         runs_dir = tmp_path / "runs"
         with (
-            mock.patch("extty.run.get_runs_dir", return_value=runs_dir),
-            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+            _runs_dir_at(runs_dir),
+            _runs_dir_at(runs_dir),
         ):
             extty.init(
                 "myproject", name="local-run", config={"lr": 0.5}, system_metrics=False
@@ -2599,7 +2696,7 @@ class TestS3UploadAvoidsReads:
 
         runs_dir = tmp_path / "runs"
         with (
-            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+            _runs_dir_at(runs_dir),
             mock.patch("extty.s3.S3Config.load", return_value=s3_config),
             mock.patch("boto3.client", return_value=client),
         ):
@@ -2626,7 +2723,7 @@ class TestS3UploadAvoidsReads:
 
         runs_dir = tmp_path / "runs"
         with (
-            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+            _runs_dir_at(runs_dir),
             mock.patch("extty.s3.S3Config.load", return_value=s3_config) as load_mock,
             mock.patch("boto3.client", return_value=client) as boto_mock,
         ):
@@ -2641,7 +2738,7 @@ class TestS3UploadAvoidsReads:
 
         runs_dir = tmp_path / "runs"
         with (
-            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+            _runs_dir_at(runs_dir),
             mock.patch("extty.s3.S3Config.load", return_value=s3_config),
             mock.patch("boto3.client", return_value=client),
         ):
@@ -2651,7 +2748,7 @@ class TestS3UploadAvoidsReads:
     def test_no_s3_config_raises_friendly_error(self, tmp_path: Path) -> None:
         runs_dir = tmp_path / "runs"
         with (
-            mock.patch("extty.query.get_runs_dir", return_value=runs_dir),
+            _runs_dir_at(runs_dir),
             mock.patch("extty.s3.S3Config.load", return_value=None),
         ):
             with pytest.raises(FileNotFoundError, match="no S3 configuration"):
@@ -2661,7 +2758,7 @@ class TestS3UploadAvoidsReads:
 class TestDistributedInit:
     def test_rank_env_nonzero_returns_noop(self, tmp_path: Path) -> None:
         with mock.patch.dict(os.environ, {"RANK": "1"}):
-            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            with _runs_dir_at(tmp_path / "runs"):
                 run = extty.init("test-project", name="dist-test", system_metrics=False)
                 assert isinstance(run, extty.NoOpRun)
                 extty.finish()
@@ -2669,7 +2766,7 @@ class TestDistributedInit:
 
     def test_rank_env_zero_returns_real_run(self, tmp_path: Path) -> None:
         with mock.patch.dict(os.environ, {"RANK": "0"}):
-            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            with _runs_dir_at(tmp_path / "runs"):
                 run = extty.init(
                     "test-project", name="rank0-test", system_metrics=False
                 )
@@ -2680,7 +2777,7 @@ class TestDistributedInit:
     def test_no_rank_env_returns_real_run(self, tmp_path: Path) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("RANK", None)
-            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            with _runs_dir_at(tmp_path / "runs"):
                 run = extty.init(
                     "test-project", name="norank-test", system_metrics=False
                 )
@@ -2689,7 +2786,7 @@ class TestDistributedInit:
 
     def test_explicit_rank_overrides_env(self, tmp_path: Path) -> None:
         with mock.patch.dict(os.environ, {"RANK": "0"}):
-            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            with _runs_dir_at(tmp_path / "runs"):
                 run = extty.init(
                     "test-project", name="override-test", system_metrics=False, rank=3
                 )
@@ -2697,7 +2794,7 @@ class TestDistributedInit:
                 extty.finish()
 
         with mock.patch.dict(os.environ, {"RANK": "1"}):
-            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            with _runs_dir_at(tmp_path / "runs"):
                 run = extty.init(
                     "test-project", name="override-test2", system_metrics=False, rank=0
                 )
@@ -2747,7 +2844,7 @@ class TestDistributedInit:
     def test_noop_run_no_directories_created(self, tmp_path: Path) -> None:
         from extty.run import NoOpRun
 
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+        with _runs_dir_at(tmp_path / "runs"):
             run = NoOpRun("proj", name="no-dir-test")
             run.log({"x": 1}, step=0)
             run.finish()
@@ -2755,7 +2852,7 @@ class TestDistributedInit:
 
     def test_module_log_and_finish_with_noop(self, tmp_path: Path) -> None:
         with mock.patch.dict(os.environ, {"RANK": "2"}):
-            with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
+            with _runs_dir_at(tmp_path / "runs"):
                 extty.init("test-project", name="module-noop", system_metrics=False)
                 extty.log({"loss": 0.5}, step=0)
                 extty.finish()

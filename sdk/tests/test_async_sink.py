@@ -199,28 +199,24 @@ class TestAsyncSink:
 
 
 class TestAtexitSafetyNet:
-    def test_atexit_handler_finishes_active_run(self, tmp_path) -> None:
-        with mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"):
-            extty.init("atexit-test", name="r1", system_metrics=False)
-            assert extty._active_run is not None
-            run = extty._active_run
+    def test_atexit_handler_finishes_active_run(self) -> None:
+        extty.init("atexit-test", name="r1", system_metrics=False)
+        assert extty._active_run is not None
+        run = extty._active_run
 
-            extty._atexit_finish_active_run()
+        extty._atexit_finish_active_run()
 
-            assert extty._active_run is None
-            assert run._finished is True
+        assert extty._active_run is None
+        assert run._finished is True
 
     def test_atexit_handler_noop_when_no_active_run(self) -> None:
         extty._active_run = None
         extty._atexit_finish_active_run()
         assert extty._active_run is None
 
-    def test_atexit_registered_only_once_across_inits(self, tmp_path) -> None:
+    def test_atexit_registered_only_once_across_inits(self) -> None:
         extty._atexit_registered = False
-        with (
-            mock.patch("extty.run.get_runs_dir", return_value=tmp_path / "runs"),
-            mock.patch("extty.atexit.register") as register_mock,
-        ):
+        with mock.patch("extty.atexit.register") as register_mock:
             extty.init("atexit-once", name="r1", system_metrics=False)
             extty.init("atexit-once", name="r2", system_metrics=False)
             extty.init("atexit-once", name="r3", system_metrics=False)

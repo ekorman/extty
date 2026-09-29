@@ -139,12 +139,13 @@ ckpt = extty.load_checkpoint_from("my-project", "run-1", step)  # any run
 model.load_state_dict(ckpt["model_state_dict"])
 ```
 
-With S3 configured (see below), each checkpoint is also uploaded, and the
-local copy is deleted once the upload succeeds; pass `keep_local=True` to keep
-it. If an upload fails, the local copy is kept and an error is logged, so a
-flaky bucket never costs you a checkpoint. Loads use a complete local copy
-when there is one and download from S3 otherwise; a checkpoint downloaded once
-reloads without contacting S3.
+With S3 configured (see below), each checkpoint is uploaded instead, and kept
+locally only if you pass `keep_local=True` or the upload fails (an error is
+logged with the local path), so a flaky bucket never costs you a checkpoint.
+Loads use a complete local copy when there is one and download from S3
+otherwise; a checkpoint downloaded once reloads without contacting S3.
+Checkpoints reach S3 only through `save_checkpoint`: `extty push` does not
+upload them.
 
 `extty.delete_local_checkpoint(project, run, step)` frees disk by deleting a
 local copy that is also in S3. It refuses to delete a checkpoint's only copy

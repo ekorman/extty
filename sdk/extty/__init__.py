@@ -229,8 +229,8 @@ def save_checkpoint(
     """
     Save a checkpoint for the active run.
 
-    The checkpoint is written to the run directory, then uploaded to S3 when
-    configured; see :meth:`extty.Run.save_checkpoint`.
+    Saved to the run directory, or uploaded to S3 when configured; see
+    :meth:`extty.Run.save_checkpoint`.
 
     Parameters
     ----------
@@ -376,28 +376,43 @@ def delete_local_checkpoint(
     Raises
     ------
     RuntimeError
-        If the local files are the only copy and ``force`` is not set.
+        If ``force`` is not set and S3 cannot confirm it has the checkpoint
+        (not configured, unreachable, or missing it).
     """
     import shutil
-
-    from extty.s3 import S3Storage
 
     local_dir = local_checkpoint_dir(project, run_name, step)
     if not local_dir.exists():
         return False
     if not force:
-        if s3_config is None:
-            s3_config = S3Config.load()
-        if s3_config is None or not S3Storage(
-            s3_config, project, run_name
-        ).has_checkpoint(step):
-            raise RuntimeError(
-                f"Refusing to delete {local_dir}: checkpoint {project}/{run_name} "
-                f"step {step} is not in S3, so this is its only copy. "
-                "Pass force=True to delete it anyway."
-            )
+        _require_remote_copy(project, run_name, step, local_dir, s3_config)
     shutil.rmtree(local_dir)
     return True
+
+
+def _require_remote_copy(
+    project: str,
+    run_name: str,
+    step: int,
+    local_dir: Path,
+    s3_config: S3Config | None,
+) -> None:
+    from extty.s3 import _S3_ERRORS, S3Storage
+
+    refusal = (
+        f"Refusing to delete {local_dir}: it may be the only copy of checkpoint "
+        f"{project}/{run_name} step {step}. Pass force=True to delete it anyway."
+    )
+    if s3_config is None:
+        s3_config = S3Config.load()
+    if s3_config is None:
+        raise RuntimeError(f"{refusal} (S3 is not configured.)")
+    try:
+        in_s3 = S3Storage(s3_config, project, run_name).has_checkpoint(step)
+    except _S3_ERRORS as e:
+        raise RuntimeError(f"{refusal} (Could not check S3: {e})") from e
+    if not in_s3:
+        raise RuntimeError(f"{refusal} (It is not in S3.)")
 
 
 def finish() -> None:

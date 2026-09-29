@@ -1,10 +1,11 @@
 """
 On-disk checkpoint layout shared by the local and S3 backends.
 
-Every checkpoint is written to ``<run dir>/checkpoints/<step>/`` first; S3,
-when configured, receives an upload of that directory. Each file is written
-atomically, and the per-step ``meta.json`` is written last, so its presence
-marks a complete local copy.
+A checkpoint for ``step`` lives in ``<run dir>/checkpoints/<step>/``. Saving
+has two steps: :func:`stage_checkpoint` serializes state dicts into that
+directory (a ``path`` is left where it is), then S3 receives the staged files
+and/or :func:`commit_checkpoint` completes the local copy. Files are written
+atomically and ``meta.json`` last, so its presence marks a complete local copy.
 """
 
 from __future__ import annotations
@@ -12,10 +13,12 @@ from __future__ import annotations
 import json
 import shutil
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from extty import storage
+from extty.storage import get_run_dir
 
 META_FILE = "meta.json"
 LEGACY_FILE = "checkpoint.pt"
@@ -30,8 +33,7 @@ def checkpoint_dir(run_dir: Path, step: int) -> Path:
 
 def local_checkpoint_dir(project: str, run_name: str, step: int) -> Path:
     """Directory holding the checkpoint for ``step`` of a run in the runs dir."""
-    project_dir = project if project else "_default"
-    return checkpoint_dir(storage.get_runs_dir() / project_dir / run_name, step)
+    return checkpoint_dir(get_run_dir(project, run_name), step)
 
 
 def file_names(meta: dict[str, Any]) -> list[str]:
@@ -64,18 +66,17 @@ def required_files(names: list[str], *, load_optimizer: bool) -> list[str]:
     return [name for name in names if load_optimizer or name != OPTIMIZER_FILE]
 
 
-def _write_atomic(target: Path, write: Callable[[Path], object]) -> int:
+@contextmanager
+def _atomic(target: Path) -> Iterator[Path]:
     tmp = target.with_name(target.name + ".part")
-    write(tmp)
+    yield tmp
     tmp.replace(target)
-    return target.stat().st_size
 
 
 def write_meta(dest: Path, meta: dict[str, Any]) -> None:
     """Write ``meta`` as the ``meta.json`` of the checkpoint in ``dest``."""
-    _write_atomic(
-        dest / META_FILE, lambda tmp: tmp.write_text(json.dumps(meta, indent=2))
-    )
+    with _atomic(dest / META_FILE) as tmp:
+        tmp.write_text(json.dumps(meta, indent=2))
 
 
 def read_meta(dest: Path) -> dict[str, Any] | None:
@@ -86,16 +87,20 @@ def read_meta(dest: Path) -> dict[str, Any] | None:
         return None
 
 
-def write_checkpoint(
+def stage_checkpoint(
     dest: Path,
     step: int,
     *,
     path: str | None = None,
     state_dict: Any = None,
     optimizer_state_dict: Any = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Path]]:
     """
-    Write a checkpoint into ``dest``.
+    Prepare a checkpoint's files without committing a local copy.
+
+    State dicts are serialized into ``dest``; a ``path`` is used where it is.
+    Any ``meta.json`` already in ``dest`` is removed first, so the step does
+    not read as a complete local copy until :func:`commit_checkpoint`.
 
     Parameters
     ----------
@@ -104,7 +109,7 @@ def write_checkpoint(
     step : int
         The training step for this checkpoint.
     path : str or None
-        Path to an existing file, copied in as ``checkpoint.pt``.
+        Path to an existing file, saved as ``checkpoint.pt``.
     state_dict : Any or None
         Model state dict, serialized with ``torch.save`` as ``model.pt``.
     optimizer_state_dict : Any or None
@@ -113,41 +118,77 @@ def write_checkpoint(
 
     Returns
     -------
-    dict[str, Any]
+    entry : dict[str, Any]
         The ``checkpoints.json`` index entry (``step``, ``timestamp``,
-        ``files``), also written to ``dest / "meta.json"``.
+        ``files``).
+    sources : dict[str, Path]
+        Where each of the checkpoint's files is, keyed by file name.
 
     Raises
     ------
     ValueError
         If neither or both of ``path`` and ``state_dict`` are provided.
+    FileNotFoundError
+        If ``path`` is not an existing file.
     """
     if (path is None) == (state_dict is None):
         raise ValueError("Exactly one of `path` or `state_dict` must be provided.")
+    if path is not None and not Path(path).is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {path}")
 
-    writers: dict[str, Callable[[Path], object]]
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / META_FILE).unlink(missing_ok=True)
+
+    sources: dict[str, Path] = {}
     if path is not None:
-        writers = {LEGACY_FILE: lambda tmp: shutil.copyfile(path, tmp)}
+        sources[LEGACY_FILE] = Path(path)
     else:
         import torch
 
-        writers = {MODEL_FILE: lambda tmp: torch.save(state_dict, tmp)}
+        states = {MODEL_FILE: state_dict}
         if optimizer_state_dict is not None:
-            writers[OPTIMIZER_FILE] = lambda tmp: torch.save(optimizer_state_dict, tmp)
+            states[OPTIMIZER_FILE] = optimizer_state_dict
+        for name, state in states.items():
+            with _atomic(dest / name) as tmp:
+                torch.save(state, tmp)
+            sources[name] = dest / name
 
-    dest.mkdir(parents=True, exist_ok=True)
-    (dest / META_FILE).unlink(missing_ok=True)
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     entry: dict[str, Any] = {
         "step": step,
         "timestamp": timestamp,
         "files": [
-            {"name": name, "size_bytes": _write_atomic(dest / name, write)}
-            for name, write in writers.items()
+            {"name": name, "size_bytes": source.stat().st_size}
+            for name, source in sources.items()
         ],
     }
+    return entry, sources
+
+
+def commit_checkpoint(
+    dest: Path, entry: dict[str, Any], sources: dict[str, Path]
+) -> None:
+    """
+    Complete the local copy of a staged checkpoint.
+
+    Copies in any staged file that lives outside ``dest``, then writes
+    ``meta.json``.
+
+    Parameters
+    ----------
+    dest : Path
+        The checkpoint directory passed to :func:`stage_checkpoint`.
+    entry : dict[str, Any]
+        The index entry returned by :func:`stage_checkpoint`.
+    sources : dict[str, Path]
+        The file locations returned by :func:`stage_checkpoint`.
+    """
+    for name, source in sources.items():
+        target = dest / name
+        if source != target:
+            with _atomic(target) as tmp:
+                shutil.copyfile(source, tmp)
     write_meta(dest, entry)
-    return entry
 
 
 def read_checkpoint(

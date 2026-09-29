@@ -36,6 +36,25 @@ def get_runs_dir() -> Path:
     return get_extty_home() / "runs"
 
 
+def get_run_dir(project: str, run_name: str) -> Path:
+    """
+    Get the local directory of a run.
+
+    Parameters
+    ----------
+    project : str
+        The project name; an empty name maps to ``_default``.
+    run_name : str
+        The run name.
+
+    Returns
+    -------
+    Path
+        ``<runs dir>/<project>/<run_name>``.
+    """
+    return get_runs_dir() / (project or "_default") / run_name
+
+
 def get_artifacts_dir() -> Path:
     """Get the default artifacts directory (``<extty home>/artifacts``)."""
     return get_extty_home() / "artifacts"
