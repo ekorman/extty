@@ -8,8 +8,8 @@ pip install extty            # extty[image] for Image logging
 cargo install --path tui     # optional: the `extty` TUI/CLI
 ```
 
-The TUI is optional. The Python SDK alone can log runs, read them back
-(locally or straight from S3) and push them to S3.
+The TUI and S3 are both optional. Runs are stored locally, and the Python SDK
+alone can log and read them. Configure S3 to sync runs to a bucket.
 
 ## Logging
 
@@ -68,6 +68,8 @@ run.chart("eval/roc")
 run.image_bytes(run.images("val/detections")[-1])
 ```
 
+With S3 configured, `get_run` reads a run straight from S3 if it isn't local.
+
 ## Checkpoints
 
 ```python
@@ -90,7 +92,7 @@ free disk by deleting local copies that S3 also has. Neither deletes a
 checkpoint's only copy unless you pass `force=True` to
 `delete_local_checkpoint`.
 
-## S3 sync
+## S3 sync (optional)
 
 Configure S3 in `~/.extty/s3/config.toml`, which both the SDK and TUI read:
 
