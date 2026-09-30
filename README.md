@@ -147,9 +147,14 @@ otherwise; a checkpoint downloaded once reloads without contacting S3.
 Checkpoints reach S3 only through `save_checkpoint`: `extty push` does not
 upload them.
 
-`extty.delete_local_checkpoint(project, run, step)` frees disk by deleting a
-local copy that is also in S3. It refuses to delete a checkpoint's only copy
-unless you pass `force=True`.
+Each save of a checkpoint has its own ID. A step's directory is always
+replaced whole, so an interrupted save or download never leaves a mix of two
+saves, and the TUI marks checkpoints whose local copy is not the save S3 has.
+
+`extty.delete_local_checkpoint(project, run, step)` and `extty prune local`
+free disk by deleting local copies of saves that S3 also has. They refuse to
+delete a checkpoint's only copy, including a re-save that S3 has an older
+version of, unless you pass `force=True` to `delete_local_checkpoint`.
 
 ## Where data is stored
 

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::checkpoints::{self, Status};
 use crate::data::artifacts_dir;
 use crate::s3;
 
@@ -23,8 +24,18 @@ struct CheckpointCandidate {
     step: u64,
     local_path: PathBuf,
     size_bytes: u64,
-    in_s3: bool,
+    /// `None` when S3 could not be checked.
+    status: Option<Status>,
 }
+
+impl CheckpointCandidate {
+    fn deletable(&self) -> bool {
+        self.status.is_some_and(Status::local_is_deletable)
+    }
+}
+
+/// A run's project, name, and local checkpoint directories keyed by step.
+type LocalCheckpointRun = (String, String, Vec<(u64, PathBuf)>);
 
 struct ArtifactCandidate {
     name: String,
@@ -72,7 +83,7 @@ pub fn run_local(opts: PruneLocalOptions) -> Result<()> {
         print_artifact_summary(&artifacts);
 
         let safe_ckpts: Vec<&CheckpointCandidate> =
-            checkpoints.iter().filter(|c| c.in_s3).collect();
+            checkpoints.iter().filter(|c| c.deletable()).collect();
         let safe_arts: Vec<&ArtifactCandidate> = artifacts.iter().filter(|a| a.in_s3).collect();
 
         let total_bytes: u64 = safe_ckpts.iter().map(|c| c.size_bytes).sum::<u64>()
@@ -141,7 +152,7 @@ fn runs_dir() -> PathBuf {
 fn find_local_checkpoint_runs(
     project_filter: Option<&str>,
     run_filter: Option<&str>,
-) -> Result<Vec<(String, String, Vec<PathBuf>)>> {
+) -> Result<Vec<LocalCheckpointRun>> {
     let runs_dir = runs_dir();
     if !runs_dir.exists() {
         return Ok(Vec::new());
@@ -178,18 +189,7 @@ fn find_local_checkpoint_runs(
                 continue;
             }
 
-            let ckpt_dir = run_path.join("checkpoints");
-            if !ckpt_dir.is_dir() {
-                continue;
-            }
-
-            let mut step_dirs: Vec<PathBuf> = fs::read_dir(&ckpt_dir)?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
-            step_dirs.sort();
-
+            let step_dirs = checkpoints::local_step_dirs(&run_path);
             if !step_dirs.is_empty() {
                 out.push((proj_name.clone(), run_name, step_dirs));
             }
@@ -200,30 +200,24 @@ fn find_local_checkpoint_runs(
 
 async fn verify_checkpoints(
     client: &s3::S3Client,
-    runs: Vec<(String, String, Vec<PathBuf>)>,
+    runs: Vec<LocalCheckpointRun>,
 ) -> Result<Vec<CheckpointCandidate>> {
     let mut out = Vec::new();
     for (project, run_name, step_dirs) in runs {
-        let remote_steps: HashSet<u64> = match client
-            .list_remote_checkpoint_steps(&project, &run_name)
-            .await
-        {
-            Ok(steps) => steps.into_iter().collect(),
-            Err(e) => {
-                eprintln!(
-                    "warning: could not read S3 checkpoint index for {}/{}: {}",
-                    project, run_name, e
-                );
-                HashSet::new()
-            }
-        };
-
-        for step_dir in step_dirs {
-            let Some(step_name) = step_dir.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Ok(step) = step_name.parse::<u64>() else {
-                continue;
+        for (step, step_dir) in step_dirs {
+            let local = checkpoints::read_local_copy(&step_dir);
+            let status = match client
+                .remote_checkpoint_meta(&project, &run_name, step)
+                .await
+            {
+                Ok(remote) => checkpoints::status(local.as_ref(), remote.as_ref()),
+                Err(e) => {
+                    eprintln!(
+                        "warning: could not check S3 for {}/{} step {}: {}",
+                        project, run_name, step, e
+                    );
+                    None
+                }
             };
             out.push(CheckpointCandidate {
                 project: project.clone(),
@@ -231,7 +225,7 @@ async fn verify_checkpoints(
                 step,
                 size_bytes: dir_size(&step_dir),
                 local_path: step_dir,
-                in_s3: remote_steps.contains(&step),
+                status,
             });
         }
     }
@@ -343,10 +337,14 @@ fn print_checkpoint_summary(candidates: &[CheckpointCandidate]) {
             println!("  {}/{}", c.project, c.run_name);
             current_run = Some(key);
         }
-        let mark = if c.in_s3 {
-            "✓ in S3"
-        } else {
-            "✗ not in S3 — skip"
+        let mark = match c.status {
+            Some(Status::Synced) => "✓ in S3",
+            Some(Status::Cached) => "✓ in S3 (old download)",
+            Some(Status::Diverged) => "✗ S3 has a different save — skip",
+            Some(Status::LocalOnly | Status::Untracked | Status::RemoteOnly) => {
+                "✗ not in S3 — skip"
+            }
+            None => "✗ could not check S3 — skip",
         };
         println!(
             "    step {:<10} {:<22} {}",
@@ -388,24 +386,7 @@ fn confirm(prompt: &str) -> Result<bool> {
 
 fn delete_checkpoint_dir(c: &CheckpointCandidate) -> Result<()> {
     fs::remove_dir_all(&c.local_path)
-        .with_context(|| format!("Failed to delete {}", c.local_path.display()))?;
-
-    let ckpt_dir = c
-        .local_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("checkpoint path has no parent"))?;
-    let run_dir = ckpt_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("checkpoints dir has no parent"))?;
-
-    if ckpt_dir.exists() && fs::read_dir(ckpt_dir)?.next().is_none() {
-        fs::remove_dir(ckpt_dir).ok();
-        let cached_index = run_dir.join("checkpoints.json");
-        if cached_index.exists() {
-            fs::remove_file(cached_index).ok();
-        }
-    }
-    Ok(())
+        .with_context(|| format!("Failed to delete {}", c.local_path.display()))
 }
 
 fn delete_artifact_dir(a: &ArtifactCandidate) -> Result<()> {

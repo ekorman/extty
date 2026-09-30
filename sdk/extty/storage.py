@@ -289,20 +289,29 @@ def dedupe_image_records(records: list[ImageRecord]) -> list[ImageRecord]:
     return [by_step[step] for step in sorted(by_step)]
 
 
+def parse_checkpoint_entry(entry: dict[str, Any]) -> Checkpoint:
+    """
+    Build a Checkpoint from one ``checkpoints.json`` / ``meta.json`` entry.
+
+    The oldest entries list bare file names, with the size of a single file
+    at the top level, and some have no timestamp.
+    """
+
+    def checkpoint_file(file: str | dict[str, Any]) -> CheckpointFile:
+        if isinstance(file, str):
+            return CheckpointFile(name=file, size_bytes=entry.get("size_bytes", 0))
+        return CheckpointFile(name=file["name"], size_bytes=file.get("size_bytes", 0))
+
+    return Checkpoint(
+        step=entry["step"],
+        timestamp=entry.get("timestamp", ""),
+        files=[checkpoint_file(f) for f in entry.get("files", [])],
+    )
+
+
 def parse_checkpoints_json(text: str) -> list[Checkpoint]:
     """Parse a ``checkpoints.json`` body into Checkpoint values, sorted by step."""
-    entries = json.loads(text)
-    checkpoints = [
-        Checkpoint(
-            step=entry["step"],
-            timestamp=entry["timestamp"],
-            files=[
-                CheckpointFile(name=f["name"], size_bytes=f["size_bytes"])
-                for f in entry.get("files", [])
-            ],
-        )
-        for entry in entries
-    ]
+    checkpoints = [parse_checkpoint_entry(entry) for entry in json.loads(text)]
     checkpoints.sort(key=lambda c: c.step)
     return checkpoints
 
@@ -792,24 +801,46 @@ class RunStorage:
         return self.run_dir / "images" / record.file
 
     def read_checkpoints(self) -> list[Checkpoint]:
-        """Read the run's checkpoint index from ``checkpoints.json``."""
+        """
+        List the checkpoints known for this run.
+
+        Combines ``checkpoints.json``, this machine's copy of S3's index, with
+        the saves in ``checkpoints/<step>/``. A step's local save is listed in
+        preference to the index entry, since loading uses it.
+        """
         filepath = self.run_dir / "checkpoints.json"
-        if not filepath.exists():
-            return []
-        return parse_checkpoints_json(filepath.read_text())
+        by_step = (
+            {c.step: c for c in parse_checkpoints_json(filepath.read_text())}
+            if filepath.exists()
+            else {}
+        )
+        checkpoints_dir = self.run_dir / "checkpoints"
+        step_dirs = checkpoints_dir.iterdir() if checkpoints_dir.is_dir() else ()
+        for step_dir in step_dirs:
+            if not step_dir.name.isdigit():
+                continue
+            try:
+                meta = json.loads((step_dir / "meta.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            step = int(step_dir.name)
+            by_step[step] = parse_checkpoint_entry({**meta, "step": step})
+        return [by_step[step] for step in sorted(by_step)]
 
     def record_checkpoint(self, entry: dict[str, Any]) -> None:
-        """Merge one checkpoint entry into the local ``checkpoints.json`` index.
+        """Merge an uploaded save into ``checkpoints.json``.
 
-        Mirrors the S3-side index update: an existing entry for the same
-        step is replaced, otherwise the entry is appended, and the index
-        stays sorted by step.
+        ``checkpoints.json`` in the run dir is this machine's copy of S3's
+        index, so it only records saves that reached S3; saves kept only
+        locally are found in ``checkpoints/<step>/``. An existing entry for
+        the same step is replaced, otherwise the entry is appended, and the
+        index stays sorted by step.
 
         Parameters
         ----------
         entry : dict[str, Any]
-            Index entry with ``step``, ``timestamp``, and ``files`` keys, as
-            produced by :meth:`extty.s3.S3Storage.save_checkpoint`.
+            The save's meta entry, as produced by
+            :func:`extty.checkpoints.stage_checkpoint`.
         """
         filepath = self.run_dir / "checkpoints.json"
         existing: list[dict[str, Any]] = []

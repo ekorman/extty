@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -6,6 +6,8 @@ use std::time::{Instant, SystemTime};
 
 use chrono::{DateTime, Local};
 use serde::Deserialize;
+
+use crate::checkpoints;
 
 // A single data point in a metric time series
 #[derive(Debug, Clone)]
@@ -185,6 +187,8 @@ pub struct Checkpoint {
     pub timestamp: Option<DateTime<Local>>,
     pub files: Vec<CheckpointFile>,
     pub downloaded_files: Vec<String>,
+    /// How the local copy compares with S3, as of the last pull.
+    pub status: checkpoints::Status,
 }
 
 impl Checkpoint {
@@ -477,74 +481,95 @@ fn parse_datetime(s: &str) -> Option<DateTime<Local>> {
     None
 }
 
-// Load checkpoints from checkpoints.json
+/// Load a run's checkpoints: S3's index as last pulled (`checkpoints.json`)
+/// plus the saves in `checkpoints/<step>/`. A step's local save is shown in
+/// preference to the index entry, since loading uses it.
 fn load_checkpoints(run_path: &Path) -> Vec<Checkpoint> {
-    let checkpoints_path = run_path.join("checkpoints.json");
-    if !checkpoints_path.exists() {
-        return vec![];
-    }
-
-    let Ok(content) = fs::read_to_string(&checkpoints_path) else {
-        return vec![];
-    };
-
-    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&content) else {
-        return vec![];
-    };
-
-    let checkpoints_dir = run_path.join("checkpoints");
-    let mut checkpoints: Vec<Checkpoint> = entries
-        .iter()
-        .filter_map(|entry| {
-            let step = entry.get("step")?.as_u64()?;
-            let timestamp = entry
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(parse_datetime);
-
-            let files: Vec<CheckpointFile> = match entry.get("files") {
-                Some(serde_json::Value::Array(arr)) => arr
-                    .iter()
-                    .filter_map(|item| match item {
-                        serde_json::Value::String(name) => Some(CheckpointFile {
-                            name: name.clone(),
-                            size_bytes: None,
-                        }),
-                        serde_json::Value::Object(obj) => {
-                            let name = obj.get("name")?.as_str()?.to_string();
-                            let size_bytes = obj.get("size_bytes").and_then(|v| v.as_u64());
-                            Some(CheckpointFile { name, size_bytes })
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-                _ => {
-                    let size_bytes = entry.get("size_bytes").and_then(|v| v.as_u64());
-                    vec![CheckpointFile {
-                        name: "checkpoint.pt".to_string(),
-                        size_bytes,
-                    }]
-                }
-            };
-
-            let step_dir = checkpoints_dir.join(step.to_string());
-            let downloaded_files: Vec<String> = files
-                .iter()
-                .filter(|f| step_dir.join(&f.name).exists())
-                .map(|f| f.name.clone())
-                .collect();
-
-            Some(Checkpoint {
-                step,
-                timestamp,
-                files,
-                downloaded_files,
+    let remote: BTreeMap<u64, serde_json::Value> = fs::read(run_path.join("checkpoints.json"))
+        .ok()
+        .and_then(|content| serde_json::from_slice::<Vec<serde_json::Value>>(&content).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| Some((entry.get("step")?.as_u64()?, entry)))
+        .collect();
+    let local: BTreeMap<u64, (PathBuf, checkpoints::LocalCopy)> =
+        checkpoints::local_step_dirs(run_path)
+            .into_iter()
+            .filter_map(|(step, dir)| {
+                let copy = checkpoints::read_local_copy(&dir)?;
+                Some((step, (dir, copy)))
             })
+            .collect();
+
+    let steps: BTreeSet<u64> = remote.keys().chain(local.keys()).copied().collect();
+    let mut out: Vec<Checkpoint> = steps
+        .into_iter()
+        .filter_map(|step| {
+            let local_copy = local.get(&step);
+            let remote_entry = remote.get(&step);
+            let status = checkpoints::status(local_copy.map(|(_, c)| c), remote_entry)?;
+            match local_copy {
+                Some((dir, checkpoints::LocalCopy::Committed(meta))) => {
+                    let mut ckpt = checkpoint_from_entry(step, meta, status);
+                    ckpt.downloaded_files = ckpt
+                        .files
+                        .iter()
+                        .filter(|f| dir.join(&f.name).exists())
+                        .map(|f| f.name.clone())
+                        .collect();
+                    Some(ckpt)
+                }
+                _ => Some(checkpoint_from_entry(step, remote_entry?, status)),
+            }
         })
         .collect();
 
-    checkpoints.sort_by(|a, b| b.step.cmp(&a.step));
-    checkpoints
+    out.sort_by(|a, b| b.step.cmp(&a.step));
+    out
+}
+
+fn checkpoint_from_entry(
+    step: u64,
+    entry: &serde_json::Value,
+    status: checkpoints::Status,
+) -> Checkpoint {
+    let timestamp = entry
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .and_then(parse_datetime);
+
+    let files: Vec<CheckpointFile> = match entry.get("files") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(name) => Some(CheckpointFile {
+                    name: name.clone(),
+                    size_bytes: None,
+                }),
+                serde_json::Value::Object(obj) => {
+                    let name = obj.get("name")?.as_str()?.to_string();
+                    let size_bytes = obj.get("size_bytes").and_then(|v| v.as_u64());
+                    Some(CheckpointFile { name, size_bytes })
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => {
+            let size_bytes = entry.get("size_bytes").and_then(|v| v.as_u64());
+            vec![CheckpointFile {
+                name: "checkpoint.pt".to_string(),
+                size_bytes,
+            }]
+        }
+    };
+
+    Checkpoint {
+        step,
+        timestamp,
+        files,
+        downloaded_files: Vec::new(),
+        status,
+    }
 }
 
 /// Return type for run metadata
@@ -1746,5 +1771,50 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let series = load_images(tmp.path());
         assert!(series.is_empty());
+    }
+
+    #[test]
+    fn checkpoints_combine_pulled_index_and_local_saves() {
+        let tmp = TempDir::new().unwrap();
+        let run = tmp.path();
+        fs::write(
+            run.join("checkpoints.json"),
+            r#"[{"step": 10, "save_id": "remote10", "timestamp": "2026-01-01T00:00:00+0000",
+                 "files": [{"name": "model.pt", "size_bytes": 1}]},
+                {"step": 20, "save_id": "remote20", "timestamp": "2026-01-01T00:00:00+0000",
+                 "files": [{"name": "model.pt", "size_bytes": 1}]},
+                {"step": 30, "save_id": "remote30", "timestamp": "2026-01-01T00:00:00+0000",
+                 "files": [{"name": "model.pt", "size_bytes": 1}]}]"#,
+        )
+        .unwrap();
+        for (step, save_id) in [(5, "local5"), (10, "local10"), (20, "remote20")] {
+            let dir = run.join(format!("checkpoints/{step}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("model.pt"), b"w").unwrap();
+            fs::write(
+                dir.join("meta.json"),
+                format!(
+                    r#"{{"step": {step}, "save_id": "{save_id}", "timestamp": "2026-01-01T00:00:00+0000",
+                        "files": [{{"name": "model.pt", "size_bytes": 1}}]}}"#
+                ),
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(run.join("checkpoints/.staging/partial")).unwrap();
+
+        let got: Vec<(u64, checkpoints::Status, bool)> = load_checkpoints(run)
+            .iter()
+            .map(|c| (c.step, c.status, c.all_downloaded()))
+            .collect();
+
+        assert_eq!(
+            got,
+            [
+                (30, checkpoints::Status::RemoteOnly, false),
+                (20, checkpoints::Status::Synced, true),
+                (10, checkpoints::Status::Diverged, true),
+                (5, checkpoints::Status::LocalOnly, true),
+            ]
+        );
     }
 }

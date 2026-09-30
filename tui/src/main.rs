@@ -36,6 +36,7 @@ const COMPARE_COLORS: [Color; 8] = [
     Color::Rgb(0, 200, 255),
 ];
 
+mod checkpoints;
 mod data;
 mod infra;
 mod paths;
@@ -1713,15 +1714,20 @@ impl App {
                 }
             }
 
-            let s3_config_path = crate::paths::extty_home().join("s3").join("config.toml");
-
-            if s3_config_path.exists()
-                && !run::send_s3_config(&ssh_base, &s3_config_path)
-                    .is_ok_and(|output| output.status.success())
-            {
-                let _ = tx.send(SetupMessage::Status(
-                    "Warning: failed to copy S3 config".to_string(),
-                ));
+            let s3_config_path = s3::config_path();
+            if s3_config_path.exists() {
+                let failure = match run::send_s3_config(&ssh_base, &s3_config_path) {
+                    Ok(output) if output.status.success() => None,
+                    Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+                    Err(e) => Some(e.to_string()),
+                };
+                if let Some(reason) = failure {
+                    let _ = tx.send(SetupMessage::Error(format!(
+                        "Failed to copy S3 config, so checkpoints would stay on the instance: {}",
+                        reason
+                    )));
+                    return;
+                }
             }
 
             let git_hash = std::process::Command::new("git")
@@ -7287,6 +7293,21 @@ fn format_size(size: u64) -> String {
     }
 }
 
+/// A label for checkpoints whose local copy is the only copy of its save.
+fn checkpoint_status_tag(status: checkpoints::Status) -> Option<Span<'static>> {
+    match status {
+        checkpoints::Status::LocalOnly => Some(Span::styled(
+            "  local only",
+            Style::default().fg(NEON_YELLOW),
+        )),
+        checkpoints::Status::Diverged => Some(Span::styled(
+            "  local differs from S3",
+            Style::default().fg(NEON_MAGENTA),
+        )),
+        _ => None,
+    }
+}
+
 fn val_metrics_at_step(
     metrics: &HashMap<String, Vec<MetricPoint>>,
     step: u64,
@@ -7349,6 +7370,7 @@ fn render_checkpoints_card(
                 Style::default().fg(NEON_YELLOW).bold(),
             ),
         ];
+        spans.extend(checkpoint_status_tag(ckpt.status));
         if let Some(ts) = ckpt.timestamp {
             spans.push(Span::styled(
                 format!("  {}", ts.format("%Y-%m-%d %H:%M")),
@@ -8062,6 +8084,7 @@ fn render_focused_checkpoints(
                 Style::default().fg(NEON_YELLOW).bold(),
             ),
         ];
+        spans.extend(checkpoint_status_tag(ckpt.status));
         if let Some(ts) = ckpt.timestamp {
             spans.push(Span::styled(
                 format!("  {}", ts.format("%Y-%m-%d %H:%M")),

@@ -19,6 +19,7 @@ from extty.chart import Chart
 from extty.checkpoints import (
     checkpoint_dir,
     commit_checkpoint,
+    discard_staged,
     read_local_checkpoint,
     stage_checkpoint,
 )
@@ -292,6 +293,8 @@ class Run:
         ``<run dir>/checkpoints/<step>/``. With S3 it is uploaded, and also
         kept in the run directory if ``keep_local`` is set or the upload
         fails. A ``path`` is uploaded from where it is, not copied first.
+        Saving a step again replaces its earlier local copy, and the run
+        directory never holds a partly written save.
 
         Parameters
         ----------
@@ -314,22 +317,28 @@ class Run:
         with self._lock:
             if self._finished:
                 raise RuntimeError("Cannot save checkpoint on a finished run.")
-        local_dir = checkpoint_dir(self._local_storage.run_dir, step)
-        entry, sources = stage_checkpoint(
-            local_dir,
+        run_dir = self._local_storage.run_dir
+        local_dir = checkpoint_dir(run_dir, step)
+        staged = stage_checkpoint(
+            run_dir,
             step,
             path=path,
             state_dict=state_dict,
             optimizer_state_dict=optimizer_state_dict,
         )
-        uploaded = self._s3_storage is not None and self._s3_storage.upload_checkpoint(
-            entry, sources
-        )
-        if uploaded and not keep_local:
-            shutil.rmtree(local_dir)
-        else:
-            commit_checkpoint(local_dir, entry, sources)
-        self._local_storage.record_checkpoint(entry)
+        try:
+            uploaded = (
+                self._s3_storage is not None
+                and self._s3_storage.upload_checkpoint(staged.meta, staged.sources)
+            )
+            if uploaded and not keep_local:
+                shutil.rmtree(local_dir, ignore_errors=True)
+            else:
+                commit_checkpoint(run_dir, staged)
+        finally:
+            discard_staged(staged)
+        if uploaded:
+            self._local_storage.record_checkpoint(staged.meta)
         if self._s3_storage is None:
             logger.info("checkpoint step %d: saved to %s", step, local_dir)
         elif not uploaded:

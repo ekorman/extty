@@ -5,8 +5,13 @@ import io
 import json
 import logging
 import os
+import pickle
 import shutil
+import socket
+import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,10 +24,19 @@ from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionEr
 
 import extty
 from extty.checkpoints import (
+    DELETABLE_LOCALLY,
     META_FILE,
+    LocalCopy,
+    adopt_download,
+    checkpoint_dir,
+    checkpoint_status,
     commit_checkpoint,
+    discard_staged,
     local_checkpoint_dir,
+    new_staging_dir,
+    publish,
     read_local_checkpoint,
+    remote_relpath,
     stage_checkpoint,
 )
 from extty.s3 import S3Config, S3Storage
@@ -1057,326 +1071,426 @@ class TestExperimentDataclassConfig:
             }
 
 
-class TestSaveCheckpoint:
-    """Tests for save_checkpoint functionality."""
+_CHECKPOINT_STATUS_SPEC = json.loads(
+    (Path(__file__).parents[2] / "spec" / "checkpoint_status.json").read_text()
+)
 
-    def _make_mock_s3_client(
-        self, stored: dict[str, bytes] | None = None
-    ) -> mock.MagicMock:
-        if stored is None:
-            stored = {}
-        client = mock.MagicMock()
 
-        def put_object(Bucket, Key, Body, ContentType=None):
-            if isinstance(Body, str):
-                Body = Body.encode("utf-8")
-            stored[Key] = Body
+def _pickle_save(obj, path):
+    import pickle
 
-        def get_object(Bucket, Key):
-            if Key in stored:
-                body = mock.MagicMock()
-                body.read.return_value = stored[Key]
-                return {"Body": body}
-            raise client.exceptions.NoSuchKey(
-                {"Error": {"Code": "NoSuchKey"}}, "GetObject"
-            )
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
 
-        def upload_file(Filename, Bucket, Key, ExtraArgs=None):
-            with open(Filename, "rb") as f:
-                stored[Key] = f.read()
 
-        client.put_object.side_effect = put_object
-        client.get_object.side_effect = get_object
-        client.upload_file.side_effect = upload_file
-        client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
-        return client, stored
+def _pickle_load(path):
+    import pickle
 
-    def _make_storage(
-        self,
-        client: mock.MagicMock,
-        bucket: str = "test-bucket",
-        prefix: str = "test",
-        project: str = "myproject",
-        run_name: str = "run-001",
-    ) -> S3Storage:
-        config = S3Config(bucket=bucket, prefix=prefix)
-        with mock.patch("boto3.client", return_value=client):
-            storage = S3Storage(config, project, run_name)
-        return storage
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
-    def test_save_checkpoint_with_path(self, tmp_path: Path) -> None:
-        """Test save_checkpoint uploads file and updates checkpoints.json."""
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(
-            client, prefix="test", project="myproject", run_name="run-001"
+
+@pytest.fixture
+def fake_torch() -> Generator[mock.MagicMock, None, None]:
+    """Stand in for a CPU-only torch with pickle-backed ``save`` / ``load``."""
+    fake = mock.MagicMock()
+    fake.cuda.is_available.return_value = False
+    fake.backends.mps.is_available.return_value = False
+    fake.save.side_effect = _pickle_save
+    fake.load.side_effect = lambda path, **kw: _pickle_load(path)
+    with mock.patch.dict("sys.modules", {"torch": fake}):
+        yield fake
+
+
+def _mock_s3_client() -> tuple[mock.MagicMock, dict[str, bytes]]:
+    """A mock S3 client backed by an in-memory ``{key: bytes}`` store."""
+    stored: dict[str, bytes] = {}
+    client = mock.MagicMock()
+    client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+    def require(key: str) -> bytes:
+        if key not in stored:
+            raise client.exceptions.NoSuchKey({"Error": {"Code": "NoSuchKey"}}, key)
+        return stored[key]
+
+    def put_object(Bucket, Key, Body, ContentType=None):
+        stored[Key] = Body
+
+    def get_object(Bucket, Key):
+        body = mock.MagicMock()
+        body.read.return_value = require(Key)
+        return {"Body": body}
+
+    def head_object(Bucket, Key):
+        return {"ContentLength": len(require(Key))}
+
+    def upload_file(Filename, Bucket, Key, **kwargs):
+        stored[Key] = Path(Filename).read_bytes()
+
+    def download_file(Bucket, Key, Filename, **kwargs):
+        data = require(Key)
+        Path(Filename).write_bytes(data)
+        if kwargs.get("Callback") is not None:
+            kwargs["Callback"](len(data))
+
+    def paginate(Bucket, Prefix):
+        keys = sorted(k for k in stored if k.startswith(Prefix))
+        return [{"Contents": [{"Key": k} for k in keys]}]
+
+    def delete_objects(Bucket, Delete):
+        for obj in Delete["Objects"]:
+            stored.pop(obj["Key"], None)
+
+    client.put_object.side_effect = put_object
+    client.get_object.side_effect = get_object
+    client.head_object.side_effect = head_object
+    client.upload_file.side_effect = upload_file
+    client.download_file.side_effect = download_file
+    client.get_paginator.return_value.paginate.side_effect = paginate
+    client.delete_objects.side_effect = delete_objects
+    client.delete_object.side_effect = lambda Bucket, Key: stored.pop(Key, None)
+    return client, stored
+
+
+_S3_CONFIG = S3Config(bucket="b", prefix="pfx")
+
+
+def _s3_storage(client: mock.MagicMock, run_name: str = "run-1") -> S3Storage:
+    with mock.patch("boto3.client", return_value=client):
+        return S3Storage(_S3_CONFIG, "proj", run_name)
+
+
+def _s3_run(client: mock.MagicMock, name: str) -> extty.run.Run:
+    with mock.patch("boto3.client", return_value=client):
+        return extty.run.Run(
+            "proj", name=name, system_metrics=False, s3_config=_S3_CONFIG
         )
 
-        fake_file = tmp_path / "model.pt"
-        fake_file.write_bytes(b"fake model data")
 
-        _write_and_upload(storage, step=100, path=str(fake_file))
+def _step_prefix(run_name: str, step: int) -> str:
+    return f"pfx/runs/proj/{run_name}/checkpoints/{step}"
 
-        checkpoint_key = "test/runs/myproject/run-001/checkpoints/100/checkpoint.pt"
-        assert checkpoint_key in stored
-        assert stored[checkpoint_key] == b"fake model data"
 
-        meta_key = "test/runs/myproject/run-001/checkpoints/100/meta.json"
-        assert meta_key in stored
-        meta = json.loads(stored[meta_key])
-        assert meta["step"] == 100
-        assert meta["files"] == [
-            {"name": "checkpoint.pt", "size_bytes": len(b"fake model data")}
+def _index_key(run_name: str) -> str:
+    return f"pfx/runs/proj/{run_name}/checkpoints.json"
+
+
+def _remote_meta(stored: dict[str, bytes], run_name: str, step: int) -> dict[str, Any]:
+    return json.loads(stored[f"{_step_prefix(run_name, step)}/{META_FILE}"])
+
+
+def _remote_file(
+    stored: dict[str, bytes], run_name: str, step: int, name: str
+) -> bytes:
+    """A file of the save S3's ``meta.json`` currently points at."""
+    meta = _remote_meta(stored, run_name, step)
+    return stored[f"{_step_prefix(run_name, step)}/{remote_relpath(meta, name)}"]
+
+
+def _step_keys(stored: dict[str, bytes], run_name: str, step: int) -> list[str]:
+    prefix = _step_prefix(run_name, step) + "/"
+    return sorted(k.removeprefix(prefix) for k in stored if k.startswith(prefix))
+
+
+def _save_local(run_dir: Path, step: int, **kwargs: Any) -> dict[str, Any]:
+    """Stage and commit a checkpoint into ``run_dir``, returning its meta."""
+    staged = stage_checkpoint(run_dir, step, **kwargs)
+    try:
+        commit_checkpoint(run_dir, staged)
+    finally:
+        discard_staged(staged)
+    return staged.meta
+
+
+def _write_and_upload(
+    storage: S3Storage, step: int, **kwargs: Any
+) -> dict[str, Any] | None:
+    """Stage a checkpoint for ``storage``'s run and upload it, as Run does."""
+    staged = stage_checkpoint(
+        get_run_dir(storage.project, storage.run_name), step, **kwargs
+    )
+    try:
+        uploaded = storage.upload_checkpoint(staged.meta, staged.sources)
+    finally:
+        discard_staged(staged)
+    return staged.meta if uploaded else None
+
+
+def _staging_leftovers(run_dir: Path) -> list[Path]:
+    staging = run_dir / "checkpoints" / ".staging"
+    return list(staging.iterdir()) if staging.exists() else []
+
+
+class TestCheckpointStatus:
+    """The local-vs-S3 status table, shared with the TUI."""
+
+    @pytest.mark.parametrize(
+        "case",
+        _CHECKPOINT_STATUS_SPEC["cases"],
+        ids=[case["name"] for case in _CHECKPOINT_STATUS_SPEC["cases"]],
+    )
+    def test_matches_spec(self, case: dict[str, Any]) -> None:
+        local = (
+            None
+            if case["local"] is None
+            else LocalCopy(meta=None if case["local"] == "untracked" else case["local"])
+        )
+        status = checkpoint_status(local, case["remote"])
+
+        assert (status.value if status else None) == case["status"]
+        assert (status in DELETABLE_LOCALLY) == case["deletable"]
+
+
+class TestLocalCheckpoints:
+    """Staging and committing checkpoints in the run dir."""
+
+    def test_committed_checkpoint_layout(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """State dicts become model.pt / optimizer.pt plus the save's meta.json."""
+        meta = _save_local(
+            tmp_path, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
+        )
+
+        dest = checkpoint_dir(tmp_path, 3)
+        assert meta["step"] == 3
+        assert meta["save_id"]
+        assert [f["name"] for f in meta["files"]] == ["model.pt", "optimizer.pt"]
+        assert all(f["size_bytes"] > 0 for f in meta["files"])
+        assert json.loads((dest / META_FILE).read_text()) == meta
+        assert sorted(p.name for p in dest.iterdir()) == [
+            "meta.json",
+            "model.pt",
+            "optimizer.pt",
         ]
+        assert _staging_leftovers(tmp_path) == []
 
-        index_key = "test/runs/myproject/run-001/checkpoints.json"
-        assert index_key in stored
-        index = json.loads(stored[index_key])
-        assert len(index) == 1
-        assert index[0]["step"] == 100
-
-    def test_save_checkpoint_state_dict_model_and_optimizer(
-        self, tmp_path: Path
+    def test_each_save_gets_its_own_id(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
     ) -> None:
-        """Test state_dict mode produces model.pt and optimizer.pt."""
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(
-            client, prefix="pfx", project="proj", run_name="run-1"
-        )
+        with mock.patch("time.strftime", return_value="2026-09-30T10:00:00+0000"):
+            first = _save_local(tmp_path, 3, state_dict={"w": 1})
+            second = _save_local(tmp_path, 3, state_dict={"w": 1})
 
-        mock_torch = mock.MagicMock()
+        assert first["save_id"] != second["save_id"]
 
-        def fake_save(obj, path):
-            import pickle
+    def test_stage_checkpoint_requires_exactly_one_source(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Exactly one"):
+            stage_checkpoint(tmp_path, 1)
 
-            with open(path, "wb") as f:
-                pickle.dump(obj, f)
+        with pytest.raises(ValueError, match="Exactly one"):
+            stage_checkpoint(tmp_path, 1, path="/a", state_dict={"k": "v"})
 
-        mock_torch.save.side_effect = fake_save
-
-        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            _write_and_upload(
-                storage,
-                step=50,
-                state_dict={"weight": "data"},
-                optimizer_state_dict={"lr": 0.01},
-            )
-
-        model_key = "pfx/runs/proj/run-1/checkpoints/50/model.pt"
-        opt_key = "pfx/runs/proj/run-1/checkpoints/50/optimizer.pt"
-        assert model_key in stored
-        assert opt_key in stored
-
-        meta_key = "pfx/runs/proj/run-1/checkpoints/50/meta.json"
-        meta = json.loads(stored[meta_key])
-        assert meta["step"] == 50
-        file_names = [f["name"] for f in meta["files"]]
-        assert file_names == ["model.pt", "optimizer.pt"]
-        for f in meta["files"]:
-            assert "size_bytes" in f
-            assert f["size_bytes"] > 0
-
-    def test_save_checkpoint_state_dict_model_only(self, tmp_path: Path) -> None:
-        """Test state_dict mode without optimizer produces only model.pt."""
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(
-            client, prefix="pfx", project="proj", run_name="run-2"
-        )
-
-        mock_torch = mock.MagicMock()
-
-        def fake_save(obj, path):
-            import pickle
-
-            with open(path, "wb") as f:
-                pickle.dump(obj, f)
-
-        mock_torch.save.side_effect = fake_save
-
-        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            _write_and_upload(storage, step=10, state_dict={"weight": "data"})
-
-        model_key = "pfx/runs/proj/run-2/checkpoints/10/model.pt"
-        opt_key = "pfx/runs/proj/run-2/checkpoints/10/optimizer.pt"
-        assert model_key in stored
-        assert opt_key not in stored
-
-        meta_key = "pfx/runs/proj/run-2/checkpoints/10/meta.json"
-        meta = json.loads(stored[meta_key])
-        file_names = [f["name"] for f in meta["files"]]
-        assert file_names == ["model.pt"]
-
-    def test_save_checkpoint_updates_existing_index(self, tmp_path: Path) -> None:
-        """Test that saving a second checkpoint appends to index."""
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(
-            client, prefix="pfx", project="proj", run_name="run-x"
-        )
-
-        file1 = tmp_path / "ckpt1.pt"
-        file1.write_bytes(b"ckpt1")
-        file2 = tmp_path / "ckpt2.pt"
-        file2.write_bytes(b"ckpt2data")
-
-        _write_and_upload(storage, step=50, path=str(file1))
-        _write_and_upload(storage, step=100, path=str(file2))
-
-        index_key = "pfx/runs/proj/run-x/checkpoints.json"
-        index = json.loads(stored[index_key])
-        assert len(index) == 2
-        assert index[0]["step"] == 50
-        assert index[1]["step"] == 100
-
-    def test_save_checkpoint_returns_index_entry(self, tmp_path: Path) -> None:
-        """Test that save_checkpoint returns the checkpoints.json entry."""
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(
-            client, prefix="pfx", project="proj", run_name="run-e"
-        )
-
-        fake_file = tmp_path / "ckpt.pt"
-        fake_file.write_bytes(b"data")
-
-        entry = _write_and_upload(storage, step=7, path=str(fake_file))
-
-        assert entry is not None
-        assert entry["step"] == 7
-        assert entry["files"] == [{"name": "checkpoint.pt", "size_bytes": 4}]
-        index = json.loads(stored["pfx/runs/proj/run-e/checkpoints.json"])
-        assert index == [entry]
-
-    def test_upload_checkpoint_returns_false_on_s3_error(self, tmp_path: Path) -> None:
-        """A failed upload reports False and leaves the local files alone."""
-        client, _ = self._make_mock_s3_client()
-        client.upload_file.side_effect = BotoCoreError()
-        storage = self._make_storage(
-            client, prefix="pfx", project="proj", run_name="run-f"
-        )
-
-        fake_file = tmp_path / "ckpt.pt"
-        fake_file.write_bytes(b"data")
-        entry, sources = stage_checkpoint(tmp_path / "ckpt", 7, path=str(fake_file))
-
-        assert storage.upload_checkpoint(entry, sources) is False
-        assert fake_file.read_bytes() == b"data"
-
-    def test_list_checkpoints_empty(self) -> None:
-        """Test list_checkpoints returns empty list when no checkpoints exist."""
-        client, _ = self._make_mock_s3_client()
-        storage = self._make_storage(
-            client, bucket="b", prefix="", project="p", run_name="r"
-        )
-        assert storage.list_checkpoints() == []
-
-    def test_list_checkpoints_returns_entries(self, tmp_path: Path) -> None:
-        """Test list_checkpoints returns saved checkpoint metadata."""
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(client, prefix="pfx", project="p", run_name="r")
-
-        fake_file = tmp_path / "ckpt.pt"
-        fake_file.write_bytes(b"data")
-
-        _write_and_upload(storage, step=10, path=str(fake_file))
-        result = storage.list_checkpoints()
-
-        assert len(result) == 1
-        assert result[0]["step"] == 10
-
-    def test_delete_checkpoint_optimizer_removes_only_optimizer(
-        self, tmp_path: Path
+    def test_staging_leaves_committed_save_untouched(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
     ) -> None:
-        """Deleting an optimizer removes optimizer.pt and updates metadata."""
-        client, stored = self._make_mock_s3_client()
-        client.delete_object.side_effect = lambda Bucket, Key: stored.pop(Key, None)
-        storage = self._make_storage(
-            client, prefix="pfx", project="proj", run_name="run-opt"
-        )
+        """Nothing in the step dir changes until a new save is committed."""
+        _save_local(tmp_path, 3, state_dict={"w": 1})
 
-        mock_torch = mock.MagicMock()
+        staged = stage_checkpoint(tmp_path, 3, state_dict={"w": 2})
+        assert read_local_checkpoint(checkpoint_dir(tmp_path, 3)) == {
+            "model_state_dict": {"w": 1}
+        }
+        discard_staged(staged)
+        assert _staging_leftovers(tmp_path) == []
 
-        def fake_save(obj, path):
-            import pickle
+    def test_failed_serialization_keeps_previous_save(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        _save_local(tmp_path, 3, state_dict={"w": 1})
 
-            with open(path, "wb") as f:
-                pickle.dump(obj, f)
+        def partial_save(obj: Any, path: Path) -> None:
+            Path(path).write_bytes(b"partial")
+            raise OSError("disk full")
 
-        mock_torch.save.side_effect = fake_save
+        fake_torch.save.side_effect = partial_save
+        with pytest.raises(OSError, match="disk full"):
+            stage_checkpoint(tmp_path, 3, state_dict={"w": 2})
 
-        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            _write_and_upload(
-                storage,
-                step=42,
-                state_dict={"weight": "data"},
-                optimizer_state_dict={"lr": 0.01},
-            )
+        assert read_local_checkpoint(checkpoint_dir(tmp_path, 3)) == {
+            "model_state_dict": {"w": 1}
+        }
+        assert _staging_leftovers(tmp_path) == []
 
-        model_key = "pfx/runs/proj/run-opt/checkpoints/42/model.pt"
-        opt_key = "pfx/runs/proj/run-opt/checkpoints/42/optimizer.pt"
-        meta_key = "pfx/runs/proj/run-opt/checkpoints/42/meta.json"
-        index_key = "pfx/runs/proj/run-opt/checkpoints.json"
-        assert opt_key in stored
+    def test_resave_replaces_whole_directory(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        _save_local(tmp_path, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
+        _save_local(tmp_path, 3, state_dict={"w": 2})
 
-        storage.delete_checkpoint_optimizer(step=42)
+        dest = checkpoint_dir(tmp_path, 3)
+        assert sorted(p.name for p in dest.iterdir()) == ["meta.json", "model.pt"]
+        assert read_local_checkpoint(dest) == {"model_state_dict": {"w": 2}}
+        assert _staging_leftovers(tmp_path) == []
 
-        assert model_key in stored
-        assert opt_key not in stored
-
-        meta = json.loads(stored[meta_key])
-        assert [f["name"] for f in meta["files"]] == ["model.pt"]
-
-        index = json.loads(stored[index_key])
-        assert len(index) == 1
-        assert [f["name"] for f in index[0]["files"]] == ["model.pt"]
-
-    def test_delete_checkpoint_optimizer_noop_when_absent(self, tmp_path: Path) -> None:
-        """Calling delete on a checkpoint without an optimizer is a no-op."""
-        client, stored = self._make_mock_s3_client()
-        client.delete_object.side_effect = lambda Bucket, Key: stored.pop(Key, None)
-        storage = self._make_storage(
-            client, prefix="pfx", project="proj", run_name="run-no-opt"
-        )
-
-        mock_torch = mock.MagicMock()
-
-        def fake_save(obj, path):
-            import pickle
-
-            with open(path, "wb") as f:
-                pickle.dump(obj, f)
-
-        mock_torch.save.side_effect = fake_save
-
-        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            _write_and_upload(storage, step=7, state_dict={"weight": "data"})
-
-        before = dict(stored)
-        storage.delete_checkpoint_optimizer(step=7)
-        assert stored == before
-        client.delete_object.assert_not_called()
-
-    def test_delete_checkpoint_optimizer_unknown_step_raises(self) -> None:
-        """Deleting an optimizer for a step that doesn't exist raises."""
-        client, _ = self._make_mock_s3_client()
-        storage = self._make_storage(
-            client, prefix="pfx", project="proj", run_name="run-missing"
-        )
+    def test_failed_replace_restores_previous_save(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        _save_local(tmp_path, 3, state_dict={"w": 1})
+        dest = checkpoint_dir(tmp_path, 3)
 
         with pytest.raises(FileNotFoundError):
-            storage.delete_checkpoint_optimizer(step=999)
+            publish(tmp_path / "checkpoints" / ".staging" / "gone", dest)
 
-    def test_delete_local_checkpoint_noop_when_absent(self, tmp_path: Path) -> None:
-        """delete_local_checkpoint returns False when nothing is cached."""
-        with _runs_dir_at(tmp_path / "runs"):
-            assert extty.delete_local_checkpoint("proj", "run-empty", step=42) is False
+        assert read_local_checkpoint(dest) == {"model_state_dict": {"w": 1}}
+
+    def test_adopt_download_adds_files_to_same_save(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """A second loader of a step fills in what the first one didn't fetch."""
+        meta = _save_local(
+            tmp_path, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
+        )
+        dest = checkpoint_dir(tmp_path, 3)
+        (dest / "optimizer.pt").rename(tmp_path / "optimizer.pt")
+        staging = new_staging_dir(tmp_path)
+        (tmp_path / "optimizer.pt").rename(staging / "optimizer.pt")
+        (staging / META_FILE).write_text(json.dumps(meta))
+
+        assert adopt_download(staging, dest, meta) is True
+        assert read_local_checkpoint(dest) == {
+            "model_state_dict": {"w": 1},
+            "optimizer_state_dict": {"lr": 0.1},
+        }
+
+    def test_adopt_download_leaves_a_different_save_alone(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        _save_local(tmp_path, 3, state_dict={"w": 1})
+        dest = checkpoint_dir(tmp_path, 3)
+        staging = new_staging_dir(tmp_path)
+        other = {"step": 3, "save_id": "other", "timestamp": "t", "files": []}
+        (staging / META_FILE).write_text(json.dumps(other))
+
+        assert adopt_download(staging, dest, other) is False
+        assert read_local_checkpoint(dest) == {"model_state_dict": {"w": 1}}
+
+    def test_staging_left_by_dead_processes_is_removed(self, tmp_path: Path) -> None:
+        """Only this host's staging dirs, from dead processes, left long enough."""
+        exited = subprocess.Popen(["true"])
+        exited.wait()
+        host = socket.gethostname()
+        staging_root = tmp_path / "checkpoints" / ".staging"
+        names = {
+            "abandoned": f"{host}#{exited.pid}#a",
+            "recent": f"{host}#{exited.pid}#b",
+            "running": f"{host}#{os.getpid()}#c",
+            "other_host": f"elsewhere#{exited.pid}#d",
+            "set_aside": f"{host}#{exited.pid}#e#replaced",
+        }
+        long_ago = time.time() - 2 * 3600
+        for label, name in names.items():
+            (staging_root / name).mkdir(parents=True)
+            (staging_root / name / "model.pt").write_bytes(b"w")
+            if label != "recent":
+                os.utime(staging_root / name, (long_ago, long_ago))
+
+        new_staging_dir(tmp_path)
+
+        remaining = {p.name for p in staging_root.iterdir()}
+        assert names["abandoned"] not in remaining
+        assert {names[k] for k in names if k != "abandoned"} <= remaining
+
+    def test_read_local_checkpoint_round_trip(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        _save_local(tmp_path, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
+
+        dest = checkpoint_dir(tmp_path, 3)
+        assert read_local_checkpoint(dest) == {
+            "model_state_dict": {"w": 1},
+            "optimizer_state_dict": {"lr": 0.1},
+        }
+        assert read_local_checkpoint(dest, load_optimizer=False) == {
+            "model_state_dict": {"w": 1}
+        }
+
+    def test_read_local_checkpoint_requires_meta_and_needed_files(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """A missing optimizer matters only if it is asked for."""
+        dest = checkpoint_dir(tmp_path, 3)
+        assert read_local_checkpoint(dest) is None
+
+        _save_local(tmp_path, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
+        (dest / "optimizer.pt").unlink()
+        assert read_local_checkpoint(dest) is None
+        assert read_local_checkpoint(dest, load_optimizer=False) == {
+            "model_state_dict": {"w": 1}
+        }
+
+        (dest / META_FILE).unlink()
+        assert read_local_checkpoint(dest, load_optimizer=False) is None
+
+    def test_run_saves_and_loads_without_s3(
+        self,
+        extty_home: Path,
+        fake_torch: mock.MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """With no S3 configured, checkpoints live in the run dir and round-trip."""
+        with caplog.at_level(logging.INFO, logger="extty"):
+            run = extty.run.Run("proj", name="local-run", system_metrics=False)
+            run.save_checkpoint(
+                5, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
+            )
+            loaded = run.load_checkpoint(5)
+            run.finish()
+
+        expected = {"model_state_dict": {"w": 1}, "optimizer_state_dict": {"lr": 0.1}}
+        run_dir = extty_home / "runs" / "proj" / "local-run"
+        ckpt_dir = run_dir / "checkpoints" / "5"
+        assert loaded == expected
+        assert (ckpt_dir / "model.pt").exists()
+        assert f"saved to {ckpt_dir}" in caplog.text
+        assert not (run_dir / "checkpoints.json").exists()
+        run_data = extty.get_run("proj", "local-run", local_only=True)
+        assert [c.step for c in run_data.checkpoints] == [5]
+        assert extty.load_checkpoint_from("proj", "local-run", 5) == expected
+
+    def test_run_load_missing_step_without_s3_raises(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        run = extty.run.Run("proj", name="empty-run", system_metrics=False)
+        with pytest.raises(FileNotFoundError, match="step 9"):
+            run.load_checkpoint(9)
+        run.finish()
+
+    def test_load_checkpoint_from_missing_without_s3_raises(self) -> None:
+        with pytest.raises(FileNotFoundError, match="S3 is not configured"):
+            extty.load_checkpoint_from("proj", "nope", 1)
+
+    def test_missing_path_leaves_existing_local_copy_intact(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """A bad path fails before touching the step's existing checkpoint."""
+        run = extty.run.Run("proj", name="typo", system_metrics=False)
+        run.save_checkpoint(5, state_dict={"w": 1})
+
+        with pytest.raises(FileNotFoundError):
+            run.save_checkpoint(5, path="/nonexistent/ckpt.pt")
+
+        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
+        run.finish()
+
+    def test_run_and_lookups_share_run_dir(self) -> None:
+        """Where a Run saves must be where lookups by project/name look."""
+        run = extty.run.Run("", name="shared", system_metrics=False)
+        run.finish()
+
+        run_dir = Path(run.run_dir)
+        assert run_dir == get_run_dir("", "shared")
+        assert run_dir == get_runs_dir() / "_default" / "shared"
+        assert local_checkpoint_dir("", "shared", 3) == run_dir / "checkpoints" / "3"
 
     def test_module_level_save_checkpoint_without_init_raises(self) -> None:
-        """Test that calling extty.save_checkpoint without init raises RuntimeError."""
         extty._active_run = None
         with pytest.raises(RuntimeError, match="No active run"):
             extty.save_checkpoint(step=1, path="/nonexistent")
 
 
 class TestLocalCheckpointIndex:
-    """Tests for mirroring the checkpoint index into the local run dir."""
+    """``checkpoints.json`` mirrors S3's index; local saves are found on disk."""
 
     def test_record_checkpoint_merges_and_sorts(self, tmp_path: Path) -> None:
         storage = RunStorage(run_dir=tmp_path / "run")
@@ -1396,36 +1510,478 @@ class TestLocalCheckpointIndex:
         assert checkpoints[1].timestamp == "t3"
         assert checkpoints[1].files[0].name == "c"
 
-    def test_run_save_checkpoint_mirrors_local_index(self, tmp_path: Path) -> None:
-        """A checkpoint saved on the training machine must be visible to
-        get_run() there, which prefers the local run dir over S3."""
-        client, stored = TestSaveCheckpoint()._make_mock_s3_client()
-        runs_dir = tmp_path / "runs"
+    def test_read_checkpoints_adds_local_saves(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """Local saves are listed too, and win over the index for their step."""
+        run_dir = tmp_path / "run"
+        storage = RunStorage(run_dir=run_dir)
+        storage.record_checkpoint(
+            {
+                "step": 10,
+                "timestamp": "t-remote",
+                "files": [{"name": "a", "size_bytes": 1}],
+            }
+        )
+        storage.record_checkpoint(
+            {
+                "step": 20,
+                "timestamp": "t-remote",
+                "files": [{"name": "a", "size_bytes": 1}],
+            }
+        )
+        with mock.patch("time.strftime", return_value="t-local"):
+            _save_local(run_dir, 5, state_dict={"w": 1})
+            _save_local(run_dir, 10, state_dict={"w": 1})
+        stage_checkpoint(run_dir, 30, state_dict={"w": 1})
 
-        fake_file = tmp_path / "ckpt.pt"
-        fake_file.write_bytes(b"fake model data")
+        checkpoints = storage.read_checkpoints()
+        assert [(c.step, c.timestamp) for c in checkpoints] == [
+            (5, "t-local"),
+            (10, "t-local"),
+            (20, "t-remote"),
+        ]
 
-        with (
-            _runs_dir_at(runs_dir),
-            mock.patch("boto3.client", return_value=client),
-        ):
-            run = extty.run.Run(
-                "proj",
-                name="run-1",
-                system_metrics=False,
-                s3_config=S3Config(bucket="b", prefix="pfx"),
-            )
-            run.save_checkpoint(100, path=str(fake_file))
-            run.finish()
+    def test_read_checkpoints_accepts_oldest_entry_shape(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """A download of a very old save keeps its bare-name, timestamp-less meta."""
+        client, stored = _mock_s3_client()
+        stored[f"{_step_prefix('run-1', 5)}/checkpoint.pt"] = pickle.dumps({"w": 1})
+        stored[_index_key("run-1")] = json.dumps(
+            [{"step": 5, "files": ["checkpoint.pt"], "size_bytes": 100}]
+        ).encode()
+        _s3_storage(client).load_checkpoint(5)
 
-        local_index = runs_dir / "proj" / "run-1" / "checkpoints.json"
-        assert json.loads(local_index.read_text()) == json.loads(
-            stored["pfx/runs/proj/run-1/checkpoints.json"]
+        (checkpoint,) = RunStorage(
+            run_dir=get_run_dir("proj", "run-1")
+        ).read_checkpoints()
+
+        assert checkpoint.step == 5
+        assert checkpoint.timestamp == ""
+        assert [(f.name, f.size_bytes) for f in checkpoint.files] == [
+            ("checkpoint.pt", 100)
+        ]
+
+
+class TestS3CheckpointUpload:
+    """How a save is laid out in S3 and committed there."""
+
+    def test_path_checkpoint_layout(self, tmp_path: Path) -> None:
+        client, stored = _mock_s3_client()
+        storage = _s3_storage(client)
+        user_file = tmp_path / "model.pt"
+        user_file.write_bytes(b"fake model data")
+
+        meta = _write_and_upload(storage, step=100, path=str(user_file))
+
+        assert meta is not None
+        assert _remote_meta(stored, "run-1", 100) == meta
+        assert meta["files"] == [
+            {"name": "checkpoint.pt", "size_bytes": len(b"fake model data")}
+        ]
+        assert _step_keys(stored, "run-1", 100) == [
+            f"{meta['save_id']}/checkpoint.pt",
+            "meta.json",
+        ]
+        assert _remote_file(stored, "run-1", 100, "checkpoint.pt") == b"fake model data"
+        assert json.loads(stored[_index_key("run-1")]) == [meta]
+
+    def test_state_dict_model_and_optimizer(self, fake_torch: mock.MagicMock) -> None:
+        client, stored = _mock_s3_client()
+        storage = _s3_storage(client)
+
+        _write_and_upload(
+            storage,
+            step=50,
+            state_dict={"w": "data"},
+            optimizer_state_dict={"lr": 0.01},
         )
 
-        with _runs_dir_at(runs_dir):
-            run_data = extty.get_run("proj", "run-1", local_only=True)
-            assert [c.step for c in run_data.checkpoints] == [100]
+        meta = _remote_meta(stored, "run-1", 50)
+        assert [f["name"] for f in meta["files"]] == ["model.pt", "optimizer.pt"]
+        assert pickle.loads(_remote_file(stored, "run-1", 50, "model.pt")) == {
+            "w": "data"
+        }
+        assert _remote_file(stored, "run-1", 50, "optimizer.pt")
+
+    def test_state_dict_model_only(self, fake_torch: mock.MagicMock) -> None:
+        client, stored = _mock_s3_client()
+        storage = _s3_storage(client)
+
+        _write_and_upload(storage, step=10, state_dict={"w": "data"})
+
+        meta = _remote_meta(stored, "run-1", 10)
+        assert [f["name"] for f in meta["files"]] == ["model.pt"]
+        assert _step_keys(stored, "run-1", 10) == [
+            f"{meta['save_id']}/model.pt",
+            "meta.json",
+        ]
+
+    def test_index_accumulates_steps(self, tmp_path: Path) -> None:
+        client, stored = _mock_s3_client()
+        storage = _s3_storage(client)
+        user_file = tmp_path / "ckpt.pt"
+        user_file.write_bytes(b"ckpt")
+
+        _write_and_upload(storage, step=100, path=str(user_file))
+        _write_and_upload(storage, step=50, path=str(user_file))
+
+        index = json.loads(stored[_index_key("run-1")])
+        assert [e["step"] for e in index] == [50, 100]
+        assert [c["step"] for c in storage.list_checkpoints()] == [50, 100]
+
+    def test_list_checkpoints_empty(self) -> None:
+        client, _ = _mock_s3_client()
+        assert _s3_storage(client).list_checkpoints() == []
+
+    def test_upload_returns_false_on_s3_error(self, tmp_path: Path) -> None:
+        """A failed upload reports False and leaves the user's file alone."""
+        client, _ = _mock_s3_client()
+        client.upload_file.side_effect = BotoCoreError()
+        storage = _s3_storage(client)
+        user_file = tmp_path / "ckpt.pt"
+        user_file.write_bytes(b"data")
+
+        assert _write_and_upload(storage, step=7, path=str(user_file)) is None
+        assert user_file.read_bytes() == b"data"
+
+    def test_failed_reupload_leaves_previous_save_in_s3(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """New files go under their own prefix, so S3's committed save is untouched."""
+        client, stored = _mock_s3_client()
+        storage = _s3_storage(client)
+        first = _write_and_upload(
+            storage, step=5, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
+        )
+        upload_file = client.upload_file.side_effect
+
+        def fail_on_optimizer(Filename, Bucket, Key, **kwargs):
+            if Key.endswith("optimizer.pt"):
+                raise BotoCoreError()
+            upload_file(Filename, Bucket, Key, **kwargs)
+
+        client.upload_file.side_effect = fail_on_optimizer
+        second = _write_and_upload(
+            storage, step=5, state_dict={"w": 2}, optimizer_state_dict={"lr": 0.2}
+        )
+
+        assert second is None
+        assert _remote_meta(stored, "run-1", 5) == first
+        assert pickle.loads(_remote_file(stored, "run-1", 5, "model.pt")) == {"w": 1}
+
+    def test_resave_removes_superseded_files(self, fake_torch: mock.MagicMock) -> None:
+        client, stored = _mock_s3_client()
+        storage = _s3_storage(client)
+        prefix = _step_prefix("run-1", 5)
+        stored[f"{prefix}/checkpoint.pt"] = b"from before save IDs"
+        stored[f"{prefix}/{META_FILE}"] = json.dumps(
+            {"step": 5, "timestamp": "t", "files": ["checkpoint.pt"]}
+        ).encode()
+        _write_and_upload(
+            storage, step=5, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
+        )
+
+        meta = _write_and_upload(storage, step=5, state_dict={"w": 2})
+
+        assert meta is not None
+        assert _step_keys(stored, "run-1", 5) == [
+            f"{meta['save_id']}/model.pt",
+            "meta.json",
+        ]
+
+    def test_checkpoint_meta_prefers_step_meta_over_index(self) -> None:
+        """The step's meta.json is the commit record; the index can lag behind it."""
+        client, stored = _mock_s3_client()
+        storage = _s3_storage(client)
+        stored[_index_key("run-1")] = json.dumps(
+            [{"step": 5, "save_id": "old", "timestamp": "t", "files": []}]
+        ).encode()
+        stored[f"{_step_prefix('run-1', 5)}/{META_FILE}"] = json.dumps(
+            {"step": 5, "save_id": "new", "timestamp": "t", "files": []}
+        ).encode()
+
+        assert storage.find_checkpoint(5)["save_id"] == "new"
+
+    def test_delete_checkpoint_optimizer_removes_only_optimizer(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        client, stored = _mock_s3_client()
+        storage = _s3_storage(client)
+        _write_and_upload(
+            storage, step=42, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.01}
+        )
+        save_id = _remote_meta(stored, "run-1", 42)["save_id"]
+
+        storage.delete_checkpoint_optimizer(step=42)
+
+        meta = _remote_meta(stored, "run-1", 42)
+        assert _step_keys(stored, "run-1", 42) == [f"{save_id}/model.pt", "meta.json"]
+        assert [f["name"] for f in meta["files"]] == ["model.pt"]
+        assert meta["save_id"] == save_id
+        index = json.loads(stored[_index_key("run-1")])
+        assert [f["name"] for f in index[0]["files"]] == ["model.pt"]
+
+    def test_delete_checkpoint_optimizer_noop_when_absent(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        client, stored = _mock_s3_client()
+        storage = _s3_storage(client)
+        _write_and_upload(storage, step=7, state_dict={"w": 1})
+
+        before = dict(stored)
+        storage.delete_checkpoint_optimizer(step=7)
+
+        assert stored == before
+        client.delete_object.assert_not_called()
+
+    def test_delete_checkpoint_optimizer_unknown_step_raises(self) -> None:
+        client, _ = _mock_s3_client()
+        with pytest.raises(FileNotFoundError):
+            _s3_storage(client).delete_checkpoint_optimizer(step=999)
+
+
+class TestS3CheckpointLoad:
+    """Loading S3's save of a checkpoint through the local run dir."""
+
+    def test_load_model_and_optimizer(self, fake_torch: mock.MagicMock) -> None:
+        client, _ = _mock_s3_client()
+        storage = _s3_storage(client)
+        _write_and_upload(
+            storage,
+            step=10,
+            state_dict={"w": [1, 2, 3]},
+            optimizer_state_dict={"lr": 0.01},
+        )
+
+        assert storage.load_checkpoint(10) == {
+            "model_state_dict": {"w": [1, 2, 3]},
+            "optimizer_state_dict": {"lr": 0.01},
+        }
+
+    def test_load_skipping_optimizer_downloads_only_model(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        client, _ = _mock_s3_client()
+        storage = _s3_storage(client)
+        _write_and_upload(
+            storage, step=10, state_dict={"w": [1]}, optimizer_state_dict={"lr": 0.1}
+        )
+
+        assert storage.load_checkpoint(10, load_optimizer=False) == {
+            "model_state_dict": {"w": [1]}
+        }
+        downloaded = [c.kwargs["Key"] for c in client.download_file.call_args_list]
+        assert [key.rsplit("/", 1)[1] for key in downloaded] == ["model.pt"]
+
+    def test_load_adds_missing_file_to_same_save(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        client, _ = _mock_s3_client()
+        storage = _s3_storage(client)
+        meta = _write_and_upload(
+            storage, step=10, state_dict={"w": [1]}, optimizer_state_dict={"lr": 0.1}
+        )
+        storage.load_checkpoint(10, load_optimizer=False)
+        client.download_file.reset_mock()
+
+        assert storage.load_checkpoint(10)["optimizer_state_dict"] == {"lr": 0.1}
+        downloaded = [c.kwargs["Key"] for c in client.download_file.call_args_list]
+        assert [key.rsplit("/", 1)[1] for key in downloaded] == ["optimizer.pt"]
+        local_dir = local_checkpoint_dir("proj", "run-1", 10)
+        assert json.loads((local_dir / META_FILE).read_text()) == meta
+
+    def test_load_legacy_format(self, fake_torch: mock.MagicMock) -> None:
+        """A save from before save IDs: files at the step root, index entry only."""
+        import pickle
+
+        client, stored = _mock_s3_client()
+        stored[f"{_step_prefix('run-1', 5)}/checkpoint.pt"] = pickle.dumps(
+            {"model_state_dict": {"w": 42}, "optimizer_state_dict": {"lr": 0.01}}
+        )
+        stored[_index_key("run-1")] = json.dumps(
+            [{"step": 5, "files": ["checkpoint.pt"], "size_bytes": 100}]
+        ).encode()
+
+        assert _s3_storage(client).load_checkpoint(5) == {
+            "model_state_dict": {"w": 42},
+            "optimizer_state_dict": {"lr": 0.01},
+        }
+
+    def test_load_reuses_local_copy(self, fake_torch: mock.MagicMock) -> None:
+        client, _ = _mock_s3_client()
+        storage = _s3_storage(client)
+        _write_and_upload(storage, step=20, state_dict={"w": 1})
+
+        storage.load_checkpoint(20)
+        client.download_file.reset_mock()
+        storage.load_checkpoint(20)
+
+        client.download_file.assert_not_called()
+
+    def test_concurrent_loads_of_a_step_share_one_copy(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """Ranks of a distributed job loading the same step must not collide."""
+        client, _ = _mock_s3_client()
+        _write_and_upload(
+            _s3_storage(client),
+            step=10,
+            state_dict={"w": 1},
+            optimizer_state_dict={"lr": 0.1},
+        )
+        barrier = threading.Barrier(2, timeout=10)
+        download = client.download_file.side_effect
+
+        def download_in_step(**kwargs: Any) -> None:
+            download(**kwargs)
+            barrier.wait()
+
+        client.download_file.side_effect = download_in_step
+        results: list[Any] = [None, None]
+
+        def load(i: int) -> None:
+            try:
+                results[i] = _s3_storage(client).load_checkpoint(10)
+            except BaseException as e:
+                results[i] = e
+
+        threads = [threading.Thread(target=load, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        expected = {"model_state_dict": {"w": 1}, "optimizer_state_dict": {"lr": 0.1}}
+        assert results == [expected, expected]
+        assert (
+            read_local_checkpoint(local_checkpoint_dir("proj", "run-1", 10)) == expected
+        )
+        assert _staging_leftovers(get_run_dir("proj", "run-1")) == []
+
+    def test_load_nonexistent_step_raises(self) -> None:
+        client, _ = _mock_s3_client()
+        with pytest.raises(FileNotFoundError, match="step 999"):
+            _s3_storage(client).load_checkpoint(999)
+
+    def test_interrupted_save_is_not_mixed_into_a_load(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """A save killed mid-upload leaves nothing a later load could pick up."""
+        client, _ = _mock_s3_client()
+        run = _s3_run(client, "killed")
+        run.save_checkpoint(5, state_dict={"w": 1})
+        client.upload_file.side_effect = KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            run.save_checkpoint(5, state_dict={"w": 2})
+        run.finish()
+
+        run_dir = get_run_dir("proj", "killed")
+        assert not checkpoint_dir(run_dir, 5).exists()
+        assert _staging_leftovers(run_dir) == []
+        with mock.patch("boto3.client", return_value=client):
+            loaded = extty.load_checkpoint_from(
+                "proj", "killed", 5, s3_config=_S3_CONFIG
+            )
+        assert loaded == {"model_state_dict": {"w": 1}}
+
+    def test_load_leaves_a_different_local_save_alone(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """S3's save is loaded without replacing a local-only save of the step."""
+        client, _ = _mock_s3_client()
+        run = _s3_run(client, "diverged")
+        run.save_checkpoint(5, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
+        client.upload_file.side_effect = BotoCoreError()
+        run.save_checkpoint(5, state_dict={"w": 2}, optimizer_state_dict={"lr": 0.2})
+        run.finish()
+        client.upload_file.side_effect = None
+        local_dir = local_checkpoint_dir("proj", "diverged", 5)
+        local_meta = json.loads((local_dir / META_FILE).read_text())
+        (local_dir / "optimizer.pt").unlink()
+
+        with mock.patch("boto3.client", return_value=client):
+            loaded = extty.load_checkpoint_from(
+                "proj", "diverged", 5, s3_config=_S3_CONFIG
+            )
+
+        assert loaded == {
+            "model_state_dict": {"w": 1},
+            "optimizer_state_dict": {"lr": 0.1},
+        }
+        assert json.loads((local_dir / META_FILE).read_text()) == local_meta
+        assert read_local_checkpoint(local_dir, load_optimizer=False) == {
+            "model_state_dict": {"w": 2}
+        }
+        assert _staging_leftovers(get_run_dir("proj", "diverged")) == []
+
+
+class TestRunCheckpointsWithS3:
+    """What Run.save_checkpoint keeps locally when S3 is configured."""
+
+    def test_upload_success_removes_local_copy(
+        self, extty_home: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """The local files go; the local index mirrors S3's and lists the step."""
+        client, stored = _mock_s3_client()
+        run = _s3_run(client, "s3-run")
+        run.save_checkpoint(5, state_dict={"w": 1})
+        run.finish()
+
+        run_dir = extty_home / "runs" / "proj" / "s3-run"
+        assert _remote_file(stored, "s3-run", 5, "model.pt")
+        assert not checkpoint_dir(run_dir, 5).exists()
+        assert _staging_leftovers(run_dir) == []
+        assert json.loads((run_dir / "checkpoints.json").read_text()) == json.loads(
+            stored[_index_key("s3-run")]
+        )
+        run_data = extty.get_run("proj", "s3-run", local_only=True)
+        assert [c.step for c in run_data.checkpoints] == [5]
+
+    def test_keep_local_loads_without_download(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        client, _ = _mock_s3_client()
+        run = _s3_run(client, "kept-run")
+        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
+
+        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
+        client.download_file.assert_not_called()
+        run.finish()
+
+    def test_uploaded_resave_drops_older_local_copy(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """A kept older save must not shadow the newer one that went to S3."""
+        client, _ = _mock_s3_client()
+        run = _s3_run(client, "resaved")
+        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
+        run.save_checkpoint(5, state_dict={"w": 2})
+
+        assert not local_checkpoint_dir("proj", "resaved", 5).exists()
+        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 2}}
+        run.finish()
+
+    def test_pulled_checkpoint_reloads_offline(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        client, _ = _mock_s3_client()
+        run = _s3_run(client, "pulled-run")
+        run.save_checkpoint(5, state_dict={"w": 1})
+        run.finish()
+
+        with mock.patch("boto3.client", return_value=client):
+            first = extty.load_checkpoint_from(
+                "proj", "pulled-run", 5, s3_config=_S3_CONFIG
+            )
+        with mock.patch("boto3.client", side_effect=AssertionError("S3 contacted")):
+            second = extty.load_checkpoint_from(
+                "proj", "pulled-run", 5, s3_config=_S3_CONFIG
+            )
+
+        assert first == second == {"model_state_dict": {"w": 1}}
 
     @pytest.mark.parametrize(
         "error",
@@ -1437,582 +1993,39 @@ class TestLocalCheckpointIndex:
         ],
         ids=["botocore", "s3-upload-failed"],
     )
-    def test_run_save_checkpoint_keeps_local_copy_on_s3_error(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, error: Exception
+    def test_failed_upload_keeps_local_copy(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        error: Exception,
     ) -> None:
-        """A failed S3 upload keeps the local copy and records it in the index.
+        """The save is committed locally and listed, but not recorded as in S3.
 
         ``upload_file`` reports bucket-side failures (403, missing bucket) as
         ``S3UploadFailedError``, which is not a botocore exception.
         """
-        client, _ = TestSaveCheckpoint()._make_mock_s3_client()
+        client, _ = _mock_s3_client()
         client.upload_file.side_effect = error
-        runs_dir = tmp_path / "runs"
+        user_file = tmp_path / "ckpt.pt"
+        user_file.write_bytes(b"fake model data")
 
-        fake_file = tmp_path / "ckpt.pt"
-        fake_file.write_bytes(b"fake model data")
-
-        with (
-            _runs_dir_at(runs_dir),
-            mock.patch("boto3.client", return_value=client),
-            caplog.at_level(logging.ERROR, logger="extty"),
-        ):
-            run = extty.run.Run(
-                "proj",
-                name="run-2",
-                system_metrics=False,
-                s3_config=S3Config(bucket="b", prefix="pfx"),
-            )
-            run.save_checkpoint(100, path=str(fake_file))
+        with caplog.at_level(logging.ERROR, logger="extty"):
+            run = _s3_run(client, "run-2")
+            run.save_checkpoint(100, path=str(user_file))
             run.finish()
 
-        run_dir = runs_dir / "proj" / "run-2"
-        local_file = run_dir / "checkpoints" / "100" / "checkpoint.pt"
-        assert local_file.read_bytes() == b"fake model data"
-        index = json.loads((run_dir / "checkpoints.json").read_text())
-        assert [e["step"] for e in index] == [100]
+        run_dir = get_run_dir("proj", "run-2")
+        local_dir = checkpoint_dir(run_dir, 100)
+        assert (local_dir / "checkpoint.pt").read_bytes() == b"fake model data"
+        assert not (run_dir / "checkpoints.json").exists()
         assert "local copy kept at" in caplog.text
-
-
-class TestLoadCheckpoint:
-    """Tests for load_checkpoint functionality."""
-
-    def _make_mock_s3_client(
-        self, stored: dict[str, bytes] | None = None
-    ) -> tuple[mock.MagicMock, dict[str, bytes]]:
-        if stored is None:
-            stored = {}
-        client = mock.MagicMock()
-
-        def put_object(Bucket, Key, Body, ContentType=None):
-            if isinstance(Body, str):
-                Body = Body.encode("utf-8")
-            stored[Key] = Body
-
-        def get_object(Bucket, Key):
-            if Key in stored:
-                body = mock.MagicMock()
-                body.read.return_value = stored[Key]
-                return {"Body": body}
-            raise client.exceptions.NoSuchKey(
-                {"Error": {"Code": "NoSuchKey"}}, "GetObject"
-            )
-
-        def upload_file(Filename, Bucket, Key, ExtraArgs=None):
-            with open(Filename, "rb") as f:
-                stored[Key] = f.read()
-
-        def download_file(Bucket, Key, Filename, **kwargs):
-            if Key not in stored:
-                raise client.exceptions.NoSuchKey(
-                    {"Error": {"Code": "NoSuchKey"}}, "GetObject"
-                )
-            data = stored[Key]
-            with open(Filename, "wb") as f:
-                f.write(data)
-            callback = kwargs.get("Callback")
-            if callback is not None:
-                callback(len(data))
-
-        def head_object(Bucket, Key):
-            if Key not in stored:
-                raise client.exceptions.NoSuchKey(
-                    {"Error": {"Code": "NoSuchKey"}}, "HeadObject"
-                )
-            return {"ContentLength": len(stored[Key])}
-
-        client.put_object.side_effect = put_object
-        client.get_object.side_effect = get_object
-        client.upload_file.side_effect = upload_file
-        client.download_file.side_effect = download_file
-        client.head_object.side_effect = head_object
-        client.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
-        return client, stored
-
-    def _make_storage(
-        self,
-        client: mock.MagicMock,
-        bucket: str = "test-bucket",
-        prefix: str = "pfx",
-        project: str = "proj",
-        run_name: str = "run-1",
-    ) -> S3Storage:
-        config = S3Config(bucket=bucket, prefix=prefix)
-        with mock.patch("boto3.client", return_value=client):
-            storage = S3Storage(config, project, run_name)
-        return storage
-
-    def test_load_new_format_model_and_optimizer(self, tmp_path: Path) -> None:
-        """Test loading a new-format checkpoint with model.pt and optimizer.pt."""
-
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(client)
-
-        mock_torch = mock.MagicMock()
-        mock_torch.save.side_effect = lambda obj, path: _pickle_save(obj, path)
-        mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
-
-        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            _write_and_upload(
-                storage,
-                step=10,
-                state_dict={"w": [1, 2, 3]},
-                optimizer_state_dict={"lr": 0.01},
-            )
-
-        with (
-            mock.patch.dict("sys.modules", {"torch": mock_torch}),
-            _runs_dir_at(tmp_path / "runs"),
-        ):
-            result = storage.load_checkpoint(10)
-
-        assert "model_state_dict" in result
-        assert result["model_state_dict"] == {"w": [1, 2, 3]}
-        assert "optimizer_state_dict" in result
-        assert result["optimizer_state_dict"] == {"lr": 0.01}
-
-    def test_load_new_format_skip_optimizer(self, tmp_path: Path) -> None:
-        """Test loading only model weights, skipping optimizer."""
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(client)
-
-        mock_torch = mock.MagicMock()
-        mock_torch.save.side_effect = lambda obj, path: _pickle_save(obj, path)
-        mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
-
-        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            _write_and_upload(
-                storage,
-                step=10,
-                state_dict={"w": [1]},
-                optimizer_state_dict={"lr": 0.1},
-            )
-
-        with (
-            mock.patch.dict("sys.modules", {"torch": mock_torch}),
-            _runs_dir_at(tmp_path / "runs"),
-        ):
-            result = storage.load_checkpoint(10, load_optimizer=False)
-
-        assert "model_state_dict" in result
-        assert "optimizer_state_dict" not in result
-
-    def test_load_legacy_format(self, tmp_path: Path) -> None:
-        """Test loading an old-format checkpoint (single checkpoint.pt)."""
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(client)
-
-        mock_torch = mock.MagicMock()
-        mock_torch.save.side_effect = lambda obj, path: _pickle_save(obj, path)
-        mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
-
-        legacy_data = {
-            "model_state_dict": {"w": 42},
-            "optimizer_state_dict": {"lr": 0.01},
-        }
-        import pickle
-
-        s3_key = "pfx/runs/proj/run-1/checkpoints/5/checkpoint.pt"
-        stored[s3_key] = pickle.dumps(legacy_data)
-
-        index_key = "pfx/runs/proj/run-1/checkpoints.json"
-        stored[index_key] = json.dumps(
-            [{"step": 5, "files": ["checkpoint.pt"], "size_bytes": 100}]
-        ).encode()
-
-        with (
-            mock.patch.dict("sys.modules", {"torch": mock_torch}),
-            _runs_dir_at(tmp_path / "runs"),
-        ):
-            result = storage.load_checkpoint(5)
-
-        assert result["model_state_dict"] == {"w": 42}
-        assert result["optimizer_state_dict"] == {"lr": 0.01}
-
-    def test_load_uses_local_cache(self, tmp_path: Path) -> None:
-        """Test that a cached file is not re-downloaded."""
-        client, stored = self._make_mock_s3_client()
-        storage = self._make_storage(client)
-
-        mock_torch = mock.MagicMock()
-        mock_torch.save.side_effect = lambda obj, path: _pickle_save(obj, path)
-        mock_torch.load.side_effect = lambda path, **kw: _pickle_load(path)
-
-        with mock.patch.dict("sys.modules", {"torch": mock_torch}):
-            _write_and_upload(storage, step=20, state_dict={"w": 1})
-
-        with (
-            mock.patch.dict("sys.modules", {"torch": mock_torch}),
-            _runs_dir_at(tmp_path / "runs"),
-        ):
-            storage.load_checkpoint(20)
-            client.download_file.reset_mock()
-            storage.load_checkpoint(20)
-
-        client.download_file.assert_not_called()
-
-    def test_load_nonexistent_step_raises(self) -> None:
-        """Test that loading a step that doesn't exist raises FileNotFoundError."""
-        client, _ = self._make_mock_s3_client()
-        storage = self._make_storage(client)
-
-        with pytest.raises(FileNotFoundError, match="step 999"):
-            storage.load_checkpoint(999)
-
-
-def _pickle_save(obj, path):
-    import pickle
-
-    with open(path, "wb") as f:
-        pickle.dump(obj, f)
-
-
-def _pickle_load(path):
-    import pickle
-
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def _save_local(dest: Path, step: int, **kwargs: Any) -> dict[str, Any]:
-    """Stage and commit a checkpoint into ``dest``, returning its index entry."""
-    entry, sources = stage_checkpoint(dest, step, **kwargs)
-    commit_checkpoint(dest, entry, sources)
-    return entry
-
-
-def _write_and_upload(
-    storage: S3Storage, step: int, **kwargs: Any
-) -> dict[str, Any] | None:
-    """Stage a checkpoint in ``storage``'s local dir and upload it, as Run does."""
-    entry, sources = stage_checkpoint(
-        storage._local_checkpoint_dir(step), step, **kwargs
-    )
-    return entry if storage.upload_checkpoint(entry, sources) else None
-
-
-@pytest.fixture
-def fake_torch() -> Generator[mock.MagicMock, None, None]:
-    """Stand in for a CPU-only torch with pickle-backed ``save`` / ``load``."""
-    fake = mock.MagicMock()
-    fake.cuda.is_available.return_value = False
-    fake.backends.mps.is_available.return_value = False
-    fake.save.side_effect = _pickle_save
-    fake.load.side_effect = lambda path, **kw: _pickle_load(path)
-    with mock.patch.dict("sys.modules", {"torch": fake}):
-        yield fake
-
-
-class TestLocalCheckpoints:
-    """Tests for the local checkpoint backend and the S3 mirroring policy."""
-
-    def _s3_run(self, client: mock.MagicMock, name: str) -> extty.run.Run:
-        with mock.patch("boto3.client", return_value=client):
-            return extty.run.Run(
-                "proj",
-                name=name,
-                system_metrics=False,
-                s3_config=S3Config(bucket="b", prefix="pfx"),
-            )
-
-    def test_committed_checkpoint_layout(
-        self, tmp_path: Path, fake_torch: mock.MagicMock
-    ) -> None:
-        """State dicts become model.pt / optimizer.pt plus a meta.json entry."""
-        dest = tmp_path / "ckpt"
-        entry = _save_local(
-            dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
-        )
-
-        assert entry["step"] == 3
-        assert [f["name"] for f in entry["files"]] == ["model.pt", "optimizer.pt"]
-        assert all(f["size_bytes"] > 0 for f in entry["files"])
-        assert json.loads((dest / META_FILE).read_text()) == entry
-        assert sorted(p.name for p in dest.iterdir()) == [
-            "meta.json",
-            "model.pt",
-            "optimizer.pt",
-        ]
-
-    def test_stage_checkpoint_requires_exactly_one_source(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="Exactly one"):
-            stage_checkpoint(tmp_path, 1)
-
-        with pytest.raises(ValueError, match="Exactly one"):
-            stage_checkpoint(tmp_path, 1, path="/a", state_dict={"k": "v"})
-
-    def test_read_local_checkpoint_round_trip(
-        self, tmp_path: Path, fake_torch: mock.MagicMock
-    ) -> None:
-        dest = tmp_path / "ckpt"
-        _save_local(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
-
-        assert read_local_checkpoint(dest) == {
-            "model_state_dict": {"w": 1},
-            "optimizer_state_dict": {"lr": 0.1},
-        }
-        assert read_local_checkpoint(dest, load_optimizer=False) == {
-            "model_state_dict": {"w": 1}
-        }
-
-    def test_read_local_checkpoint_requires_meta_and_needed_files(
-        self, tmp_path: Path, fake_torch: mock.MagicMock
-    ) -> None:
-        """Only a complete copy counts; a missing optimizer matters only if asked for."""
-        dest = tmp_path / "ckpt"
-        assert read_local_checkpoint(dest) is None
-
-        _save_local(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
-        (dest / "optimizer.pt").unlink()
-        assert read_local_checkpoint(dest) is None
-        assert read_local_checkpoint(dest, load_optimizer=False) == {
-            "model_state_dict": {"w": 1}
-        }
-
-        (dest / META_FILE).unlink()
-        assert read_local_checkpoint(dest, load_optimizer=False) is None
-
-    def test_interrupted_rewrite_is_not_read_as_complete(
-        self, tmp_path: Path, fake_torch: mock.MagicMock
-    ) -> None:
-        """Re-saving a step invalidates its meta.json before writing any file."""
-        dest = tmp_path / "ckpt"
-        _save_local(dest, 3, state_dict={"w": 1})
-        fake_torch.save.side_effect = OSError("disk full")
-
-        with pytest.raises(OSError, match="disk full"):
-            _save_local(dest, 3, state_dict={"w": 2})
-
-        assert read_local_checkpoint(dest) is None
-
-    def test_run_saves_and_loads_without_s3(
-        self,
-        extty_home: Path,
-        fake_torch: mock.MagicMock,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """With no S3 configured, checkpoints live in the run dir and round-trip."""
-        with caplog.at_level(logging.INFO, logger="extty"):
-            run = extty.run.Run("proj", name="local-run", system_metrics=False)
-            run.save_checkpoint(
-                5, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1}
-            )
-            loaded = run.load_checkpoint(5)
-            run.finish()
-
-        expected = {"model_state_dict": {"w": 1}, "optimizer_state_dict": {"lr": 0.1}}
-        ckpt_dir = extty_home / "runs" / "proj" / "local-run" / "checkpoints" / "5"
-        assert loaded == expected
-        assert (ckpt_dir / "model.pt").exists()
-        assert f"saved to {ckpt_dir}" in caplog.text
-        run_data = extty.get_run("proj", "local-run", local_only=True)
-        assert [c.step for c in run_data.checkpoints] == [5]
-        assert extty.load_checkpoint_from("proj", "local-run", 5) == expected
-
-    def test_run_load_missing_step_without_s3_raises(
-        self, fake_torch: mock.MagicMock
-    ) -> None:
-        run = extty.run.Run("proj", name="empty-run", system_metrics=False)
-        with pytest.raises(FileNotFoundError, match="step 9"):
-            run.load_checkpoint(9)
-        run.finish()
-
-    def test_s3_upload_success_removes_local_copy(
-        self, extty_home: Path, fake_torch: mock.MagicMock
-    ) -> None:
-        """After a successful upload the local files go; the index entry stays."""
-        client, stored = TestLoadCheckpoint()._make_mock_s3_client()
-        run = self._s3_run(client, "s3-run")
-        run.save_checkpoint(5, state_dict={"w": 1})
-        run.finish()
-
-        run_dir = extty_home / "runs" / "proj" / "s3-run"
-        assert "pfx/runs/proj/s3-run/checkpoints/5/model.pt" in stored
-        assert not (run_dir / "checkpoints" / "5").exists()
-        index = json.loads((run_dir / "checkpoints.json").read_text())
-        assert [e["step"] for e in index] == [5]
-
-    def test_s3_upload_keep_local_loads_without_download(
-        self, fake_torch: mock.MagicMock
-    ) -> None:
-        client, stored = TestLoadCheckpoint()._make_mock_s3_client()
-        run = self._s3_run(client, "kept-run")
-        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
-
-        assert "pfx/runs/proj/kept-run/checkpoints/5/model.pt" in stored
-        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
-        client.download_file.assert_not_called()
-        run.finish()
-
-    def test_checkpoint_pulled_from_s3_reloads_offline(
-        self, fake_torch: mock.MagicMock
-    ) -> None:
-        """A checkpoint downloaded once is reloaded without contacting S3."""
-        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
-        run = self._s3_run(client, "pulled-run")
-        run.save_checkpoint(5, state_dict={"w": 1})
-        run.finish()
-
-        config = S3Config(bucket="b", prefix="pfx")
-        with mock.patch("boto3.client", return_value=client):
-            first = extty.load_checkpoint_from(
-                "proj", "pulled-run", 5, s3_config=config
-            )
-        with mock.patch("boto3.client", side_effect=AssertionError("S3 contacted")):
-            second = extty.load_checkpoint_from(
-                "proj", "pulled-run", 5, s3_config=config
-            )
-
-        assert first == second == {"model_state_dict": {"w": 1}}
-
-    def test_load_checkpoint_from_missing_without_s3_raises(self) -> None:
-        with pytest.raises(FileNotFoundError, match="S3 is not configured"):
-            extty.load_checkpoint_from("proj", "nope", 1)
-
-    def test_delete_local_checkpoint_refuses_only_copy(
-        self, fake_torch: mock.MagicMock
-    ) -> None:
-        run = extty.run.Run("proj", name="only-copy", system_metrics=False)
-        run.save_checkpoint(5, state_dict={"w": 1})
-        run.finish()
-
-        with pytest.raises(RuntimeError, match="only copy"):
-            extty.delete_local_checkpoint("proj", "only-copy", 5)
-        assert extty.load_checkpoint_from("proj", "only-copy", 5) == {
-            "model_state_dict": {"w": 1}
-        }
-
-        assert extty.delete_local_checkpoint("proj", "only-copy", 5, force=True)
-        with pytest.raises(FileNotFoundError):
-            extty.load_checkpoint_from("proj", "only-copy", 5)
-
-    def test_delete_local_checkpoint_when_in_s3(
-        self, extty_home: Path, fake_torch: mock.MagicMock
-    ) -> None:
-        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
-        run = self._s3_run(client, "backed-up")
-        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
-        run.finish()
-
-        config = S3Config(bucket="b", prefix="pfx")
-        with mock.patch("boto3.client", return_value=client):
-            removed = extty.delete_local_checkpoint(
-                "proj", "backed-up", 5, s3_config=config
-            )
-
-        assert removed is True
-        ckpt_dir = extty_home / "runs" / "proj" / "backed-up" / "checkpoints" / "5"
-        assert not ckpt_dir.exists()
-
-    def test_delete_local_checkpoint_refuses_when_s3_unreachable(
-        self, fake_torch: mock.MagicMock
-    ) -> None:
-        """An S3 error while looking for the remote copy refuses the delete."""
-        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
-        run = self._s3_run(client, "offline")
-        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
-        run.finish()
-        client.get_object.side_effect = EndpointConnectionError(
-            endpoint_url="https://s3.example.com"
-        )
-
-        with (
-            mock.patch("boto3.client", return_value=client),
-            pytest.raises(RuntimeError, match="Could not check S3"),
-        ):
-            extty.delete_local_checkpoint(
-                "proj", "offline", 5, s3_config=S3Config(bucket="b", prefix="pfx")
-            )
-
-        assert local_checkpoint_dir("proj", "offline", 5).exists()
-
-    def test_run_and_lookups_share_run_dir(self) -> None:
-        """Where a Run saves must be where lookups by project/name look."""
-        run = extty.run.Run("", name="shared", system_metrics=False)
-        run.finish()
-
-        run_dir = Path(run.run_dir)
-        assert run_dir == get_run_dir("", "shared")
-        assert run_dir == get_runs_dir() / "_default" / "shared"
-        assert local_checkpoint_dir("", "shared", 3) == run_dir / "checkpoints" / "3"
-
-    def test_s3_path_checkpoint_uploads_without_local_copy(
-        self, tmp_path: Path
-    ) -> None:
-        """A saved file goes to S3 from where it is; nothing is copied locally."""
-        client, stored = TestLoadCheckpoint()._make_mock_s3_client()
-        user_file = tmp_path / "ckpt.pt"
-        user_file.write_bytes(b"weights")
-        run = self._s3_run(client, "path-run")
-        run.save_checkpoint(5, path=str(user_file))
-        run.finish()
-
-        uploaded_from = [
-            c.kwargs["Filename"] for c in client.upload_file.call_args_list
-        ]
-        assert uploaded_from == [str(user_file)]
-        key = "pfx/runs/proj/path-run/checkpoints/5/checkpoint.pt"
-        assert stored[key] == b"weights"
-        assert not local_checkpoint_dir("proj", "path-run", 5).exists()
-
-    def test_s3_path_checkpoint_keep_local_copies_file(
-        self, tmp_path: Path, fake_torch: mock.MagicMock
-    ) -> None:
-        """With keep_local, the saved file is copied in, independent of the original."""
-        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
-        user_file = tmp_path / "ckpt.pt"
-        _pickle_save({"model_state_dict": {"w": 1}}, user_file)
-        run = self._s3_run(client, "kept-path")
-        run.save_checkpoint(5, path=str(user_file), keep_local=True)
-        user_file.unlink()
-
-        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
-        client.download_file.assert_not_called()
-        run.finish()
-
-    def test_missing_path_leaves_existing_local_copy_intact(
-        self, fake_torch: mock.MagicMock
-    ) -> None:
-        """A bad path fails before touching the step's existing checkpoint."""
-        run = extty.run.Run("proj", name="typo", system_metrics=False)
-        run.save_checkpoint(5, state_dict={"w": 1})
-
-        with pytest.raises(FileNotFoundError):
-            run.save_checkpoint(5, path="/nonexistent/ckpt.pt")
-
-        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
-        run.finish()
-
-    def test_failed_write_leaves_no_partial_file(
-        self, tmp_path: Path, fake_torch: mock.MagicMock
-    ) -> None:
-        def partial_save(obj: Any, path: Path) -> None:
-            Path(path).write_bytes(b"partial")
-            raise OSError("disk full")
-
-        fake_torch.save.side_effect = partial_save
-        dest = tmp_path / "ckpt"
-
-        with pytest.raises(OSError, match="disk full"):
-            stage_checkpoint(dest, 3, state_dict={"w": 1})
-
-        assert list(dest.iterdir()) == []
-
-    def test_resave_removes_files_from_earlier_save(
-        self, tmp_path: Path, fake_torch: mock.MagicMock
-    ) -> None:
-        dest = tmp_path / "ckpt"
-        _save_local(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
-        _save_local(dest, 3, state_dict={"w": 2})
-
-        assert sorted(p.name for p in dest.iterdir()) == ["meta.json", "model.pt"]
-        assert read_local_checkpoint(dest) == {"model_state_dict": {"w": 2}}
+        run_data = extty.get_run("proj", "run-2", local_only=True)
+        assert [c.step for c in run_data.checkpoints] == [100]
 
     def test_index_write_failure_keeps_local_copy(
         self, fake_torch: mock.MagicMock, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Files in S3 without an index entry don't count as a finished upload."""
-        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
+        client, _ = _mock_s3_client()
         put_object = client.put_object.side_effect
 
         def put_object_except_index(**kwargs: Any) -> None:
@@ -2021,7 +2034,7 @@ class TestLocalCheckpoints:
             put_object(**kwargs)
 
         client.put_object.side_effect = put_object_except_index
-        run = self._s3_run(client, "no-index")
+        run = _s3_run(client, "no-index")
         with caplog.at_level(logging.ERROR, logger="extty"):
             run.save_checkpoint(5, state_dict={"w": 1})
         run.finish()
@@ -2032,9 +2045,11 @@ class TestLocalCheckpoints:
 
     def test_unreadable_remote_index_is_not_overwritten(self, tmp_path: Path) -> None:
         """A failed index read must not rewrite the index with one entry."""
-        client, stored = TestLoadCheckpoint()._make_mock_s3_client()
-        index_key = "pfx/runs/proj/run-1/checkpoints.json"
-        stored[index_key] = json.dumps([{"step": 1, "timestamp": "t", "files": []}])
+        client, stored = _mock_s3_client()
+        index_key = _index_key("run-1")
+        stored[index_key] = json.dumps(
+            [{"step": 1, "timestamp": "t", "files": []}]
+        ).encode()
         get_object = client.get_object.side_effect
 
         def get_object_denying_index(Bucket: str, Key: str) -> Any:
@@ -2046,23 +2061,106 @@ class TestLocalCheckpoints:
             return get_object(Bucket=Bucket, Key=Key)
 
         client.get_object.side_effect = get_object_denying_index
-        storage = TestLoadCheckpoint()._make_storage(client)
+        storage = _s3_storage(client)
         user_file = tmp_path / "ckpt.pt"
         user_file.write_bytes(b"weights")
 
         assert _write_and_upload(storage, step=2, path=str(user_file)) is None
         assert [e["step"] for e in json.loads(stored[index_key])] == [1]
 
-    def test_delete_local_checkpoint_refuses_when_s3_has_different_save(
+    def test_path_checkpoint_uploads_without_local_copy(self, tmp_path: Path) -> None:
+        """A saved file goes to S3 from where it is; nothing is copied locally."""
+        client, stored = _mock_s3_client()
+        user_file = tmp_path / "ckpt.pt"
+        user_file.write_bytes(b"weights")
+        run = _s3_run(client, "path-run")
+        run.save_checkpoint(5, path=str(user_file))
+        run.finish()
+
+        uploaded_from = [
+            c.kwargs["Filename"] for c in client.upload_file.call_args_list
+        ]
+        assert uploaded_from == [str(user_file)]
+        assert _remote_file(stored, "path-run", 5, "checkpoint.pt") == b"weights"
+        assert not local_checkpoint_dir("proj", "path-run", 5).exists()
+
+    def test_path_checkpoint_keep_local_copies_file(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        """With keep_local, the saved file is copied in, independent of the original."""
+        client, _ = _mock_s3_client()
+        user_file = tmp_path / "ckpt.pt"
+        _pickle_save({"model_state_dict": {"w": 1}}, user_file)
+        run = _s3_run(client, "kept-path")
+        run.save_checkpoint(5, path=str(user_file), keep_local=True)
+        user_file.unlink()
+
+        assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
+        client.download_file.assert_not_called()
+        run.finish()
+
+
+class TestDeleteLocalCheckpoint:
+    """delete_local_checkpoint only removes a copy S3 also has."""
+
+    def test_noop_when_absent(self) -> None:
+        assert extty.delete_local_checkpoint("proj", "run-empty", step=42) is False
+
+    def test_refuses_only_copy_without_s3(self, fake_torch: mock.MagicMock) -> None:
+        run = extty.run.Run("proj", name="only-copy", system_metrics=False)
+        run.save_checkpoint(5, state_dict={"w": 1})
+        run.finish()
+
+        with pytest.raises(RuntimeError, match="S3 is not configured"):
+            extty.delete_local_checkpoint("proj", "only-copy", 5)
+        assert extty.load_checkpoint_from("proj", "only-copy", 5) == {
+            "model_state_dict": {"w": 1}
+        }
+
+        assert extty.delete_local_checkpoint("proj", "only-copy", 5, force=True)
+        with pytest.raises(FileNotFoundError):
+            extty.load_checkpoint_from("proj", "only-copy", 5)
+
+    def test_deletes_when_s3_has_same_save(self, fake_torch: mock.MagicMock) -> None:
+        client, _ = _mock_s3_client()
+        run = _s3_run(client, "backed-up")
+        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
+        run.finish()
+
+        with mock.patch("boto3.client", return_value=client):
+            removed = extty.delete_local_checkpoint(
+                "proj", "backed-up", 5, s3_config=_S3_CONFIG
+            )
+
+        assert removed is True
+        assert not local_checkpoint_dir("proj", "backed-up", 5).exists()
+
+    def test_refuses_when_step_not_in_s3(self, fake_torch: mock.MagicMock) -> None:
+        client, _ = _mock_s3_client()
+        client.upload_file.side_effect = BotoCoreError()
+        run = _s3_run(client, "failed-upload")
+        run.save_checkpoint(5, state_dict={"w": 1})
+        run.finish()
+
+        with (
+            mock.patch("boto3.client", return_value=client),
+            pytest.raises(RuntimeError, match="not in S3"),
+        ):
+            extty.delete_local_checkpoint(
+                "proj", "failed-upload", 5, s3_config=_S3_CONFIG
+            )
+        assert local_checkpoint_dir("proj", "failed-upload", 5).exists()
+
+    def test_refuses_when_s3_has_different_save(
         self, fake_torch: mock.MagicMock
     ) -> None:
-        """S3's older save of a step doesn't vouch for a newer local-only one."""
-        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
-        run = self._s3_run(client, "resumed")
+        """S3's save of a step doesn't vouch for a local-only re-save, even one
+        made in the same second with the same file sizes."""
+        client, _ = _mock_s3_client()
+        run = _s3_run(client, "resumed")
         with mock.patch("time.strftime", return_value="2026-09-30T10:00:00+0000"):
             run.save_checkpoint(5, state_dict={"w": 1})
-        client.upload_file.side_effect = BotoCoreError()
-        with mock.patch("time.strftime", return_value="2026-09-30T11:00:00+0000"):
+            client.upload_file.side_effect = BotoCoreError()
             run.save_checkpoint(5, state_dict={"w": 2})
         run.finish()
 
@@ -2070,22 +2168,35 @@ class TestLocalCheckpoints:
             mock.patch("boto3.client", return_value=client),
             pytest.raises(RuntimeError, match="different save"),
         ):
-            extty.delete_local_checkpoint(
-                "proj", "resumed", 5, s3_config=S3Config(bucket="b", prefix="pfx")
-            )
+            extty.delete_local_checkpoint("proj", "resumed", 5, s3_config=_S3_CONFIG)
 
         assert extty.load_checkpoint_from("proj", "resumed", 5) == {
             "model_state_dict": {"w": 2}
         }
 
-    def test_delete_local_checkpoint_allows_cache_without_meta(
-        self, tmp_path: Path
-    ) -> None:
+    def test_refuses_when_s3_unreachable(self, fake_torch: mock.MagicMock) -> None:
+        client, _ = _mock_s3_client()
+        run = _s3_run(client, "offline")
+        run.save_checkpoint(5, state_dict={"w": 1}, keep_local=True)
+        run.finish()
+        client.get_object.side_effect = EndpointConnectionError(
+            endpoint_url="https://s3.example.com"
+        )
+
+        with (
+            mock.patch("boto3.client", return_value=client),
+            pytest.raises(RuntimeError, match="Could not check S3"),
+        ):
+            extty.delete_local_checkpoint("proj", "offline", 5, s3_config=_S3_CONFIG)
+
+        assert local_checkpoint_dir("proj", "offline", 5).exists()
+
+    def test_allows_download_cache_without_meta(self, tmp_path: Path) -> None:
         """Download caches from before meta.json was written locally stay deletable."""
-        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
+        client, _ = _mock_s3_client()
         user_file = tmp_path / "ckpt.pt"
         user_file.write_bytes(b"weights")
-        run = self._s3_run(client, "old-cache")
+        run = _s3_run(client, "old-cache")
         run.save_checkpoint(5, path=str(user_file))
         run.finish()
         cache = local_checkpoint_dir("proj", "old-cache", 5)
@@ -2094,15 +2205,13 @@ class TestLocalCheckpoints:
 
         with mock.patch("boto3.client", return_value=client):
             removed = extty.delete_local_checkpoint(
-                "proj", "old-cache", 5, s3_config=S3Config(bucket="b", prefix="pfx")
+                "proj", "old-cache", 5, s3_config=_S3_CONFIG
             )
 
         assert removed is True
         assert not cache.exists()
 
-    def test_delete_local_checkpoint_refuses_without_boto3(
-        self, fake_torch: mock.MagicMock
-    ) -> None:
+    def test_refuses_without_boto3(self, fake_torch: mock.MagicMock) -> None:
         run = extty.run.Run("proj", name="no-boto", system_metrics=False)
         run.save_checkpoint(5, state_dict={"w": 1})
         run.finish()
@@ -2378,7 +2487,7 @@ class TestS3FailureTolerance:
                 {"Error": {"Code": "NoSuchKey"}}, "GetObject"
             )
 
-        def upload_file(Filename, Bucket, Key, ExtraArgs=None):
+        def upload_file(Filename, Bucket, Key, **kwargs):
             with open(Filename, "rb") as f:
                 stored[Key] = f.read()
 

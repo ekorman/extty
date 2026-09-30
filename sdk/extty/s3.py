@@ -19,10 +19,15 @@ from extty._logger import log as logger
 from extty.chart import Chart
 from extty.checkpoints import (
     META_FILE,
+    adopt_download,
+    checkpoint_dir,
     file_names,
-    local_checkpoint_dir,
+    new_staging_dir,
     read_checkpoint,
+    read_meta,
+    remote_relpath,
     required_files,
+    save_identity,
     write_meta,
 )
 from extty.confusion import ConfusionMatrix
@@ -38,6 +43,7 @@ from extty.storage import (
     SystemMetricPoint,
     dedupe_image_records,
     get_extty_home,
+    get_run_dir,
     parse_chart_jsonl,
     parse_checkpoints_json,
     parse_confusion_jsonl,
@@ -768,20 +774,25 @@ class S3Storage:
             logger.warning("Failed to write run metadata to S3", exc_info=True)
 
     def upload_checkpoint(
-        self, entry: dict[str, Any], sources: Mapping[str, Path]
+        self, meta: dict[str, Any], sources: Mapping[str, Path]
     ) -> bool:
         """
-        Upload a checkpoint prepared by :func:`extty.checkpoints.stage_checkpoint`.
+        Upload a save prepared by :func:`extty.checkpoints.stage_checkpoint`.
+
+        The files go under the save's own prefix, then the step's
+        ``meta.json`` is written to point at them, so a failure part way
+        leaves S3's copy of the step as it was. Files of the save it replaces
+        are removed afterwards.
 
         S3 errors are non-fatal: they are logged as warnings and reported
         through the return value, so the caller can keep the local copy.
 
         Parameters
         ----------
-        entry : dict[str, Any]
-            The index entry returned by ``stage_checkpoint``.
+        meta : dict[str, Any]
+            The save's meta entry.
         sources : Mapping[str, Path]
-            Where each of the checkpoint's files is, keyed by file name.
+            Where each of the save's files is, keyed by file name.
 
         Returns
         -------
@@ -789,19 +800,20 @@ class S3Storage:
             True if the files and ``meta.json`` were uploaded and the index
             was updated.
         """
-        step = entry["step"]
+        step = meta["step"]
         try:
             for name, source in sources.items():
-                self._client.upload_file(
-                    Filename=str(source),
-                    Bucket=self.config.bucket,
-                    Key=self._s3_key("checkpoints", str(step), name),
-                    ExtraArgs={"ContentType": "application/octet-stream"},
+                _upload_with_progress(
+                    self._client,
+                    source,
+                    self.config.bucket,
+                    self._checkpoint_file_key(step, meta, name),
+                    label=f"step {step} / {name}",
                 )
             self._client.put_object(
                 Bucket=self.config.bucket,
                 Key=self._s3_key("checkpoints", str(step), META_FILE),
-                Body=json.dumps(entry, indent=2).encode("utf-8"),
+                Body=json.dumps(meta, indent=2).encode("utf-8"),
                 ContentType="application/json",
             )
         except _S3_ERRORS:
@@ -809,7 +821,37 @@ class S3Storage:
                 "Failed to save checkpoint (step %d) to S3", step, exc_info=True
             )
             return False
-        return self._update_checkpoints_index(entry)
+        self._remove_superseded_saves(meta)
+        return self._update_checkpoints_index(meta)
+
+    def _checkpoint_file_key(self, step: int, meta: dict[str, Any], name: str) -> str:
+        return self._s3_key("checkpoints", str(step), remote_relpath(meta, name))
+
+    def _remove_superseded_saves(self, meta: dict[str, Any]) -> None:
+        """Delete a step's objects that belong to saves other than ``meta``'s."""
+        step_prefix = self._s3_key("checkpoints", str(meta["step"]), "")
+        keep = {step_prefix + META_FILE}
+        keep_prefix = step_prefix + f"{meta['save_id']}/"
+        try:
+            paginator = self._client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(
+                Bucket=self.config.bucket, Prefix=step_prefix
+            ):
+                stale = [
+                    {"Key": obj["Key"]}
+                    for obj in page.get("Contents", [])
+                    if obj["Key"] not in keep and not obj["Key"].startswith(keep_prefix)
+                ]
+                if stale:
+                    self._client.delete_objects(
+                        Bucket=self.config.bucket, Delete={"Objects": stale}
+                    )
+        except _S3_ERRORS:
+            logger.warning(
+                "Failed to remove superseded files of checkpoint step %d",
+                meta["step"],
+                exc_info=True,
+            )
 
     def _update_checkpoints_index(self, entry: dict[str, Any]) -> bool:
         """
@@ -864,7 +906,13 @@ class S3Storage:
         map_location=None,
     ) -> dict[str, Any]:
         """
-        Load a checkpoint, downloading from S3 if not cached locally.
+        Load S3's save of a checkpoint, reusing what is already local.
+
+        A local copy of the same save is used as far as it goes, and any file
+        it lacks is added to it. Otherwise the save is downloaded to a staging
+        directory and becomes the local copy, unless the local copy is a
+        different save, which is left alone. Several processes, such as the
+        ranks of a distributed job, can load the same step at once.
 
         Handles both old format (single ``checkpoint.pt`` containing
         ``model_state_dict`` and ``optimizer_state_dict`` keys) and new
@@ -887,53 +935,77 @@ class S3Storage:
         Raises
         ------
         FileNotFoundError
-            If the checkpoint step does not exist in the index.
+            If S3 has no checkpoint for the step.
         """
         meta = self._checkpoint_meta(step)
-        local_dir = self._local_checkpoint_dir(step)
-        local_dir.mkdir(parents=True, exist_ok=True)
         names = file_names(meta)
+        needed = required_files(names, load_optimizer=load_optimizer)
+        run_dir = get_run_dir(self.project, self.run_name)
+        local_dir = checkpoint_dir(run_dir, step)
+        local_meta = read_meta(local_dir)
+        same_save = local_meta is not None and save_identity(
+            local_meta
+        ) == save_identity(meta)
+        missing = [
+            name for name in needed if not (same_save and (local_dir / name).exists())
+        ]
 
-        for fname in required_files(names, load_optimizer=load_optimizer):
-            local_path = local_dir / fname
-            if local_path.exists():
-                logger.info(
-                    "checkpoint step %d: using cached %s (%s)",
+        staging = new_staging_dir(run_dir)
+        try:
+            self._download_checkpoint_files(step, meta, missing, staging)
+            write_meta(staging, meta)
+            if adopt_download(staging, local_dir, meta):
+                source = local_dir
+            else:
+                logger.warning(
+                    "checkpoint step %d: %s holds a different save than S3; "
+                    "loading S3's without replacing it",
                     step,
-                    fname,
-                    _format_bytes(local_path.stat().st_size),
+                    local_dir,
                 )
-                continue
+                source = staging
+            return read_checkpoint(
+                source, names, load_optimizer=load_optimizer, map_location=map_location
+            )
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _download_checkpoint_files(
+        self, step: int, meta: dict[str, Any], names: list[str], dest: Path
+    ) -> None:
+        """Download ``names`` from ``meta``'s save into the directory ``dest``."""
+        for name in names:
             _download_with_progress(
                 self._client,
                 self.config.bucket,
-                self._s3_key("checkpoints", str(step), fname),
-                local_path,
-                label=f"step {step} / {fname}",
+                self._checkpoint_file_key(step, meta, name),
+                dest / name,
+                label=f"step {step} / {name}",
             )
-        write_meta(local_dir, meta)
-
-        return read_checkpoint(
-            local_dir, names, load_optimizer=load_optimizer, map_location=map_location
-        )
 
     def _checkpoint_meta(self, step: int) -> dict[str, Any]:
-        """Fetch the meta entry for a given checkpoint step.
-
-        Falls back to fetching the per-step meta.json directly if the
-        checkpoint index is missing or outdated (e.g. due to a failed
-        index write).
         """
-        for entry in self.list_checkpoints():
-            if entry.get("step") == step:
-                return entry
+        Fetch S3's meta entry for a checkpoint step.
 
-        meta_key = self._s3_key("checkpoints", str(step), "meta.json")
+        The step's ``meta.json`` is read first: it is written last on every
+        save, so it always describes the save whose files are in S3. The
+        index is only consulted for checkpoints old enough to lack one.
+
+        Raises
+        ------
+        FileNotFoundError
+            If S3 has no checkpoint for the step.
+        """
+        meta_key = self._s3_key("checkpoints", str(step), META_FILE)
         try:
             response = self._client.get_object(Bucket=self.config.bucket, Key=meta_key)
             return json.loads(response["Body"].read().decode("utf-8"))
         except self._client.exceptions.NoSuchKey:
-            raise FileNotFoundError(f"Checkpoint step {step} not found.")
+            pass
+        for entry in self.list_checkpoints():
+            if entry.get("step") == step:
+                return entry
+        raise FileNotFoundError(f"Checkpoint step {step} not found.")
 
     def delete_checkpoint_optimizer(self, step: int) -> None:
         """
@@ -971,7 +1043,7 @@ class S3Storage:
         if not any(is_optimizer(f) for f in files):
             return
 
-        opt_key = self._s3_key("checkpoints", str(step), "optimizer.pt")
+        opt_key = self._checkpoint_file_key(step, meta, "optimizer.pt")
         try:
             self._client.delete_object(Bucket=self.config.bucket, Key=opt_key)
         except _S3_ERRORS:
@@ -1033,10 +1105,6 @@ class S3Storage:
             )
         except Exception:
             pass
-
-    def _local_checkpoint_dir(self, step: int) -> Path:
-        """Local directory for a checkpoint step."""
-        return local_checkpoint_dir(self.project, self.run_name, step)
 
     def find_checkpoint(self, step: int) -> dict[str, Any] | None:
         """

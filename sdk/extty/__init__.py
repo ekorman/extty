@@ -24,7 +24,15 @@ from extty.artifact import (
     save_artifact as _save_artifact_raw,
 )
 from extty.chart import Chart
-from extty.checkpoints import local_checkpoint_dir, read_local_checkpoint
+from extty.checkpoints import (
+    DELETABLE_LOCALLY,
+    CheckpointStatus,
+    LocalCopy,
+    checkpoint_status,
+    local_checkpoint_dir,
+    read_local_checkpoint,
+    read_local_copy,
+)
 from extty.compare import compare, config_diff, plot_metric, reduce_metric
 from extty.confusion import ConfusionMatrix
 from extty.example import BatchExample, Example
@@ -349,10 +357,11 @@ def delete_local_checkpoint(
     """
     Delete a checkpoint's local files, leaving any S3 copy intact.
 
-    The local copy may be the only one (no S3 configured, or its upload
-    failed), so unless ``force`` is set this deletes only when S3 holds the
-    same save of the checkpoint as the local copy. This is the inverse of
-    :func:`load_checkpoint_from`, using the same addressing.
+    The local copy may be the only one (no S3 configured, its upload failed,
+    or S3 has since been given a different save of the step), so unless
+    ``force`` is set this deletes only when S3 holds the same save as the
+    local copy. This is the inverse of :func:`load_checkpoint_from`, using
+    the same addressing.
 
     Parameters
     ----------
@@ -363,7 +372,7 @@ def delete_local_checkpoint(
     step : int
         The training step whose local files should be removed.
     force : bool, default False
-        Delete even if the checkpoint is not in S3.
+        Delete even if S3 does not hold this save of the checkpoint.
     s3_config : S3Config, optional
         S3 configuration. Loaded from environment if not provided.
 
@@ -383,22 +392,30 @@ def delete_local_checkpoint(
     import shutil
 
     local_dir = local_checkpoint_dir(project, run_name, step)
-    if not local_dir.exists():
+    local = read_local_copy(local_dir)
+    if local is None:
         return False
     if not force:
-        _require_remote_copy(project, run_name, step, local_dir, s3_config)
+        _require_remote_copy(project, run_name, step, local, local_dir, s3_config)
     shutil.rmtree(local_dir)
     return True
+
+
+_KEEP_REASONS = {
+    CheckpointStatus.LOCAL_ONLY: "It is not in S3.",
+    CheckpointStatus.UNTRACKED: "It is not in S3.",
+    CheckpointStatus.DIVERGED: "S3 has a different save of this step.",
+}
 
 
 def _require_remote_copy(
     project: str,
     run_name: str,
     step: int,
+    local: LocalCopy,
     local_dir: Path,
     s3_config: S3Config | None,
 ) -> None:
-    from extty.checkpoints import read_meta, same_checkpoint
     from extty.s3 import _S3_ERRORS, S3Storage
 
     refusal = (
@@ -413,11 +430,9 @@ def _require_remote_copy(
         remote = S3Storage(s3_config, project, run_name).find_checkpoint(step)
     except (ImportError, *_S3_ERRORS) as e:
         raise RuntimeError(f"{refusal} (Could not check S3: {e})") from e
-    if remote is None:
-        raise RuntimeError(f"{refusal} (It is not in S3.)")
-    local = read_meta(local_dir)
-    if local is not None and not same_checkpoint(local, remote):
-        raise RuntimeError(f"{refusal} (S3 has a different save of this step.)")
+    status = checkpoint_status(local, remote)
+    if status not in DELETABLE_LOCALLY:
+        raise RuntimeError(f"{refusal} ({_KEEP_REASONS[status]})")
 
 
 def finish() -> None:
