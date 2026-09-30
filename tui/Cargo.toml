@@ -2,6 +2,8 @@
 name = "extty"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/ekorman/extty"
 
 [dependencies]
 ratatui = "0.29"
@@ -30,6 +32,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [package.metadata.release]
 # Skip crates.io publish (set to true when ready to publish)

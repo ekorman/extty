@@ -3,13 +3,43 @@
 Terminal-first ML experiment tracking: a Python SDK for logging runs and a
 Rust TUI for browsing them.
 
-```bash
-pip install extty            # extty[image] for Image logging
-cargo install --path tui     # optional: the `extty` TUI/CLI
-```
-
 The TUI and S3 are both optional. Runs are stored locally, and the Python SDK
 alone can log and read them. Configure S3 to sync runs to a bucket.
+
+## Install
+
+### Python SDK
+
+Requires Python 3.10+.
+
+```bash
+pip install extty            # or: uv add extty
+pip install "extty[image]"   # adds Image logging
+```
+
+### TUI
+
+Prebuilt binaries for macOS, Linux and Windows are attached to each
+[GitHub release](https://github.com/ekorman/extty/releases). On macOS or
+Linux, set `target` to your platform and extract `extty` onto your `PATH`:
+
+```bash
+# aarch64-apple-darwin, x86_64-apple-darwin,
+# x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu
+target=aarch64-apple-darwin
+mkdir -p ~/.local/bin
+curl -LsSf "https://github.com/ekorman/extty/releases/latest/download/extty-$target.tar.xz" \
+  | tar xJ --strip-components=1 -C ~/.local/bin "extty-$target/extty"
+```
+
+On Windows, download `extty-x86_64-pc-windows-msvc.zip` from the release and
+put `extty.exe` on your `PATH`.
+
+To build from source instead:
+
+```bash
+cargo install --locked --git https://github.com/ekorman/extty extty
+```
 
 ## Logging
 
