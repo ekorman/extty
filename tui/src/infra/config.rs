@@ -7,11 +7,7 @@ use serde::Serialize;
 use super::models::{InfraConfig, LocalMachine, Provider, ProviderConfig};
 
 fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("infra")
-        .join("config.toml")
+    crate::paths::extty_home().join("infra").join("config.toml")
 }
 
 pub fn load_config() -> Result<InfraConfig> {

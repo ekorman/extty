@@ -1,0 +1,82 @@
+{
+  "description": "How a checkpoint step's local copy compares with S3. `local` is null (no step directory), \"untracked\" (a step directory without meta.json), or that directory's meta.json. `remote` is null or S3's meta.json for the step. Both extty.checkpoints.checkpoint_status (SDK) and checkpoints::status (TUI) are tested against these cases.",
+  "cases": [
+    {
+      "name": "nothing anywhere",
+      "local": null,
+      "remote": null,
+      "status": null,
+      "deletable": false
+    },
+    {
+      "name": "only in S3",
+      "local": null,
+      "remote": {"step": 5, "save_id": "a", "timestamp": "2026-01-01T00:00:00+0000"},
+      "status": "remote_only",
+      "deletable": false
+    },
+    {
+      "name": "saved without S3 or upload failed",
+      "local": {"step": 5, "save_id": "a", "timestamp": "2026-01-01T00:00:00+0000"},
+      "remote": null,
+      "status": "local_only",
+      "deletable": false
+    },
+    {
+      "name": "same save in both",
+      "local": {"step": 5, "save_id": "a", "timestamp": "2026-01-01T00:00:00+0000"},
+      "remote": {"step": 5, "save_id": "a", "timestamp": "2026-01-01T00:00:00+0000"},
+      "status": "synced",
+      "deletable": true
+    },
+    {
+      "name": "same save, optimizer since removed from S3",
+      "local": {"step": 5, "save_id": "a", "timestamp": "2026-01-01T00:00:00+0000", "files": [{"name": "model.pt", "size_bytes": 1}, {"name": "optimizer.pt", "size_bytes": 1}]},
+      "remote": {"step": 5, "save_id": "a", "timestamp": "2026-01-01T00:00:00+0000", "files": [{"name": "model.pt", "size_bytes": 1}]},
+      "status": "synced",
+      "deletable": true
+    },
+    {
+      "name": "re-saved in the same second with the same sizes",
+      "local": {"step": 5, "save_id": "b", "timestamp": "2026-01-01T00:00:00+0000", "files": [{"name": "model.pt", "size_bytes": 1}]},
+      "remote": {"step": 5, "save_id": "a", "timestamp": "2026-01-01T00:00:00+0000", "files": [{"name": "model.pt", "size_bytes": 1}]},
+      "status": "diverged",
+      "deletable": false
+    },
+    {
+      "name": "re-saved locally over a save from before save IDs",
+      "local": {"step": 5, "save_id": "b", "timestamp": "2026-01-02T00:00:00+0000"},
+      "remote": {"step": 5, "timestamp": "2026-01-01T00:00:00+0000"},
+      "status": "diverged",
+      "deletable": false
+    },
+    {
+      "name": "download of a save from before save IDs",
+      "local": {"step": 5, "timestamp": "2026-01-01T00:00:00+0000"},
+      "remote": {"step": 5, "timestamp": "2026-01-01T00:00:00+0000"},
+      "status": "synced",
+      "deletable": true
+    },
+    {
+      "name": "download from before save IDs, S3 since re-saved",
+      "local": {"step": 5, "timestamp": "2026-01-01T00:00:00+0000"},
+      "remote": {"step": 5, "save_id": "a", "timestamp": "2026-01-02T00:00:00+0000"},
+      "status": "diverged",
+      "deletable": false
+    },
+    {
+      "name": "download cache from before local meta.json existed",
+      "local": "untracked",
+      "remote": {"step": 5, "timestamp": "2026-01-01T00:00:00+0000"},
+      "status": "cached",
+      "deletable": true
+    },
+    {
+      "name": "unknown files, not in S3",
+      "local": "untracked",
+      "remote": null,
+      "status": "untracked",
+      "deletable": false
+    }
+  ]
+}

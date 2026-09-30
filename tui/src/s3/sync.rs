@@ -10,6 +10,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
 use super::config::S3Config;
+use crate::checkpoints::{self, LocalCopy};
 
 /// Maximum number of objects fetched concurrently by [`S3Client::download_run`].
 const DOWNLOAD_CONCURRENCY: usize = 16;
@@ -291,22 +292,7 @@ impl S3Client {
             .await?;
 
         let body = response.body.collect().await?.into_bytes();
-
-        if !force && local_path.exists() {
-            if key.ends_with(".csv") {
-                merge_csv_file(local_path, &body)?;
-            } else if key.ends_with(".jsonl") {
-                merge_jsonl_file(local_path, &body)?;
-            } else if key.ends_with("meta.json") {
-                merge_meta_file(local_path, &body)?;
-            } else {
-                fs::write(local_path, &body)?;
-            }
-        } else {
-            fs::write(local_path, &body)?;
-        }
-
-        Ok(())
+        store_downloaded(key, local_path, &body, force)
     }
 
     pub async fn upload_run(
@@ -329,7 +315,7 @@ impl S3Client {
 
         let prefix = self.s3_prefix(&format!("runs/{}/{}", project, run));
 
-        for entry in walkdir(&run_dir)? {
+        for entry in run_files_to_upload(&run_dir)? {
             let relative_path = entry.strip_prefix(&run_dir)?;
             let s3_key = format!("{}/{}", prefix, relative_path.display());
 
@@ -396,16 +382,17 @@ impl S3Client {
                 let body = response.body.collect().await?.into_bytes();
                 Ok(Some(body.to_vec()))
             }
-            Err(e) => {
-                if e.to_string().contains("NoSuchKey") {
-                    Ok(None)
-                } else {
-                    Err(e.into())
-                }
-            }
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
+    /// Downloads S3's save of a checkpoint into the run's local checkpoint dir.
+    ///
+    /// `files` limits the download to those files, or all of the save's files
+    /// when `None`. They are added to a local copy of the same save; otherwise
+    /// they are downloaded to a staging directory that then replaces the step
+    /// directory whole. A local copy of a different save is never replaced.
     pub async fn download_checkpoint(
         &self,
         project: &str,
@@ -415,63 +402,114 @@ impl S3Client {
         files: Option<&[&str]>,
     ) -> Result<()> {
         let run_dir = dest.join(project).join(run);
-        let run_prefix = self.s3_prefix(&format!("runs/{}/{}/", project, run));
+        let step_dir = run_dir.join("checkpoints").join(step.to_string());
+        let meta = self
+            .remote_checkpoint_meta(project, run, step)
+            .await?
+            .with_context(|| format!("Checkpoint step {} is not in S3", step))?;
+        let names: Vec<String> = match files {
+            Some(list) => list.iter().map(|s| s.to_string()).collect(),
+            None => checkpoints::file_names(&meta),
+        };
 
-        if let Some(file_list) = files {
-            for filename in file_list {
-                let key = self.s3_prefix(&format!(
-                    "runs/{}/{}/checkpoints/{}/{}",
-                    project, run, step, filename
-                ));
-                let relative_path = key.strip_prefix(&run_prefix).unwrap_or(&key);
-                let local_path = run_dir.join(relative_path);
-                if let Some(parent) = local_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                self.download_file(&key, &local_path, true).await?;
+        match checkpoints::read_local_copy(&step_dir) {
+            Some(LocalCopy::Committed(local))
+                if checkpoints::save_identity(&local) == checkpoints::save_identity(&meta) =>
+            {
+                self.download_checkpoint_files(project, run, &meta, &names, &step_dir)
+                    .await
             }
-        } else {
-            let prefix = self.s3_prefix(&format!("runs/{}/{}/checkpoints/{}/", project, run, step));
-            let mut continuation_token: Option<String> = None;
-
-            loop {
-                let mut request = self
-                    .client
-                    .list_objects_v2()
-                    .bucket(&self.config.bucket)
-                    .prefix(&prefix);
-
-                if let Some(token) = continuation_token.take() {
-                    request = request.continuation_token(token);
+            Some(LocalCopy::Committed(_)) => anyhow::bail!(
+                "{} holds a different save of step {} than S3; delete it before downloading",
+                step_dir.display(),
+                step
+            ),
+            _ => {
+                let staging = checkpoints::new_staging_dir(&run_dir)?;
+                let result = async {
+                    self.download_checkpoint_files(project, run, &meta, &names, &staging)
+                        .await?;
+                    fs::write(
+                        staging.join(checkpoints::META_FILE),
+                        serde_json::to_vec_pretty(&meta)?,
+                    )?;
+                    checkpoints::publish(&staging, &step_dir)
                 }
-
-                let response = request.send().await?;
-
-                for object in response.contents() {
-                    if let Some(key) = object.key() {
-                        let relative_path = key.strip_prefix(&run_prefix).unwrap_or(key);
-                        if relative_path.is_empty() {
-                            continue;
-                        }
-
-                        let local_path = run_dir.join(relative_path);
-                        if let Some(parent) = local_path.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-
-                        self.download_file(key, &local_path, true).await?;
-                    }
-                }
-
-                if response.is_truncated() == Some(true) {
-                    continuation_token = response.next_continuation_token().map(|s| s.to_string());
-                } else {
-                    break;
-                }
+                .await;
+                let _ = fs::remove_dir_all(&staging);
+                result
             }
         }
+    }
 
+    /// Downloads each of `names` that `dest` lacks from the save `meta` describes.
+    async fn download_checkpoint_files(
+        &self,
+        project: &str,
+        run: &str,
+        meta: &serde_json::Value,
+        names: &[String],
+        dest: &Path,
+    ) -> Result<()> {
+        let step = meta
+            .get("step")
+            .and_then(|s| s.as_u64())
+            .unwrap_or_default();
+        for name in names {
+            let target = dest.join(name);
+            if target.exists() {
+                continue;
+            }
+            let key = self.s3_prefix(&format!(
+                "runs/{}/{}/checkpoints/{}/{}",
+                project,
+                run,
+                step,
+                checkpoints::remote_relpath(meta, name)
+            ));
+            let body = self
+                .get_object_content(&key)
+                .await?
+                .with_context(|| format!("{} is missing from S3", key))?;
+            let partial = dest.join(format!("{}.part", name));
+            fs::write(&partial, &body)?;
+            fs::rename(&partial, &target)?;
+        }
         Ok(())
+    }
+
+    /// S3's meta entry for a checkpoint step, or `None` if S3 has no such step.
+    ///
+    /// The step's `meta.json` is read first: it is written last on every save,
+    /// so it always describes the save whose files are in S3. The index is only
+    /// consulted for checkpoints old enough to lack one.
+    pub async fn remote_checkpoint_meta(
+        &self,
+        project: &str,
+        run: &str,
+        step: u64,
+    ) -> Result<Option<serde_json::Value>> {
+        let meta_key = self.s3_prefix(&format!(
+            "runs/{}/{}/checkpoints/{}/{}",
+            project,
+            run,
+            step,
+            checkpoints::META_FILE
+        ));
+        if let Some(content) = self.get_object_content(&meta_key).await? {
+            return Ok(Some(
+                serde_json::from_slice(&content).context("Failed to parse checkpoint meta.json")?,
+            ));
+        }
+        let index_key = self.s3_prefix(&format!("runs/{}/{}/checkpoints.json", project, run));
+        let Some(content) = self.get_object_content(&index_key).await? else {
+            return Ok(None);
+        };
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_slice(&content).context("Failed to parse remote checkpoints.json")?;
+        Ok(entries
+            .into_iter()
+            .find(|e| e.get("step").and_then(|s| s.as_u64()) == Some(step)))
     }
 
     pub async fn delete_run(&self, project: &str, run: &str) -> Result<()> {
@@ -604,6 +642,26 @@ fn is_mergeable(key: &str) -> bool {
     key.ends_with(".csv") || key.ends_with(".jsonl") || key.ends_with("meta.json")
 }
 
+/// Write a downloaded object to `local_path`, merging it into an existing local
+/// copy for the file types that accumulate on both sides.
+///
+/// `checkpoints.json` is not merged: locally it is a copy of S3's index, and
+/// checkpoints saved only on this machine are found in `checkpoints/<step>/`.
+fn store_downloaded(key: &str, local_path: &Path, body: &[u8], force: bool) -> Result<()> {
+    if force || !local_path.exists() {
+        fs::write(local_path, body)?;
+    } else if key.ends_with(".csv") {
+        merge_csv_file(local_path, body)?;
+    } else if key.ends_with(".jsonl") {
+        merge_jsonl_file(local_path, body)?;
+    } else if key.ends_with("meta.json") {
+        merge_meta_file(local_path, body)?;
+    } else {
+        fs::write(local_path, body)?;
+    }
+    Ok(())
+}
+
 /// Whether the local copy of `object` can be left alone.
 ///
 /// A file is current when it was written after the remote object was last
@@ -632,6 +690,24 @@ fn local_is_current(local_path: &Path, object: &Object, mergeable: bool) -> bool
         return false;
     }
     mergeable || matches!(object.size(), Some(size) if i64::try_from(metadata.len()) == Ok(size))
+}
+
+/// Files of a local run that a run upload should push.
+///
+/// Checkpoints are excluded: they reach S3 only through the SDK's
+/// `save_checkpoint`, which uploads the files, their `meta.json` and the index
+/// together. Locally, `checkpoints/` can hold multi-GB payloads that were never
+/// meant to be uploaded (and partial `.part` files), and `checkpoints.json` can
+/// list steps that exist only on this machine.
+fn run_files_to_upload(run_dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(walkdir(run_dir)?
+        .into_iter()
+        .filter(|path| {
+            path.strip_prefix(run_dir).is_ok_and(|relative| {
+                !relative.starts_with("checkpoints") && relative != Path::new("checkpoints.json")
+            })
+        })
+        .collect())
 }
 
 fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -983,21 +1059,8 @@ impl S3Client {
             .await?;
         let body = resp.body.collect().await?.into_bytes();
         fs::create_dir_all(run_dir)?;
-        fs::write(&local_path, &body)?;
+        store_downloaded(&key, &local_path, &body, false)?;
         Ok(true)
-    }
-
-    pub async fn list_remote_checkpoint_steps(&self, project: &str, run: &str) -> Result<Vec<u64>> {
-        let index_key = self.s3_prefix(&format!("runs/{}/{}/checkpoints.json", project, run));
-        let Some(content) = self.get_object_content(&index_key).await? else {
-            return Ok(Vec::new());
-        };
-        let entries: Vec<serde_json::Value> =
-            serde_json::from_slice(&content).context("Failed to parse remote checkpoints.json")?;
-        Ok(entries
-            .iter()
-            .filter_map(|e| e.get("step").and_then(|v| v.as_u64()))
-            .collect())
     }
 
     pub async fn delete_checkpoint(&self, project: &str, run: &str, step: u64) -> Result<()> {
@@ -1180,6 +1243,141 @@ mod tests {
             .last_modified(DateTime::from_secs(now - secs_ago))
             .size(size)
             .build()
+    }
+
+    /// Downloads checkpoints written by `scripts/checkpoint_smoke/smoke.py`
+    /// from a live S3 server. Run by `scripts/checkpoint_smoke/run.sh`.
+    #[test]
+    #[ignore]
+    fn smoke_download_checkpoint() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"));
+        let config = S3Config {
+            bucket: var("EXTTY_SMOKE_BUCKET"),
+            prefix: var("EXTTY_SMOKE_PREFIX"),
+            region: Some("us-east-1".to_string()),
+            access_key_id: Some("smoke".to_string()),
+            secret_access_key: Some("smoke-secret".to_string()),
+            endpoint_url: Some(var("EXTTY_SMOKE_ENDPOINT")),
+        };
+        let dest = tempfile::tempdir().unwrap();
+        let step_dir = |run: &str, step: u64| {
+            dest.path()
+                .join("smoke")
+                .join(run)
+                .join("checkpoints")
+                .join(step.to_string())
+        };
+        let names = |dir: &Path| {
+            let mut names: Vec<String> = fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let read_meta = |dir: &Path| -> serde_json::Value {
+            serde_json::from_slice(&fs::read(dir.join("meta.json")).unwrap()).unwrap()
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let client = S3Client::new(config).await.unwrap();
+
+            client
+                .download_checkpoint("smoke", "round-trip", 1, dest.path(), Some(&["model.pt"]))
+                .await
+                .unwrap();
+            let dir = step_dir("round-trip", 1);
+            assert_eq!(names(&dir), ["meta.json", "model.pt"]);
+
+            client
+                .download_checkpoint("smoke", "round-trip", 1, dest.path(), None)
+                .await
+                .unwrap();
+            assert_eq!(names(&dir), ["meta.json", "model.pt", "optimizer.pt"]);
+            let remote = client
+                .remote_checkpoint_meta("smoke", "round-trip", 1)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(remote.get("save_id").is_some());
+            assert_eq!(
+                checkpoints::save_identity(&read_meta(&dir)),
+                checkpoints::save_identity(&remote)
+            );
+
+            client
+                .download_checkpoint("smoke", "old-run", 2, dest.path(), None)
+                .await
+                .unwrap();
+            let legacy = step_dir("old-run", 2);
+            assert_eq!(names(&legacy), ["meta.json", "model.pt", "optimizer.pt"]);
+            assert!(read_meta(&legacy).get("save_id").is_none());
+
+            let missing = client
+                .download_checkpoint("smoke", "round-trip", 999, dest.path(), None)
+                .await
+                .unwrap_err();
+            assert!(missing.to_string().contains("is not in S3"), "{missing}");
+
+            let mut other = read_meta(&dir);
+            other["save_id"] = serde_json::json!("another-save");
+            fs::write(dir.join("meta.json"), other.to_string()).unwrap();
+            let err = client
+                .download_checkpoint("smoke", "round-trip", 1, dest.path(), None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("different save"), "{err}");
+
+            let staging = dest.path().join("smoke/round-trip/checkpoints/.staging");
+            assert!(!staging.exists() || fs::read_dir(&staging).unwrap().next().is_none());
+        });
+    }
+
+    #[test]
+    fn pulled_checkpoint_index_replaces_local_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("checkpoints.json");
+        fs::write(&index, br#"[{"step": 100, "timestamp": "stale"}]"#).unwrap();
+        let remote = br#"[{"step": 100, "timestamp": "remote"}, {"step": 300}]"#;
+
+        store_downloaded("runs/p/r/checkpoints.json", &index, remote, false).unwrap();
+
+        assert_eq!(fs::read(&index).unwrap(), remote);
+    }
+
+    #[test]
+    fn run_upload_skips_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        for file in [
+            "meta.json",
+            "metrics/train/loss.csv",
+            "checkpoints.json",
+            "checkpoints/100/model.pt",
+            "checkpoints/100/model.pt.part",
+            "checkpoints/100/meta.json",
+            "checkpoints_notes.txt",
+        ] {
+            let path = run_dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"x").unwrap();
+        }
+
+        let mut uploaded: Vec<String> = run_files_to_upload(run_dir)
+            .unwrap()
+            .iter()
+            .map(|path| path.strip_prefix(run_dir).unwrap().display().to_string())
+            .collect();
+        uploaded.sort();
+
+        assert_eq!(
+            uploaded,
+            [
+                "checkpoints_notes.txt",
+                "meta.json",
+                "metrics/train/loss.csv"
+            ]
+        );
     }
 
     #[test]

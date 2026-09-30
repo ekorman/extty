@@ -124,6 +124,52 @@ run.images("val/detections")            # [ImageRecord(step, file, width, height
 run.image_bytes(run.images("val/detections")[-1])  # PNG bytes
 ```
 
+## Checkpoints
+
+Checkpoints are saved into the run directory, at
+`<extty home>/runs/<project>/<run>/checkpoints/<step>/`, so they work with no
+S3 configured.
+
+```python
+extty.save_checkpoint(step, state_dict=model.state_dict(), optimizer_state_dict=opt.state_dict())
+extty.save_checkpoint(step, path="ckpt.pt")   # or a file written by torch.save
+
+ckpt = extty.load_checkpoint(step)                              # active run
+ckpt = extty.load_checkpoint_from("my-project", "run-1", step)  # any run
+model.load_state_dict(ckpt["model_state_dict"])
+```
+
+With S3 configured (see below), each checkpoint is uploaded instead, and kept
+locally only if you pass `keep_local=True` or the upload fails (an error is
+logged with the local path), so a flaky bucket never costs you a checkpoint.
+Loads use a complete local copy when there is one and download from S3
+otherwise; a checkpoint downloaded once reloads without contacting S3.
+Checkpoints reach S3 only through `save_checkpoint`: `extty push` does not
+upload them.
+
+Each save of a checkpoint has its own ID. A step's directory is always
+replaced whole, so an interrupted save or download never leaves a mix of two
+saves, and the TUI marks checkpoints whose local copy is not the save S3 has.
+
+`extty.delete_local_checkpoint(project, run, step)` and `extty prune local`
+free disk by deleting local copies of saves that S3 also has. They refuse to
+delete a checkpoint's only copy, including a re-save that S3 has an older
+version of, unless you pass `force=True` to `delete_local_checkpoint`.
+
+## Where data is stored
+
+Everything extty keeps locally (runs, checkpoints, the artifact cache, and the
+S3 config file) lives under `~/.extty`. Set `EXTTY_HOME` to move it, e.g. to
+scratch space on a cluster with a small home quota:
+
+```bash
+export EXTTY_HOME=/scratch/$USER/extty
+```
+
+The Python SDK and the `extty` TUI both honor it, and `extty run` installs the
+S3 config under the remote host's `EXTTY_HOME` (readable only by you). The
+Python SDK makes no network requests unless S3 is configured.
+
 ---
 
 # S3 Sync Usage

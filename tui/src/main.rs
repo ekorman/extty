@@ -36,8 +36,10 @@ const COMPARE_COLORS: [Color; 8] = [
     Color::Rgb(0, 200, 255),
 ];
 
+mod checkpoints;
 mod data;
 mod infra;
+mod paths;
 mod prune;
 mod run;
 mod s3;
@@ -1712,33 +1714,19 @@ impl App {
                 }
             }
 
-            let s3_config_path = dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".extty")
-                .join("s3")
-                .join("config.toml");
-
+            let s3_config_path = s3::config_path();
             if s3_config_path.exists() {
-                let mut scp_cmd = std::process::Command::new("bash");
-                scp_cmd
-                    .arg("-c")
-                    .arg(format!(
-                        "{} 'mkdir -p ~/.extty/s3' && scp -o StrictHostKeyChecking=no {} {} {}@{}:~/.extty/s3/config.toml",
-                        ssh_base,
-                        port.as_ref().map(|p| format!("-P {}", p)).unwrap_or_default(),
-                        s3_config_path.display(),
-                        ssh_user,
-                        host,
-                    ))
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-
-                if let Ok(status) = scp_cmd.status()
-                    && !status.success()
-                {
-                    let _ = tx.send(SetupMessage::Status(
-                        "Warning: failed to copy S3 config".to_string(),
-                    ));
+                let failure = match run::send_s3_config(&ssh_base, &s3_config_path) {
+                    Ok(output) if output.status.success() => None,
+                    Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+                    Err(e) => Some(e.to_string()),
+                };
+                if let Some(reason) = failure {
+                    let _ = tx.send(SetupMessage::Error(format!(
+                        "Failed to copy S3 config, so checkpoints would stay on the instance: {}",
+                        reason
+                    )));
+                    return;
                 }
             }
 
@@ -4719,9 +4707,10 @@ fn run_tui(_options: TuiOptions) -> Result<()> {
 fn run_s3_command(cmd: &str, options: SyncOptions) -> Result<()> {
     let config = s3::load_config()?.ok_or_else(|| {
         anyhow::anyhow!(
-            "S3 not configured. Create ~/.extty/s3/config.toml with:\n\n\
+            "S3 not configured. Create {} with:\n\n\
              bucket = \"your-bucket\"\n\
-             region = \"us-west-2\"\n"
+             region = \"us-west-2\"\n",
+            s3::config_path().display()
         )
     })?;
 
@@ -4847,10 +4836,7 @@ fn parse_target(target: &Option<String>) -> (Option<String>, Option<String>) {
 }
 
 fn runs_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("runs")
+    crate::paths::extty_home().join("runs")
 }
 
 fn list_local_runs(
@@ -7307,6 +7293,21 @@ fn format_size(size: u64) -> String {
     }
 }
 
+/// A label for checkpoints whose local copy is the only copy of its save.
+fn checkpoint_status_tag(status: checkpoints::Status) -> Option<Span<'static>> {
+    match status {
+        checkpoints::Status::LocalOnly => Some(Span::styled(
+            "  local only",
+            Style::default().fg(NEON_YELLOW),
+        )),
+        checkpoints::Status::Diverged => Some(Span::styled(
+            "  local differs from S3",
+            Style::default().fg(NEON_MAGENTA),
+        )),
+        _ => None,
+    }
+}
+
 fn val_metrics_at_step(
     metrics: &HashMap<String, Vec<MetricPoint>>,
     step: u64,
@@ -7369,6 +7370,7 @@ fn render_checkpoints_card(
                 Style::default().fg(NEON_YELLOW).bold(),
             ),
         ];
+        spans.extend(checkpoint_status_tag(ckpt.status));
         if let Some(ts) = ckpt.timestamp {
             spans.push(Span::styled(
                 format!("  {}", ts.format("%Y-%m-%d %H:%M")),
@@ -8082,6 +8084,7 @@ fn render_focused_checkpoints(
                 Style::default().fg(NEON_YELLOW).bold(),
             ),
         ];
+        spans.extend(checkpoint_status_tag(ckpt.status));
         if let Some(ts) = ckpt.timestamp {
             spans.push(Span::styled(
                 format!("  {}", ts.format("%Y-%m-%d %H:%M")),
@@ -11308,7 +11311,10 @@ fn render_s3_config(app: &App, frame: &mut Frame) {
         Span::styled(" ◆ ", Style::default().fg(NEON_MAGENTA)),
         Span::styled("S3 Configuration", Style::default().fg(NEON_CYAN).bold()),
         Span::styled(" (", Style::default().fg(Color::DarkGray)),
-        Span::styled("~/.extty/s3/config.toml", Style::default().fg(Color::Gray)),
+        Span::styled(
+            s3::config_path().display().to_string(),
+            Style::default().fg(Color::Gray),
+        ),
         Span::styled(")", Style::default().fg(Color::DarkGray)),
     ]);
 

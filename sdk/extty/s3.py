@@ -9,6 +9,7 @@ import shutil
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,19 @@ from typing import Any
 from extty._logger import _DIM_CYAN, _NEON_CYAN, _NEON_GREEN, _RESET, _supports_color
 from extty._logger import log as logger
 from extty.chart import Chart
+from extty.checkpoints import (
+    META_FILE,
+    adopt_download,
+    checkpoint_dir,
+    file_names,
+    new_staging_dir,
+    read_checkpoint,
+    read_meta,
+    remote_relpath,
+    required_files,
+    save_identity,
+    write_meta,
+)
 from extty.confusion import ConfusionMatrix
 from extty.image import Image
 from extty.storage import (
@@ -28,6 +42,8 @@ from extty.storage import (
     MetricPoint,
     SystemMetricPoint,
     dedupe_image_records,
+    get_extty_home,
+    get_run_dir,
     parse_chart_jsonl,
     parse_checkpoints_json,
     parse_confusion_jsonl,
@@ -223,9 +239,10 @@ class _TransferProgress:
 
 
 try:
+    from boto3.exceptions import Boto3Error
     from botocore.exceptions import BotoCoreError, ClientError
 
-    _S3_ERRORS: tuple[type[Exception], ...] = (BotoCoreError, ClientError)
+    _S3_ERRORS: tuple[type[Exception], ...] = (BotoCoreError, ClientError, Boto3Error)
 except ImportError:
     _S3_ERRORS = ()
 
@@ -246,7 +263,7 @@ class S3Config:
         """
         Create S3Config from environment variables first then falls back to config file.
 
-        Checks environment variables first, then ~/.extty/s3/config.toml.
+        Checks environment variables first, then ``<extty home>/s3/config.toml``.
 
         Returns
         -------
@@ -269,16 +286,14 @@ class S3Config:
     @classmethod
     def from_file(cls) -> S3Config | None:
         """
-        Load S3Config from ~/.extty/s3/config.toml.
+        Load S3Config from ``<extty home>/s3/config.toml``.
 
         Returns
         -------
         S3Config or None
             Configuration if file exists and has a bucket, None otherwise.
         """
-        from pathlib import Path
-
-        config_path = Path.home() / ".extty" / "s3" / "config.toml"
+        config_path = get_extty_home() / "s3" / "config.toml"
         if not config_path.exists():
             return None
 
@@ -758,150 +773,111 @@ class S3Storage:
         except _S3_ERRORS:
             logger.warning("Failed to write run metadata to S3", exc_info=True)
 
-    def save_checkpoint(
-        self,
-        step: int,
-        path: str | None = None,
-        state_dict: Any = None,
-        optimizer_state_dict: Any = None,
-    ) -> dict[str, Any] | None:
+    def upload_checkpoint(
+        self, meta: dict[str, Any], sources: Mapping[str, Path]
+    ) -> bool:
         """
-        Save a checkpoint to S3.
+        Upload a save prepared by :func:`extty.checkpoints.stage_checkpoint`.
 
-        S3 upload errors are non-fatal: failures are logged as warnings
-        and the method returns without raising. The checkpoint may not
-        be persisted remotely in that case.
+        The files go under the save's own prefix, then the step's
+        ``meta.json`` is written to point at them, so a failure part way
+        leaves S3's copy of the step as it was. Files of the save it replaces
+        are removed afterwards.
+
+        S3 errors are non-fatal: they are logged as warnings and reported
+        through the return value, so the caller can keep the local copy.
 
         Parameters
         ----------
-        step : int
-            The training step for this checkpoint.
-        path : str or None
-            Path to a local file to upload directly.
-        state_dict : Any or None
-            Model state dict to serialize with torch.save.
-        optimizer_state_dict : Any or None
-            Optimizer state dict to include when using state_dict.
+        meta : dict[str, Any]
+            The save's meta entry.
+        sources : Mapping[str, Path]
+            Where each of the save's files is, keyed by file name.
 
         Returns
         -------
-        dict[str, Any] or None
-            The ``checkpoints.json`` index entry (``step``, ``timestamp``,
-            ``files``) written to S3, or None if the save failed.
-
-        Raises
-        ------
-        ValueError
-            If neither or both of path and state_dict are provided.
+        bool
+            True if the files and ``meta.json`` were uploaded and the index
+            was updated.
         """
-        if (path is None) == (state_dict is None):
-            raise ValueError("Exactly one of `path` or `state_dict` must be provided.")
-
-        import tempfile
-
+        step = meta["step"]
         try:
-            if path is not None:
-                file_size = os.path.getsize(path)
-                checkpoint_key = self._s3_key("checkpoints", str(step), "checkpoint.pt")
-                self._client.upload_file(
-                    Filename=path,
-                    Bucket=self.config.bucket,
-                    Key=checkpoint_key,
-                    ExtraArgs={"ContentType": "application/octet-stream"},
+            for name, source in sources.items():
+                _upload_with_progress(
+                    self._client,
+                    source,
+                    self.config.bucket,
+                    self._checkpoint_file_key(step, meta, name),
+                    label=f"step {step} / {name}",
                 )
-
-                timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-                meta_entry: dict[str, Any] = {
-                    "step": step,
-                    "timestamp": timestamp,
-                    "files": [{"name": "checkpoint.pt", "size_bytes": file_size}],
-                }
-
-                meta_key = self._s3_key("checkpoints", str(step), "meta.json")
-                self._client.put_object(
-                    Bucket=self.config.bucket,
-                    Key=meta_key,
-                    Body=json.dumps(meta_entry, indent=2).encode("utf-8"),
-                    ContentType="application/json",
-                )
-                self._update_checkpoints_index(meta_entry)
-                return meta_entry
-            else:
-                import torch
-
-                timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-                files_meta: list[dict[str, Any]] = []
-                tmp_files: list[str] = []
-
-                try:
-                    model_tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
-                    tmp_files.append(model_tmp.name)
-                    torch.save(state_dict, model_tmp.name)
-                    model_tmp.close()
-
-                    model_size = os.path.getsize(model_tmp.name)
-                    self._client.upload_file(
-                        Filename=model_tmp.name,
-                        Bucket=self.config.bucket,
-                        Key=self._s3_key("checkpoints", str(step), "model.pt"),
-                        ExtraArgs={"ContentType": "application/octet-stream"},
-                    )
-                    files_meta.append({"name": "model.pt", "size_bytes": model_size})
-
-                    if optimizer_state_dict is not None:
-                        opt_tmp = tempfile.NamedTemporaryFile(
-                            suffix=".pt", delete=False
-                        )
-                        tmp_files.append(opt_tmp.name)
-                        torch.save(optimizer_state_dict, opt_tmp.name)
-                        opt_tmp.close()
-
-                        opt_size = os.path.getsize(opt_tmp.name)
-                        self._client.upload_file(
-                            Filename=opt_tmp.name,
-                            Bucket=self.config.bucket,
-                            Key=self._s3_key("checkpoints", str(step), "optimizer.pt"),
-                            ExtraArgs={"ContentType": "application/octet-stream"},
-                        )
-                        files_meta.append(
-                            {"name": "optimizer.pt", "size_bytes": opt_size}
-                        )
-
-                    meta_entry = {
-                        "step": step,
-                        "timestamp": timestamp,
-                        "files": files_meta,
-                    }
-
-                    meta_key = self._s3_key("checkpoints", str(step), "meta.json")
-                    self._client.put_object(
-                        Bucket=self.config.bucket,
-                        Key=meta_key,
-                        Body=json.dumps(meta_entry, indent=2).encode("utf-8"),
-                        ContentType="application/json",
-                    )
-                    self._update_checkpoints_index(meta_entry)
-                    return meta_entry
-                finally:
-                    for f in tmp_files:
-                        os.unlink(f)
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=self._s3_key("checkpoints", str(step), META_FILE),
+                Body=json.dumps(meta, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
         except _S3_ERRORS:
             logger.warning(
                 "Failed to save checkpoint (step %d) to S3", step, exc_info=True
             )
-            return None
+            return False
+        self._remove_superseded_saves(meta)
+        return self._update_checkpoints_index(meta)
 
-    def _update_checkpoints_index(self, entry: dict[str, Any]) -> None:
+    def _checkpoint_file_key(self, step: int, meta: dict[str, Any], name: str) -> str:
+        return self._s3_key("checkpoints", str(step), remote_relpath(meta, name))
+
+    def _remove_superseded_saves(self, meta: dict[str, Any]) -> None:
+        """Delete a step's objects that belong to saves other than ``meta``'s."""
+        step_prefix = self._s3_key("checkpoints", str(meta["step"]), "")
+        keep = {step_prefix + META_FILE}
+        keep_prefix = step_prefix + f"{meta['save_id']}/"
+        try:
+            paginator = self._client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(
+                Bucket=self.config.bucket, Prefix=step_prefix
+            ):
+                stale = [
+                    {"Key": obj["Key"]}
+                    for obj in page.get("Contents", [])
+                    if obj["Key"] not in keep and not obj["Key"].startswith(keep_prefix)
+                ]
+                if stale:
+                    self._client.delete_objects(
+                        Bucket=self.config.bucket, Delete={"Objects": stale}
+                    )
+        except _S3_ERRORS:
+            logger.warning(
+                "Failed to remove superseded files of checkpoint step %d",
+                meta["step"],
+                exc_info=True,
+            )
+
+    def _update_checkpoints_index(self, entry: dict[str, Any]) -> bool:
+        """
+        Merge ``entry`` into the run's ``checkpoints.json`` in S3.
+
+        A missing or corrupt index starts empty, but one that can't be read
+        is left alone: rewriting it with only ``entry`` would drop every other
+        step.
+
+        Returns
+        -------
+        bool
+            True if the index was written.
+        """
         index_key = self._s3_key("checkpoints.json")
         existing: list[dict[str, Any]] = []
         try:
             response = self._client.get_object(Bucket=self.config.bucket, Key=index_key)
-            content = response["Body"].read().decode("utf-8")
-            existing = json.loads(content)
+            existing = json.loads(response["Body"].read().decode("utf-8"))
         except self._client.exceptions.NoSuchKey:
             pass
-        except Exception:
-            pass
+        except json.JSONDecodeError:
+            logger.warning("Rebuilding unreadable checkpoints index in S3")
+        except _S3_ERRORS:
+            logger.warning("Failed to read checkpoints index from S3", exc_info=True)
+            return False
 
         existing_steps = {e["step"] for e in existing}
         if entry["step"] not in existing_steps:
@@ -920,6 +896,8 @@ class S3Storage:
             )
         except _S3_ERRORS:
             logger.warning("Failed to update checkpoints index in S3", exc_info=True)
+            return False
+        return True
 
     def load_checkpoint(
         self,
@@ -928,7 +906,13 @@ class S3Storage:
         map_location=None,
     ) -> dict[str, Any]:
         """
-        Load a checkpoint, downloading from S3 if not cached locally.
+        Load S3's save of a checkpoint, reusing what is already local.
+
+        A local copy of the same save is used as far as it goes, and any file
+        it lacks is added to it. Otherwise the save is downloaded to a staging
+        directory and becomes the local copy, unless the local copy is a
+        different save, which is left alone. Several processes, such as the
+        ranks of a distributed job, can load the same step at once.
 
         Handles both old format (single ``checkpoint.pt`` containing
         ``model_state_dict`` and ``optimizer_state_dict`` keys) and new
@@ -951,97 +935,77 @@ class S3Storage:
         Raises
         ------
         FileNotFoundError
-            If the checkpoint step does not exist in the index.
+            If S3 has no checkpoint for the step.
         """
         meta = self._checkpoint_meta(step)
+        names = file_names(meta)
+        needed = required_files(names, load_optimizer=load_optimizer)
+        run_dir = get_run_dir(self.project, self.run_name)
+        local_dir = checkpoint_dir(run_dir, step)
+        local_meta = read_meta(local_dir)
+        same_save = local_meta is not None and save_identity(
+            local_meta
+        ) == save_identity(meta)
+        missing = [
+            name for name in needed if not (same_save and (local_dir / name).exists())
+        ]
 
-        import torch
-
-        map_location = map_location or torch.device("cpu")
-
-        local_dir = self._local_checkpoint_dir(step)
-        local_dir.mkdir(parents=True, exist_ok=True)
-        files_raw = meta.get("files", [])
-
-        file_names: list[str] = []
-        for entry in files_raw:
-            if isinstance(entry, str):
-                file_names.append(entry)
-            elif isinstance(entry, dict):
-                file_names.append(entry["name"])
-
-        if not file_names:
-            file_names = ["checkpoint.pt"]
-
-        for fname in file_names:
-            if not load_optimizer and fname == "optimizer.pt":
-                continue
-            local_path = local_dir / fname
-            if local_path.exists():
-                logger.info(
-                    "checkpoint step %d: using cached %s (%s)",
+        staging = new_staging_dir(run_dir)
+        try:
+            self._download_checkpoint_files(step, meta, missing, staging)
+            write_meta(staging, meta)
+            if adopt_download(staging, local_dir, meta):
+                source = local_dir
+            else:
+                logger.warning(
+                    "checkpoint step %d: %s holds a different save than S3; "
+                    "loading S3's without replacing it",
                     step,
-                    fname,
-                    _format_bytes(local_path.stat().st_size),
+                    local_dir,
                 )
-                continue
-            s3_key = self._s3_key("checkpoints", str(step), fname)
+                source = staging
+            return read_checkpoint(
+                source, names, load_optimizer=load_optimizer, map_location=map_location
+            )
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _download_checkpoint_files(
+        self, step: int, meta: dict[str, Any], names: list[str], dest: Path
+    ) -> None:
+        """Download ``names`` from ``meta``'s save into the directory ``dest``."""
+        for name in names:
             _download_with_progress(
                 self._client,
                 self.config.bucket,
-                s3_key,
-                local_path,
-                label=f"step {step} / {fname}",
+                self._checkpoint_file_key(step, meta, name),
+                dest / name,
+                label=f"step {step} / {name}",
             )
-
-        is_legacy = file_names == ["checkpoint.pt"]
-        if is_legacy:
-            data = torch.load(
-                local_dir / "checkpoint.pt",
-                weights_only=False,
-                map_location=map_location,
-            )
-            result: dict[str, Any] = {
-                "model_state_dict": data.get("model_state_dict", data)
-            }
-            if load_optimizer and "optimizer_state_dict" in data:
-                result["optimizer_state_dict"] = data["optimizer_state_dict"]
-            return result
-
-        result = {
-            "model_state_dict": torch.load(
-                local_dir / "model.pt", weights_only=False, map_location=map_location
-            )
-        }
-        if (
-            load_optimizer
-            and "optimizer.pt" in file_names
-            and (local_dir / "optimizer.pt").exists()
-        ):
-            result["optimizer_state_dict"] = torch.load(
-                local_dir / "optimizer.pt",
-                weights_only=False,
-                map_location=map_location,
-            )
-        return result
 
     def _checkpoint_meta(self, step: int) -> dict[str, Any]:
-        """Fetch the meta entry for a given checkpoint step.
-
-        Falls back to fetching the per-step meta.json directly if the
-        checkpoint index is missing or outdated (e.g. due to a failed
-        index write).
         """
-        for entry in self.list_checkpoints():
-            if entry.get("step") == step:
-                return entry
+        Fetch S3's meta entry for a checkpoint step.
 
-        meta_key = self._s3_key("checkpoints", str(step), "meta.json")
+        The step's ``meta.json`` is read first: it is written last on every
+        save, so it always describes the save whose files are in S3. The
+        index is only consulted for checkpoints old enough to lack one.
+
+        Raises
+        ------
+        FileNotFoundError
+            If S3 has no checkpoint for the step.
+        """
+        meta_key = self._s3_key("checkpoints", str(step), META_FILE)
         try:
             response = self._client.get_object(Bucket=self.config.bucket, Key=meta_key)
             return json.loads(response["Body"].read().decode("utf-8"))
         except self._client.exceptions.NoSuchKey:
-            raise FileNotFoundError(f"Checkpoint step {step} not found.")
+            pass
+        for entry in self.list_checkpoints():
+            if entry.get("step") == step:
+                return entry
+        raise FileNotFoundError(f"Checkpoint step {step} not found.")
 
     def delete_checkpoint_optimizer(self, step: int) -> None:
         """
@@ -1079,7 +1043,7 @@ class S3Storage:
         if not any(is_optimizer(f) for f in files):
             return
 
-        opt_key = self._s3_key("checkpoints", str(step), "optimizer.pt")
+        opt_key = self._checkpoint_file_key(step, meta, "optimizer.pt")
         try:
             self._client.delete_object(Bucket=self.config.bucket, Key=opt_key)
         except _S3_ERRORS:
@@ -1142,12 +1106,25 @@ class S3Storage:
         except Exception:
             pass
 
-    def _local_checkpoint_dir(self, step: int) -> Path:
-        """Local cache directory for a checkpoint step."""
-        from extty.storage import get_runs_dir
+    def find_checkpoint(self, step: int) -> dict[str, Any] | None:
+        """
+        Look up the checkpoint for ``step`` in S3.
 
-        project_dir = self.project if self.project else "_default"
-        return get_runs_dir() / project_dir / self.run_name / "checkpoints" / str(step)
+        Parameters
+        ----------
+        step : int
+            The training step to look up.
+
+        Returns
+        -------
+        dict[str, Any] or None
+            The checkpoint's entry from the index or its ``meta.json``, or
+            None if S3 has no checkpoint for ``step``.
+        """
+        try:
+            return self._checkpoint_meta(step)
+        except FileNotFoundError:
+            return None
 
     def list_checkpoints(self) -> list[dict[str, Any]]:
         """

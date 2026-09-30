@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from extty._logger import log as logger
 from extty._sink import StorageSink
 from extty.artifact import ArtifactMeta
 from extty.artifact import save_artifact as _save_artifact
 from extty.async_sink import AsyncSink
 from extty.chart import Chart
+from extty.checkpoints import (
+    checkpoint_dir,
+    commit_checkpoint,
+    discard_staged,
+    read_local_checkpoint,
+    stage_checkpoint,
+)
 from extty.confusion import ConfusionMatrix
 from extty.image import Image
 from extty.s3 import S3Config, S3Storage
@@ -21,7 +30,7 @@ from extty.storage import (
     MetaData,
     RunStorage,
     generate_random_name,
-    get_runs_dir,
+    get_run_dir,
 )
 from extty.system_monitor import SystemMonitor
 
@@ -195,8 +204,7 @@ class Run:
         if s3_config is not None:
             self._s3_storage = S3Storage(s3_config, project, self.name)
 
-        project_dir = project if project else "_default"
-        run_dir = get_runs_dir() / project_dir / self.name
+        run_dir = get_run_dir(project, self.name)
         local_storage = RunStorage(run_dir=run_dir)
         self._local_storage = local_storage
         self._meta = MetaData(
@@ -276,44 +284,69 @@ class Run:
         path: str | None = None,
         state_dict: Any = None,
         optimizer_state_dict: Any = None,
+        keep_local: bool = False,
     ) -> None:
         """
-        Save a checkpoint to S3.
+        Save a checkpoint to the run directory, or to S3 when configured.
+
+        Without S3, the checkpoint is saved to
+        ``<run dir>/checkpoints/<step>/``. With S3 it is uploaded, and also
+        kept in the run directory if ``keep_local`` is set or the upload
+        fails. A ``path`` is uploaded from where it is, not copied first.
+        Saving a step again replaces its earlier local copy, and the run
+        directory never holds a partly written save.
 
         Parameters
         ----------
         step : int
             The training step for this checkpoint.
         path : str or None
-            Path to a local file to upload directly.
+            Path to an existing checkpoint file to save.
         state_dict : Any or None
             Model state dict to serialize with torch.save.
         optimizer_state_dict : Any or None
             Optimizer state dict to include when using state_dict.
+        keep_local : bool, default False
+            Keep the local copy after a successful S3 upload.
 
         Raises
         ------
         RuntimeError
-            If no S3 storage is configured or the run is finished.
+            If the run is finished.
         """
         with self._lock:
             if self._finished:
                 raise RuntimeError("Cannot save checkpoint on a finished run.")
-        if self._s3_storage is None:
-            raise RuntimeError(
-                "S3 storage is not configured. "
-                "Set EXTTY_S3_BUCKET or provide s3_config to save checkpoints."
-            )
-        entry = self._s3_storage.save_checkpoint(
+        run_dir = self._local_storage.run_dir
+        local_dir = checkpoint_dir(run_dir, step)
+        staged = stage_checkpoint(
+            run_dir,
             step,
             path=path,
             state_dict=state_dict,
             optimizer_state_dict=optimizer_state_dict,
         )
-        # Mirror the entry into the local run dir's checkpoints.json so readers
-        # that prefer local storage (get_run) see the same index as S3.
-        if entry is not None:
-            self._local_storage.record_checkpoint(entry)
+        try:
+            uploaded = (
+                self._s3_storage is not None
+                and self._s3_storage.upload_checkpoint(staged.meta, staged.sources)
+            )
+            if uploaded and not keep_local:
+                shutil.rmtree(local_dir, ignore_errors=True)
+            else:
+                commit_checkpoint(run_dir, staged)
+        finally:
+            discard_staged(staged)
+        if uploaded:
+            self._local_storage.record_checkpoint(staged.meta)
+        if self._s3_storage is None:
+            logger.info("checkpoint step %d: saved to %s", step, local_dir)
+        elif not uploaded:
+            logger.error(
+                "checkpoint step %d: S3 upload failed, local copy kept at %s",
+                step,
+                local_dir,
+            )
 
     def load_checkpoint(
         self,
@@ -321,7 +354,7 @@ class Run:
         load_optimizer: bool = True,
     ) -> dict[str, Any]:
         """
-        Load a checkpoint, downloading from S3 if not cached locally.
+        Load a checkpoint from the run directory, falling back to S3.
 
         Parameters
         ----------
@@ -338,15 +371,17 @@ class Run:
 
         Raises
         ------
-        RuntimeError
-            If no S3 storage is configured.
         FileNotFoundError
-            If the checkpoint step does not exist.
+            If the checkpoint is neither in the run directory nor in S3.
         """
+        local_dir = checkpoint_dir(self._local_storage.run_dir, step)
+        local = read_local_checkpoint(local_dir, load_optimizer=load_optimizer)
+        if local is not None:
+            return local
         if self._s3_storage is None:
-            raise RuntimeError(
-                "S3 storage is not configured. "
-                "Set EXTTY_S3_BUCKET or provide s3_config to load checkpoints."
+            raise FileNotFoundError(
+                f"Checkpoint step {step} not found in {local_dir} "
+                "and S3 is not configured."
             )
         return self._s3_storage.load_checkpoint(step, load_optimizer=load_optimizer)
 
@@ -465,6 +500,7 @@ class NoOpRun(Run):
         path: str | None = None,
         state_dict: Any = None,
         optimizer_state_dict: Any = None,
+        keep_local: bool = False,
     ) -> None:
         pass
 

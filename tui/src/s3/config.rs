@@ -23,12 +23,8 @@ fn default_prefix() -> String {
     String::new()
 }
 
-fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".extty")
-        .join("s3")
-        .join("config.toml")
+pub fn config_path() -> PathBuf {
+    crate::paths::extty_home().join("s3").join("config.toml")
 }
 
 pub fn load_config() -> Result<Option<S3Config>> {
