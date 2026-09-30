@@ -1,21 +1,13 @@
-name: Tests
+name: Tests (Rust)
 
 on:
   push:
+    paths:
+      - "tui/**"
+      - "spec/**"
+      - ".github/workflows/test-rust.yml"
 
 jobs:
-  test-python:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - run: uv python install 3.12
-      - run: uv sync --dev
-      - run: uv run pytest tests
-
   test-rust:
     runs-on: ubuntu-latest
     defaults:
