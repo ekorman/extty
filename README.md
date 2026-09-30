@@ -35,9 +35,6 @@ curl -LsSf "https://github.com/ekorman/extty/releases/latest/download/extty-$tar
 On Windows, download `extty-x86_64-pc-windows-msvc.zip` from the release and
 put `extty.exe` on your `PATH`.
 
-If you download through a browser on macOS, clear the quarantine flag before
-running it: `xattr -d com.apple.quarantine extty`.
-
 To build from source instead:
 
 ```bash
