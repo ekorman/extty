@@ -161,8 +161,9 @@ scratch space on a cluster with a small home quota:
 export EXTTY_HOME=/scratch/$USER/extty
 ```
 
-The Python SDK and the `extty` TUI both honor it. The Python SDK makes no
-network requests unless S3 is configured.
+The Python SDK and the `extty` TUI both honor it, and `extty run` installs the
+S3 config under the remote host's `EXTTY_HOME` (readable only by you). The
+Python SDK makes no network requests unless S3 is configured.
 
 ---
 

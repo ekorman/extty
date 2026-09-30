@@ -15,7 +15,7 @@ from unittest import mock
 
 import pytest
 from boto3.exceptions import S3UploadFailedError
-from botocore.exceptions import BotoCoreError, EndpointConnectionError
+from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 
 import extty
 from extty.checkpoints import (
@@ -1982,6 +1982,143 @@ class TestLocalCheckpoints:
 
         assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
         run.finish()
+
+    def test_failed_write_leaves_no_partial_file(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        def partial_save(obj: Any, path: Path) -> None:
+            Path(path).write_bytes(b"partial")
+            raise OSError("disk full")
+
+        fake_torch.save.side_effect = partial_save
+        dest = tmp_path / "ckpt"
+
+        with pytest.raises(OSError, match="disk full"):
+            stage_checkpoint(dest, 3, state_dict={"w": 1})
+
+        assert list(dest.iterdir()) == []
+
+    def test_resave_removes_files_from_earlier_save(
+        self, tmp_path: Path, fake_torch: mock.MagicMock
+    ) -> None:
+        dest = tmp_path / "ckpt"
+        _save_local(dest, 3, state_dict={"w": 1}, optimizer_state_dict={"lr": 0.1})
+        _save_local(dest, 3, state_dict={"w": 2})
+
+        assert sorted(p.name for p in dest.iterdir()) == ["meta.json", "model.pt"]
+        assert read_local_checkpoint(dest) == {"model_state_dict": {"w": 2}}
+
+    def test_index_write_failure_keeps_local_copy(
+        self, fake_torch: mock.MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Files in S3 without an index entry don't count as a finished upload."""
+        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
+        put_object = client.put_object.side_effect
+
+        def put_object_except_index(**kwargs: Any) -> None:
+            if kwargs["Key"].endswith("/checkpoints.json"):
+                raise BotoCoreError()
+            put_object(**kwargs)
+
+        client.put_object.side_effect = put_object_except_index
+        run = self._s3_run(client, "no-index")
+        with caplog.at_level(logging.ERROR, logger="extty"):
+            run.save_checkpoint(5, state_dict={"w": 1})
+        run.finish()
+
+        local = read_local_checkpoint(local_checkpoint_dir("proj", "no-index", 5))
+        assert local == {"model_state_dict": {"w": 1}}
+        assert "local copy kept at" in caplog.text
+
+    def test_unreadable_remote_index_is_not_overwritten(self, tmp_path: Path) -> None:
+        """A failed index read must not rewrite the index with one entry."""
+        client, stored = TestLoadCheckpoint()._make_mock_s3_client()
+        index_key = "pfx/runs/proj/run-1/checkpoints.json"
+        stored[index_key] = json.dumps([{"step": 1, "timestamp": "t", "files": []}])
+        get_object = client.get_object.side_effect
+
+        def get_object_denying_index(Bucket: str, Key: str) -> Any:
+            if Key == index_key:
+                raise ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+                    "GetObject",
+                )
+            return get_object(Bucket=Bucket, Key=Key)
+
+        client.get_object.side_effect = get_object_denying_index
+        storage = TestLoadCheckpoint()._make_storage(client)
+        user_file = tmp_path / "ckpt.pt"
+        user_file.write_bytes(b"weights")
+
+        assert _write_and_upload(storage, step=2, path=str(user_file)) is None
+        assert [e["step"] for e in json.loads(stored[index_key])] == [1]
+
+    def test_delete_local_checkpoint_refuses_when_s3_has_different_save(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """S3's older save of a step doesn't vouch for a newer local-only one."""
+        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
+        run = self._s3_run(client, "resumed")
+        with mock.patch("time.strftime", return_value="2026-09-30T10:00:00+0000"):
+            run.save_checkpoint(5, state_dict={"w": 1})
+        client.upload_file.side_effect = BotoCoreError()
+        with mock.patch("time.strftime", return_value="2026-09-30T11:00:00+0000"):
+            run.save_checkpoint(5, state_dict={"w": 2})
+        run.finish()
+
+        with (
+            mock.patch("boto3.client", return_value=client),
+            pytest.raises(RuntimeError, match="different save"),
+        ):
+            extty.delete_local_checkpoint(
+                "proj", "resumed", 5, s3_config=S3Config(bucket="b", prefix="pfx")
+            )
+
+        assert extty.load_checkpoint_from("proj", "resumed", 5) == {
+            "model_state_dict": {"w": 2}
+        }
+
+    def test_delete_local_checkpoint_allows_cache_without_meta(
+        self, tmp_path: Path
+    ) -> None:
+        """Download caches from before meta.json was written locally stay deletable."""
+        client, _ = TestLoadCheckpoint()._make_mock_s3_client()
+        user_file = tmp_path / "ckpt.pt"
+        user_file.write_bytes(b"weights")
+        run = self._s3_run(client, "old-cache")
+        run.save_checkpoint(5, path=str(user_file))
+        run.finish()
+        cache = local_checkpoint_dir("proj", "old-cache", 5)
+        cache.mkdir(parents=True)
+        (cache / "checkpoint.pt").write_bytes(b"weights")
+
+        with mock.patch("boto3.client", return_value=client):
+            removed = extty.delete_local_checkpoint(
+                "proj", "old-cache", 5, s3_config=S3Config(bucket="b", prefix="pfx")
+            )
+
+        assert removed is True
+        assert not cache.exists()
+
+    def test_delete_local_checkpoint_refuses_without_boto3(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        run = extty.run.Run("proj", name="no-boto", system_metrics=False)
+        run.save_checkpoint(5, state_dict={"w": 1})
+        run.finish()
+
+        with (
+            mock.patch(
+                "extty.s3._make_s3_client",
+                side_effect=ImportError("boto3 is required for S3 storage."),
+            ),
+            pytest.raises(RuntimeError, match="Could not check S3"),
+        ):
+            extty.delete_local_checkpoint(
+                "proj", "no-boto", 5, s3_config=S3Config(bucket="b")
+            )
+
+        assert local_checkpoint_dir("proj", "no-boto", 5).exists()
 
 
 class TestExttyHome:

@@ -69,7 +69,11 @@ def required_files(names: list[str], *, load_optimizer: bool) -> list[str]:
 @contextmanager
 def _atomic(target: Path) -> Iterator[Path]:
     tmp = target.with_name(target.name + ".part")
-    yield tmp
+    try:
+        yield tmp
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     tmp.replace(target)
 
 
@@ -77,6 +81,11 @@ def write_meta(dest: Path, meta: dict[str, Any]) -> None:
     """Write ``meta`` as the ``meta.json`` of the checkpoint in ``dest``."""
     with _atomic(dest / META_FILE) as tmp:
         tmp.write_text(json.dumps(meta, indent=2))
+
+
+def same_checkpoint(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Whether two meta entries describe the same save of a checkpoint."""
+    return a.get("timestamp") == b.get("timestamp") and a.get("files") == b.get("files")
 
 
 def read_meta(dest: Path) -> dict[str, Any] | None:
@@ -100,7 +109,9 @@ def stage_checkpoint(
 
     State dicts are serialized into ``dest``; a ``path`` is used where it is.
     Any ``meta.json`` already in ``dest`` is removed first, so the step does
-    not read as a complete local copy until :func:`commit_checkpoint`.
+    not read as a complete local copy until :func:`commit_checkpoint`, and
+    files left from an earlier save of the step are removed once the new ones
+    are written.
 
     Parameters
     ----------
@@ -153,6 +164,11 @@ def stage_checkpoint(
             with _atomic(dest / name) as tmp:
                 torch.save(state, tmp)
             sources[name] = dest / name
+
+    staged = set(sources.values())
+    for leftover in dest.iterdir():
+        if leftover.is_file() and leftover not in staged:
+            leftover.unlink()
 
     entry: dict[str, Any] = {
         "step": step,

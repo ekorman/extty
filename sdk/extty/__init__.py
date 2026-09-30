@@ -350,8 +350,8 @@ def delete_local_checkpoint(
     Delete a checkpoint's local files, leaving any S3 copy intact.
 
     The local copy may be the only one (no S3 configured, or its upload
-    failed), so unless ``force`` is set this refuses to delete a checkpoint
-    that S3 does not have. This is the inverse of
+    failed), so unless ``force`` is set this deletes only when S3 holds the
+    same save of the checkpoint as the local copy. This is the inverse of
     :func:`load_checkpoint_from`, using the same addressing.
 
     Parameters
@@ -376,8 +376,9 @@ def delete_local_checkpoint(
     Raises
     ------
     RuntimeError
-        If ``force`` is not set and S3 cannot confirm it has the checkpoint
-        (not configured, unreachable, or missing it).
+        If ``force`` is not set and S3 cannot confirm it has this save of the
+        checkpoint (not configured, unreachable, missing it, or holding a
+        different save of the step).
     """
     import shutil
 
@@ -397,6 +398,7 @@ def _require_remote_copy(
     local_dir: Path,
     s3_config: S3Config | None,
 ) -> None:
+    from extty.checkpoints import read_meta, same_checkpoint
     from extty.s3 import _S3_ERRORS, S3Storage
 
     refusal = (
@@ -408,11 +410,14 @@ def _require_remote_copy(
     if s3_config is None:
         raise RuntimeError(f"{refusal} (S3 is not configured.)")
     try:
-        in_s3 = S3Storage(s3_config, project, run_name).has_checkpoint(step)
-    except _S3_ERRORS as e:
+        remote = S3Storage(s3_config, project, run_name).find_checkpoint(step)
+    except (ImportError, *_S3_ERRORS) as e:
         raise RuntimeError(f"{refusal} (Could not check S3: {e})") from e
-    if not in_s3:
+    if remote is None:
         raise RuntimeError(f"{refusal} (It is not in S3.)")
+    local = read_meta(local_dir)
+    if local is not None and not same_checkpoint(local, remote):
+        raise RuntimeError(f"{refusal} (S3 has a different save of this step.)")
 
 
 def finish() -> None:

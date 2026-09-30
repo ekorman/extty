@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -132,7 +132,7 @@ pub fn run(opts: RunOptions) -> Result<()> {
         &opts.exclude,
         &mut log,
     )?;
-    copy_s3_config(&ssh_base, &host, port.as_deref(), ssh_user, &mut log)?;
+    copy_s3_config(&ssh_base, &mut log)?;
     let command_str = opts.command.join(" ");
     let script_opts = ScriptOptions {
         python_version: &opts.python_version,
@@ -440,13 +440,29 @@ fn rsync_cwd(
     )
 }
 
-fn copy_s3_config(
-    ssh_base: &str,
-    host: &str,
-    port: Option<&str>,
-    ssh_user: &str,
-    log: &mut LogFile,
-) -> Result<()> {
+/// Remote command that installs an S3 config read from stdin where the SDK on
+/// that host looks for it: `$EXTTY_HOME/s3/config.toml`, defaulting to
+/// `~/.extty`. The file holds credentials, so it is made owner-only.
+const INSTALL_REMOTE_S3_CONFIG: &str = r#"umask 077 && d="${EXTTY_HOME:-$HOME/.extty}/s3" && mkdir -p "$d" && cat > "$d/config.toml" && chmod 600 "$d/config.toml""#;
+
+/// Copy the local S3 config to the host reached by `ssh_base`.
+///
+/// The config is piped over ssh rather than sent with scp: scp's SFTP mode
+/// doesn't shell-expand remote paths, so it can't honour a remote `EXTTY_HOME`.
+pub fn send_s3_config(ssh_base: &str, config_path: &Path) -> Result<std::process::Output> {
+    let config = fs::File::open(config_path)
+        .with_context(|| format!("Failed to open {}", config_path.display()))?;
+    Command::new("bash")
+        .arg("-c")
+        .arg(format!("{} '{}'", ssh_base, INSTALL_REMOTE_S3_CONFIG))
+        .stdin(config)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("Failed to run ssh for S3 config")
+}
+
+fn copy_s3_config(ssh_base: &str, log: &mut LogFile) -> Result<()> {
     let s3_config_path = crate::paths::extty_home().join("s3").join("config.toml");
 
     if !s3_config_path.exists() {
@@ -456,22 +472,7 @@ fn copy_s3_config(
     log.log("Copying S3 config...");
     println!("Copying S3 config...");
 
-    let scp_port_arg = port.map(|p| format!("-P {}", p)).unwrap_or_default();
-
-    let output = Command::new("bash")
-        .arg("-c")
-        .arg(format!(
-            "{} 'mkdir -p ~/.extty/s3' && scp -o StrictHostKeyChecking=no {} {} {}@{}:~/.extty/s3/config.toml",
-            ssh_base,
-            scp_port_arg,
-            s3_config_path.display(),
-            ssh_user,
-            host,
-        ))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .context("Failed to run scp for S3 config")?;
+    let output = send_s3_config(ssh_base, &s3_config_path)?;
 
     if output.status.success() {
         log.log("S3 config copied");
@@ -523,4 +524,74 @@ fn upload_bootstrap_script(
 
     log.log("Bootstrap script uploaded");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    fn install(home: &Path, extty_home: Option<&Path>) {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(INSTALL_REMOTE_S3_CONFIG)
+            .env("HOME", home)
+            .stdin(Stdio::piped());
+        match extty_home {
+            Some(dir) => cmd.env("EXTTY_HOME", dir),
+            None => cmd.env_remove("EXTTY_HOME"),
+        };
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"bucket = \"b\"\n")
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    fn assert_owner_only_config(path: &Path) {
+        assert_eq!(fs::read(path).unwrap(), b"bucket = \"b\"\n");
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn remote_s3_config_follows_remote_extty_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let scratch = dir.path().join("scratch/extty");
+
+        install(&home, Some(&scratch));
+
+        assert_owner_only_config(&scratch.join("s3/config.toml"));
+        assert!(!home.join(".extty").exists());
+    }
+
+    #[test]
+    fn remote_s3_config_defaults_to_dot_extty() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+
+        install(&home, None);
+
+        assert_owner_only_config(&home.join(".extty/s3/config.toml"));
+    }
+
+    /// `sh -c` stands in for ssh: both hand the quoted command to a shell.
+    #[test]
+    fn send_s3_config_runs_install_through_ssh_quoting() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, b"bucket = \"b\"\n").unwrap();
+        let scratch = dir.path().join("scratch");
+
+        let ssh_base = format!("EXTTY_HOME={} sh -c", scratch.display());
+        let output = send_s3_config(&ssh_base, &config).unwrap();
+
+        assert!(output.status.success(), "{:?}", output);
+        assert_owner_only_config(&scratch.join("s3/config.toml"));
+    }
 }

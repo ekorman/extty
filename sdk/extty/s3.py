@@ -809,20 +809,33 @@ class S3Storage:
                 "Failed to save checkpoint (step %d) to S3", step, exc_info=True
             )
             return False
-        self._update_checkpoints_index(entry)
-        return True
+        return self._update_checkpoints_index(entry)
 
-    def _update_checkpoints_index(self, entry: dict[str, Any]) -> None:
+    def _update_checkpoints_index(self, entry: dict[str, Any]) -> bool:
+        """
+        Merge ``entry`` into the run's ``checkpoints.json`` in S3.
+
+        A missing or corrupt index starts empty, but one that can't be read
+        is left alone: rewriting it with only ``entry`` would drop every other
+        step.
+
+        Returns
+        -------
+        bool
+            True if the index was written.
+        """
         index_key = self._s3_key("checkpoints.json")
         existing: list[dict[str, Any]] = []
         try:
             response = self._client.get_object(Bucket=self.config.bucket, Key=index_key)
-            content = response["Body"].read().decode("utf-8")
-            existing = json.loads(content)
+            existing = json.loads(response["Body"].read().decode("utf-8"))
         except self._client.exceptions.NoSuchKey:
             pass
-        except Exception:
-            pass
+        except json.JSONDecodeError:
+            logger.warning("Rebuilding unreadable checkpoints index in S3")
+        except _S3_ERRORS:
+            logger.warning("Failed to read checkpoints index from S3", exc_info=True)
+            return False
 
         existing_steps = {e["step"] for e in existing}
         if entry["step"] not in existing_steps:
@@ -841,6 +854,8 @@ class S3Storage:
             )
         except _S3_ERRORS:
             logger.warning("Failed to update checkpoints index in S3", exc_info=True)
+            return False
+        return True
 
     def load_checkpoint(
         self,
@@ -1023,9 +1038,9 @@ class S3Storage:
         """Local directory for a checkpoint step."""
         return local_checkpoint_dir(self.project, self.run_name, step)
 
-    def has_checkpoint(self, step: int) -> bool:
+    def find_checkpoint(self, step: int) -> dict[str, Any] | None:
         """
-        Whether a checkpoint for ``step`` exists in S3.
+        Look up the checkpoint for ``step`` in S3.
 
         Parameters
         ----------
@@ -1034,14 +1049,14 @@ class S3Storage:
 
         Returns
         -------
-        bool
-            True if the checkpoint's index entry or ``meta.json`` exists.
+        dict[str, Any] or None
+            The checkpoint's entry from the index or its ``meta.json``, or
+            None if S3 has no checkpoint for ``step``.
         """
         try:
-            self._checkpoint_meta(step)
+            return self._checkpoint_meta(step)
         except FileNotFoundError:
-            return False
-        return True
+            return None
 
     def list_checkpoints(self) -> list[dict[str, Any]]:
         """

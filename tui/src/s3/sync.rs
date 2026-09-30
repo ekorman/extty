@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -291,22 +291,7 @@ impl S3Client {
             .await?;
 
         let body = response.body.collect().await?.into_bytes();
-
-        if !force && local_path.exists() {
-            if key.ends_with(".csv") {
-                merge_csv_file(local_path, &body)?;
-            } else if key.ends_with(".jsonl") {
-                merge_jsonl_file(local_path, &body)?;
-            } else if key.ends_with("meta.json") {
-                merge_meta_file(local_path, &body)?;
-            } else {
-                fs::write(local_path, &body)?;
-            }
-        } else {
-            fs::write(local_path, &body)?;
-        }
-
-        Ok(())
+        store_downloaded(key, local_path, &body, force)
     }
 
     pub async fn upload_run(
@@ -601,7 +586,72 @@ impl S3Client {
 /// Keys whose local copy is merged with the remote rather than overwritten.
 /// Must agree with the branches in [`S3Client::download_file`].
 fn is_mergeable(key: &str) -> bool {
-    key.ends_with(".csv") || key.ends_with(".jsonl") || key.ends_with("meta.json")
+    key.ends_with(".csv")
+        || key.ends_with(".jsonl")
+        || key.ends_with("meta.json")
+        || key.ends_with("/checkpoints.json")
+}
+
+/// Write a downloaded object to `local_path`, merging it into an existing local
+/// copy for the file types that accumulate on both sides.
+fn store_downloaded(key: &str, local_path: &Path, body: &[u8], force: bool) -> Result<()> {
+    if force || !local_path.exists() {
+        fs::write(local_path, body)?;
+    } else if key.ends_with(".csv") {
+        merge_csv_file(local_path, body)?;
+    } else if key.ends_with(".jsonl") {
+        merge_jsonl_file(local_path, body)?;
+    } else if key.ends_with("/checkpoints.json") {
+        merge_checkpoint_index_file(local_path, body)?;
+    } else if key.ends_with("meta.json") {
+        merge_meta_file(local_path, body)?;
+    } else {
+        fs::write(local_path, body)?;
+    }
+    Ok(())
+}
+
+fn merge_checkpoint_index_file(local_path: &Path, remote: &[u8]) -> Result<()> {
+    let run_dir = local_path
+        .parent()
+        .context("checkpoints.json has no parent directory")?;
+    let merged = merge_checkpoint_index(&fs::read(local_path)?, remote, run_dir)?;
+    fs::write(local_path, merged)?;
+    Ok(())
+}
+
+/// Merge a remote `checkpoints.json` into a local one, by step.
+///
+/// The remote index is authoritative for every step it lists. A local entry for
+/// a step the remote lacks is kept only while that checkpoint is complete on
+/// disk (its `checkpoints/<step>/meta.json` exists): a save whose upload failed
+/// or that was made without S3, rather than one deleted from S3.
+fn merge_checkpoint_index(local: &[u8], remote: &[u8], run_dir: &Path) -> Result<Vec<u8>> {
+    let remote: Vec<serde_json::Value> =
+        serde_json::from_slice(remote).context("Failed to parse remote checkpoints.json")?;
+    let local: Vec<serde_json::Value> = serde_json::from_slice(local).unwrap_or_default();
+    let step_of = |entry: &serde_json::Value| entry.get("step").and_then(|s| s.as_u64());
+
+    let mut by_step = BTreeMap::new();
+    for entry in local {
+        if let Some(step) = step_of(&entry)
+            && run_dir
+                .join("checkpoints")
+                .join(step.to_string())
+                .join("meta.json")
+                .exists()
+        {
+            by_step.insert(step, entry);
+        }
+    }
+    for entry in remote {
+        if let Some(step) = step_of(&entry) {
+            by_step.insert(step, entry);
+        }
+    }
+    Ok(serde_json::to_vec_pretty(
+        &by_step.into_values().collect::<Vec<_>>(),
+    )?)
 }
 
 /// Whether the local copy of `object` can be left alone.
@@ -1001,7 +1051,7 @@ impl S3Client {
             .await?;
         let body = resp.body.collect().await?.into_bytes();
         fs::create_dir_all(run_dir)?;
-        fs::write(&local_path, &body)?;
+        store_downloaded(&key, &local_path, &body, false)?;
         Ok(true)
     }
 
@@ -1201,6 +1251,51 @@ mod tests {
     }
 
     #[test]
+    fn pulled_checkpoint_index_keeps_local_only_steps_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+        let uploaded_failed = run_dir.join("checkpoints/150");
+        fs::create_dir_all(&uploaded_failed).unwrap();
+        fs::write(uploaded_failed.join("meta.json"), b"{}").unwrap();
+        let index = run_dir.join("checkpoints.json");
+        fs::write(
+            &index,
+            br#"[{"step": 100, "timestamp": "local"},
+                 {"step": 150, "timestamp": "local"},
+                 {"step": 200, "timestamp": "local"}]"#,
+        )
+        .unwrap();
+        let remote = br#"[{"step": 100, "timestamp": "remote"},
+                          {"step": 300, "timestamp": "remote"}]"#;
+
+        store_downloaded("runs/p/r/checkpoints.json", &index, remote, false).unwrap();
+
+        let merged: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        let steps: Vec<(u64, &str)> = merged
+            .iter()
+            .map(|e| {
+                (
+                    e["step"].as_u64().unwrap(),
+                    e["timestamp"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(steps, [(100, "remote"), (150, "local"), (300, "remote")]);
+    }
+
+    #[test]
+    fn pulled_checkpoint_index_is_written_when_absent_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("checkpoints.json");
+        let remote = br#"[{"step": 1}]"#;
+
+        store_downloaded("runs/p/r/checkpoints.json", &index, remote, false).unwrap();
+
+        assert_eq!(fs::read(&index).unwrap(), remote);
+    }
+
+    #[test]
     fn run_upload_skips_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         let run_dir = dir.path();
@@ -1301,7 +1396,7 @@ mod tests {
         assert!(is_mergeable("runs/p/r/system.csv"));
         assert!(is_mergeable("runs/p/r/images/val/dets.jsonl"));
         assert!(is_mergeable("runs/p/r/meta.json"));
-        assert!(!is_mergeable("runs/p/r/checkpoints.json"));
+        assert!(is_mergeable("runs/p/r/checkpoints.json"));
         assert!(!is_mergeable("runs/p/r/images/val/dets/step_1000.png"));
     }
 }
