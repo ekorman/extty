@@ -1,0 +1,33 @@
+name: Tests (Rust)
+
+on:
+  push:
+    paths:
+      - "tui/**"
+      - "spec/**"
+      - ".github/workflows/test-rust.yml"
+
+jobs:
+  test-rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --verbose
