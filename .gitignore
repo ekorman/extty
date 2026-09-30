@@ -7,3 +7,5 @@ build/
 *.egg-info/
 sdk/analysis
 .vscode
+!dist-workspace.toml
+/target

@@ -2,12 +2,18 @@
 name = "extty"
 dynamic = ["version"]
 description = "Terminal-native ML experiment tracker"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["psutil>=5.9.0", "boto3>=1.34.0", "nvidia-ml-py>=12.0.0"]
 
+[project.urls]
+Repository = "https://github.com/ekorman/extty"
+Issues = "https://github.com/ekorman/extty/issues"
 
 [build-system]
-requires = ["setuptools>=64", "setuptools_scm>=8"]
+requires = ["setuptools>=77", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
