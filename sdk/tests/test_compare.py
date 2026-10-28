@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import warnings
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from extty.compare import _ema, compare, config_diff, plot_metric, reduce_metric
+from extty.compare import (
+    _ema,
+    compare,
+    config_diff,
+    plot_metric,
+    recipe_diff,
+    reduce_metric,
+)
 from extty.query import RunData
 from extty.storage import MetaData, MetricPoint, RunStorage
 
@@ -338,3 +346,51 @@ class TestEma:
 
     def test_empty(self) -> None:
         assert _ema([], 3) == []
+
+
+def test_recipe_diff() -> None:
+    stored = {
+        "_git_hash": "aaa",
+        "training_config": {"lr": 0.0001, "sizes": [1, 2], "aug": {"flip": True}},
+        "epochs": 3,
+    }
+
+    assert recipe_diff(stored, json.loads(json.dumps(stored))) == {}
+    assert (
+        recipe_diff(
+            stored,
+            {
+                "_git_hash": "bbb",
+                "_gpu": "A100",
+                "training_config": {
+                    "lr": 0.0001,
+                    "sizes": (1, 2),
+                    "aug": {"flip": True},
+                },
+                "epochs": 3,
+            },
+        )
+        == {}
+    )
+    assert recipe_diff(
+        stored,
+        {
+            "training_config": {"lr": 0.001, "sizes": [1, 2], "aug": {"flip": False}},
+            "epochs": 3,
+        },
+    ) == {
+        "training_config.lr": (0.0001, 0.001),
+        "training_config.aug.flip": (True, False),
+    }
+    assert recipe_diff(
+        stored,
+        {
+            "training_config": {"lr": 0.0001, "sizes": [1, 2, 3], "aug": {}},
+            "seed": 0,
+        },
+    ) == {
+        "training_config.sizes": ([1, 2], [1, 2, 3]),
+        "training_config.aug.flip": (True, "<missing>"),
+        "epochs": (3, "<missing>"),
+        "seed": ("<missing>", 0),
+    }

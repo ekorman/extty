@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from extty.chart import Chart
 from extty.confusion import ConfusionMatrix
@@ -342,7 +342,12 @@ class RunStorageReader(Protocol):
 
 @dataclass
 class MetaData:
-    """Metadata for a run."""
+    """
+    Metadata for a run.
+
+    ``resumes`` holds one ``{"at", "step", "env"}`` entry per time the run
+    was resumed, and is left out of ``meta.json`` until the first resume.
+    """
 
     project: str
     run_name: str
@@ -350,9 +355,10 @@ class MetaData:
     started_at: str
     finished_at: str | None = None
     status: str = "running"
+    resumes: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "project": self.project,
             "run_name": self.run_name,
             "config": self.config,
@@ -360,6 +366,9 @@ class MetaData:
             "finished_at": self.finished_at,
             "status": self.status,
         }
+        if self.resumes:
+            data["resumes"] = self.resumes
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MetaData:
@@ -370,7 +379,44 @@ class MetaData:
             started_at=data["started_at"],
             finished_at=data.get("finished_at"),
             status=data.get("status", "running"),
+            resumes=data.get("resumes") or [],
         )
+
+
+_STEP_JSONL_DIRS = ("examples", "confusion_matrices", "charts", "images")
+
+
+def _keep_rows_through(
+    path: Path,
+    step: int,
+    row_step: Callable[[bytes], int],
+    *,
+    has_header: bool,
+) -> None:
+    """
+    Rewrite a step-keyed stream without its rows after ``step``.
+
+    A row is kept only if it is a complete line whose step, as read by
+    ``row_step``, is at most ``step``. The file is replaced atomically, and
+    only when a row is dropped.
+    """
+    lines = path.read_bytes().splitlines(keepends=True)
+    header, rows = (lines[:1], lines[1:]) if has_header else ([], lines)
+
+    def keep(line: bytes) -> bool:
+        if not line.endswith(b"\n"):
+            return False
+        try:
+            return row_step(line) <= step
+        except (ValueError, KeyError, TypeError):
+            return False
+
+    kept = [line for line in rows if keep(line)]
+    if len(kept) == len(rows):
+        return
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_bytes(b"".join(header + kept))
+    os.replace(tmp_path, path)
 
 
 @dataclass
@@ -826,6 +872,43 @@ class RunStorage:
             step = int(step_dir.name)
             by_step[step] = parse_checkpoint_entry({**meta, "step": step})
         return [by_step[step] for step in sorted(by_step)]
+
+    def truncate_after(self, step: int) -> None:
+        """
+        Drop the logged rows with a step greater than ``step``.
+
+        Rewrites each metric CSV under ``metrics/`` and each JSONL stream
+        under ``examples/``, ``confusion_matrices/``, ``charts/`` and the
+        ``images/`` index files that holds such a row, keeping the header and
+        the other rows byte for byte. An incomplete or unreadable row, such
+        as the last line of a write that was killed, is dropped too.
+        ``system.csv``, the PNGs and ``checkpoints/`` are left alone.
+
+        Not thread-safe: call it before anything is logged to this storage.
+
+        Parameters
+        ----------
+        step : int
+            The last step to keep; -1 drops every step-keyed row.
+        """
+
+        def metric_step(line: bytes) -> int:
+            return int(line.split(b",", 1)[0])
+
+        def record_step(line: bytes) -> int:
+            return int(json.loads(line)["step"])
+
+        streams: list[tuple[Path, Callable[[bytes], int], bool]] = [
+            (path, metric_step, True)
+            for path in sorted((self.run_dir / "metrics").rglob("*.csv"))
+        ]
+        for sub in _STEP_JSONL_DIRS:
+            streams += [
+                (path, record_step, False)
+                for path in sorted((self.run_dir / sub).rglob("*.jsonl"))
+            ]
+        for path, row_step, has_header in streams:
+            _keep_rows_through(path, step, row_step, has_header=has_header)
 
     def record_checkpoint(self, entry: dict[str, Any]) -> None:
         """Merge an uploaded save into ``checkpoints.json``.

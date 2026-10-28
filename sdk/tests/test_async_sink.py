@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest import mock
 
+import pytest
+
 import extty
 from extty.async_sink import _HIGH_WATER_MARK, AsyncSink
 
@@ -23,6 +25,8 @@ class _FakeSink:
     images: list[tuple[str, Any, int]] = field(default_factory=list)
     systems: list[tuple[Any, ...]] = field(default_factory=list)
     flushes: int = 0
+    flush_threads: list[int] = field(default_factory=list)
+    flush_error: Exception | None = None
     closed: bool = False
     sleep_per_call: float = 0.0
     fail_every_nth: int = 0
@@ -80,6 +84,9 @@ class _FakeSink:
     def flush(self) -> None:
         with self._lock:
             self.flushes += 1
+            self.flush_threads.append(threading.get_ident())
+        if self.flush_error is not None:
+            raise self.flush_error
 
     def close(self) -> None:
         with self._lock:
@@ -113,6 +120,42 @@ class TestAsyncSink:
             assert inner.flushes >= 1
         finally:
             sink.close()
+
+    def test_flush_runs_on_worker_after_queued_items(self) -> None:
+        """A flush never overlaps a log call another thread enqueued."""
+        inner = _FakeSink(sleep_per_call=0.01)
+        sink = AsyncSink(inner)
+        try:
+            for i in range(5):
+                sink.log_metric("loss", float(i), step=i)
+            sink.flush()
+            assert len(inner.metrics) == 5
+            assert inner.flush_threads == [sink._thread.ident]
+        finally:
+            sink.close()
+
+    def test_flush_raises_inner_error(self) -> None:
+        inner = _FakeSink(flush_error=OSError("disk full"))
+        sink = AsyncSink(inner)
+        try:
+            sink.log_metric("loss", 1.0, step=1)
+            with pytest.raises(OSError, match="disk full"):
+                sink.flush()
+            assert sink._thread.is_alive()
+            inner.flush_error = None
+            sink.flush()
+            assert inner.flushes == 2
+        finally:
+            sink.close()
+
+    def test_flush_after_close_flushes_inline(self) -> None:
+        inner = _FakeSink()
+        sink = AsyncSink(inner)
+        sink.close()
+        t0 = time.perf_counter()
+        sink.flush()
+        assert time.perf_counter() - t0 < 0.5
+        assert inner.flush_threads[-1] == threading.get_ident()
 
     def test_close_drains_pending_items(self) -> None:
         inner = _FakeSink(sleep_per_call=0.01)

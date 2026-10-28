@@ -16,6 +16,14 @@ _HIGH_WATER_MARK = 100_000
 _STOP = object()
 
 
+class _FlushRequest:
+    """A flush of the inner sink, run by the worker in queue order."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.error: Exception | None = None
+
+
 class AsyncSink:
     """
     Run every ``log_*`` call on a background daemon thread.
@@ -87,9 +95,29 @@ class AsyncSink:
         )
 
     def flush(self) -> None:
-        """Block until every item enqueued so far has been replayed."""
-        self._queue.join()
-        self._inner.flush()
+        """
+        Replay every item enqueued so far, then flush the inner sink.
+
+        The inner flush runs on the worker thread, after those items and
+        before any enqueued later, so it never overlaps a ``log_*`` call
+        made from another thread. This call blocks until it is done.
+
+        Raises
+        ------
+        Exception
+            Whatever the inner sink's ``flush`` raised.
+        """
+        if not self._thread.is_alive():
+            self._inner.flush()
+            return
+        request = _FlushRequest()
+        self._queue.put(request)
+        while not request.done.wait(timeout=1.0):
+            if not self._thread.is_alive():
+                self._inner.flush()
+                return
+        if request.error is not None:
+            raise request.error
 
     def close(self) -> None:
         """Drain the queue, join the worker thread, then close the inner sink."""
@@ -123,6 +151,13 @@ class AsyncSink:
                             type(self._inner).__name__,
                         )
                     return
+                if isinstance(item, _FlushRequest):
+                    try:
+                        self._inner.flush()
+                    except Exception as exc:
+                        item.error = exc
+                    item.done.set()
+                    continue
                 try:
                     self._dispatch(item)
                 except Exception:

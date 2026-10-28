@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import warnings
 from typing import Any, Callable
 
@@ -173,6 +174,55 @@ def config_diff(
         if len(set(repr(v) for v in values)) > 1:
             diff[key] = values
 
+    return diff
+
+
+_MISSING = "<missing>"
+
+
+def recipe_diff(
+    stored: dict[str, Any], new: dict[str, Any]
+) -> dict[str, tuple[Any, Any]]:
+    """
+    Find where a new run config differs from a run's stored one.
+
+    Top-level keys starting with ``_`` (the environment extty records, such
+    as ``_git_hash``) are ignored on both sides, and ``new`` is round-tripped
+    through JSON first, so a tuple equals the list it is stored as. Dicts are
+    compared key by key, recursively; any other value, a list included, is
+    compared whole.
+
+    Parameters
+    ----------
+    stored : dict[str, Any]
+        The config as stored in the run's ``meta.json``.
+    new : dict[str, Any]
+        The config the run is being started with.
+
+    Returns
+    -------
+    dict[str, tuple[Any, Any]]
+        ``(stored value, new value)`` for each differing value, keyed by its
+        dotted path such as ``"training_config.lr"``. A key missing on one
+        side has ``"<missing>"`` as its value there. Empty when the configs
+        match.
+    """
+    normalized = json.loads(json.dumps(new))
+    diff: dict[str, tuple[Any, Any]] = {}
+
+    def walk(old: dict[str, Any], cur: dict[str, Any], prefix: str) -> None:
+        for key in sorted(set(old) | set(cur), key=str):
+            if not prefix and str(key).startswith("_"):
+                continue
+            path = f"{prefix}{key}"
+            if key not in old or key not in cur:
+                diff[path] = (old.get(key, _MISSING), cur.get(key, _MISSING))
+            elif isinstance(old[key], dict) and isinstance(cur[key], dict):
+                walk(old[key], cur[key], f"{path}.")
+            elif old[key] != cur[key]:
+                diff[path] = (old[key], cur[key])
+
+    walk(stored, normalized, "")
     return diff
 
 

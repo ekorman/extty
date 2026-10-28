@@ -122,6 +122,48 @@ free disk by deleting local copies that S3 also has. Neither deletes a
 checkpoint's only copy unless you pass `force=True` to
 `delete_local_checkpoint`.
 
+`save_checkpoint` flushes the rows logged so far before saving, and returns
+`True` only when the save reached S3, `False` when it was kept only locally
+(no S3, or a failed upload).
+
+### Resuming a run
+
+To continue a run after its job dies, start it again under the same name with
+`resume=True`, on the same machine or, with S3 configured, on a fresh one:
+
+```python
+run = extty.init("my-project", name="job-1234", config=config, resume=True)
+start = run.resume_step or 0       # None for a new run or no checkpoint yet
+if run.resume_step is not None:
+    ckpt = extty.load_checkpoint(run.resume_step)
+    model.load_state_dict(ckpt["model_state_dict"])
+    opt.load_state_dict(ckpt["optimizer_state_dict"])
+for step in range(start + 1, n_steps + 1):
+    ...
+```
+
+The run is read from S3 when configured and from the run directory otherwise.
+If it exists:
+
+- Its stored config must match `config`, keys starting with `_` (git hash,
+  GPU, instance) aside. A difference raises `extty.RunConfigMismatch`, listing
+  the dotted paths that differ, before anything is written.
+- Its logged metrics, examples, confusion matrices, charts and image index are
+  cut back to its latest checkpoint, `run.resume_step`, in S3 and locally, and
+  new rows append to them. With no checkpoint, they are emptied. `system.csv`,
+  image files and checkpoints are kept.
+- `config` and `started_at` stay as first stored, and `meta.json` records each
+  resume under `resumes`.
+
+`run.resumed` says whether an existing run was continued; with no such run,
+`resume=True` starts a new one. Only one process may write a run name at a
+time, and resuming is not supported in distributed training. Without
+`resume=True`, a run with the same name is overwritten.
+
+With S3 configured, `resume=True` never falls back to a new run because of an
+error: init raises if reading the run from S3 fails, if its `meta.json` cannot
+be written to S3, or if S3 holds files of the run but no `meta.json`.
+
 ## S3 sync (optional)
 
 Configure S3 in `~/.extty/s3/config.toml`, which both the SDK and TUI read:
@@ -151,6 +193,10 @@ extty prune local         # delete local checkpoints/artifacts that S3 has
 ```
 
 `-n`/`--dry-run` previews, and `-f`/`--force` overwrites instead of merging.
+A run resumed since it was pulled is not merged row by row, since the resume
+cut its history back: a pull replaces the local copy's history with S3's (even
+for a run marked completed), and a push from the older copy is refused until it
+is pulled again.
 From Python: `extty.push("my-project/", dry_run=True)`.
 
 ## Where data is stored

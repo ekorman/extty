@@ -23,9 +23,10 @@ from extty.checkpoints import (
     read_local_checkpoint,
     stage_checkpoint,
 )
+from extty.compare import recipe_diff
 from extty.confusion import ConfusionMatrix
 from extty.image import Image
-from extty.s3 import S3Config, S3Storage
+from extty.s3 import S3Config, S3RunReader, S3Storage
 from extty.storage import (
     MetaData,
     RunStorage,
@@ -34,7 +35,7 @@ from extty.storage import (
 )
 from extty.system_monitor import SystemMonitor
 
-__all__ = ["Run", "NoOpRun", "StorageSink", "MultiSink"]
+__all__ = ["Run", "NoOpRun", "RunConfigMismatch", "StorageSink", "MultiSink"]
 
 
 # ``StorageSink`` moved to :mod:`extty._sink` so the async wrapper can import it
@@ -105,6 +106,33 @@ class MultiSink:
         self._primary.close()
         if self._secondary:
             self._secondary.close()
+
+
+class RunConfigMismatch(ValueError):
+    """
+    Raised when resuming a run with a config that differs from its stored one.
+
+    Parameters
+    ----------
+    run : str
+        The run, as ``project/name``.
+    diff : dict[str, tuple[Any, Any]]
+        ``(stored value, new value)`` by dotted config path, as returned by
+        :func:`extty.compare.recipe_diff`.
+
+    Attributes
+    ----------
+    paths : list[str]
+        The dotted paths that differ, sorted.
+    """
+
+    def __init__(self, run: str, diff: dict[str, tuple[Any, Any]]) -> None:
+        self.paths = sorted(diff)
+        details = "; ".join(
+            f"{path}: {diff[path][0]!r} (stored) != {diff[path][1]!r} (new)"
+            for path in self.paths
+        )
+        super().__init__(f"run {run} exists with a different config: {details}")
 
 
 @runtime_checkable
@@ -179,7 +207,56 @@ class Run:
     Represents a single experiment run.
 
     Manages logging metrics, system monitoring, and storage.
+
+    Parameters
+    ----------
+    project : str
+        Name of the project/experiment group.
+    name : str, optional
+        Name for this run. Auto-generated if not provided.
+    config : dict, optional
+        Hyperparameters and configuration to log.
+    system_metrics : bool, default True
+        Whether to automatically collect system metrics (RAM, GPU).
+    s3_config : S3Config, optional
+        S3 configuration. Loaded from the environment or config file if not
+        provided.
+    resume : bool, default False
+        Continue the run with this name if it exists, in S3 or locally. Its
+        stored config must match ``config`` (keys starting with ``_``
+        aside), its logged history is cut back to its latest checkpoint and
+        new rows are appended to it; ``started_at`` and ``config`` stay as
+        stored and the resume is recorded under ``resumes`` in its
+        ``meta.json``. With no such run, a new one is started.
+
+    Attributes
+    ----------
+    resumed : bool
+        True if an existing run was continued.
+    resume_step : int or None
+        The latest checkpoint step of a continued run, which its history was
+        kept through and which training should restart from; None for a new
+        run or one without checkpoints.
+
+    Raises
+    ------
+    ValueError
+        If ``resume`` is set without a ``name``.
+    RunConfigMismatch
+        If resuming a run whose stored config differs from ``config``. Nothing
+        is written in that case.
+    RuntimeError
+        If ``resume`` is set and S3 holds files of the run but no
+        ``meta.json``, which neither S3 nor the run directory has. Nothing is
+        written in that case.
+    botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError
+        If ``resume`` is set with S3 configured and reading the run from S3
+        fails for any reason but a missing object, or its ``meta.json``
+        cannot be written to S3.
     """
+
+    resumed: bool = False
+    resume_step: int | None = None
 
     def __init__(
         self,
@@ -189,10 +266,14 @@ class Run:
         config: dict[str, Any] | None = None,
         system_metrics: bool = True,
         s3_config: S3Config | None = None,
+        resume: bool = False,
     ) -> None:
+        if resume and not name:
+            raise ValueError("resume=True needs the name of the run to continue")
         self.project = project
         self.name = name or generate_random_name()
-        self.config = {**_collect_environment(), **(config or {})}
+        env = _collect_environment()
+        user_config = config or {}
         self._system_metrics_enabled = system_metrics
 
         self._storage: StorageSink
@@ -205,17 +286,84 @@ class Run:
             self._s3_storage = S3Storage(s3_config, project, self.name)
 
         run_dir = get_run_dir(project, self.name)
+        s3_reader: S3RunReader | None = None
+        previous: MetaData | None = None
+        if resume:
+            if self._s3_storage is not None:
+                s3_reader = S3RunReader(
+                    self._s3_storage.config,
+                    project,
+                    self.name,
+                    _client=self._s3_storage._client,
+                )
+            previous = (
+                s3_reader.read_meta() if s3_reader else None
+            ) or RunStorage.open_readonly(run_dir).read_meta()
+            if previous is not None:
+                diff = recipe_diff(previous.config, user_config)
+                if diff:
+                    raise RunConfigMismatch(f"{project}/{self.name}", diff)
+            elif s3_reader is not None and s3_reader.has_objects():
+                raise RuntimeError(
+                    f"run {project}/{self.name} has files in S3 but no "
+                    "meta.json, so it can be neither continued nor started "
+                    f"over: delete s3://{s3_reader.config.bucket}/"
+                    f"{s3_reader._s3_key('')} or use another name"
+                )
+
         local_storage = RunStorage(run_dir=run_dir)
         self._local_storage = local_storage
-        self._meta = MetaData(
-            project=project,
-            run_name=self.name,
-            config=self.config,
-            started_at=datetime.now(timezone.utc).isoformat(),
-        )
+        started_at = datetime.now(timezone.utc).isoformat()
+        if previous is not None:
+            steps = {c.step for c in local_storage.read_checkpoints()}
+            if s3_reader is not None:
+                steps.update(c.step for c in s3_reader.read_checkpoints())
+            cutoff = max(steps, default=-1)
+            local_storage.truncate_after(cutoff)
+            if self._s3_storage is not None:
+                self._s3_storage.truncate_after(cutoff)
+            self.resumed = True
+            self.resume_step = cutoff if cutoff >= 0 else None
+            self.config = previous.config
+            self._meta = MetaData(
+                project=project,
+                run_name=self.name,
+                config=previous.config,
+                started_at=previous.started_at,
+                resumes=[
+                    *previous.resumes,
+                    {"at": started_at, "step": self.resume_step, "env": env},
+                ],
+            )
+            if self.resume_step is None:
+                logger.info(
+                    "resuming run %s/%s, which has no checkpoint: "
+                    "its logged history was cleared",
+                    project,
+                    self.name,
+                )
+            else:
+                logger.info(
+                    "resuming run %s/%s from checkpoint step %d, "
+                    "its history kept through that step",
+                    project,
+                    self.name,
+                    self.resume_step,
+                )
+        else:
+            self.config = {**env, **user_config}
+            self._meta = MetaData(
+                project=project,
+                run_name=self.name,
+                config=self.config,
+                started_at=started_at,
+            )
+        if resume and self._s3_storage is not None:
+            # A run that trains without its meta.json in S3 would be started
+            # over by the next resume, so this write must not fail quietly.
+            self._s3_storage.write_meta(self._meta.to_dict(), strict=True)
         local_storage.write_meta(self._meta)
-
-        if self._s3_storage and self._meta:
+        if self._s3_storage is not None and not resume:
             self._s3_storage.write_meta(self._meta.to_dict())
 
         primary_storage: StorageSink = AsyncSink(
@@ -285,9 +433,13 @@ class Run:
         state_dict: Any = None,
         optimizer_state_dict: Any = None,
         keep_local: bool = False,
-    ) -> None:
+    ) -> bool:
         """
         Save a checkpoint to the run directory, or to S3 when configured.
+
+        The rows logged so far are flushed first, so a checkpoint that
+        reached S3 has the run's history up to its step there too, unless
+        that flush failed, which is logged.
 
         Without S3, the checkpoint is saved to
         ``<run dir>/checkpoints/<step>/``. With S3 it is uploaded, and also
@@ -309,6 +461,14 @@ class Run:
         keep_local : bool, default False
             Keep the local copy after a successful S3 upload.
 
+        Returns
+        -------
+        bool
+            True if the save's files, its ``meta.json`` and its entry in
+            the checkpoint index all reached S3; False if it was kept only in
+            the run directory, because S3 is not configured or the upload
+            failed.
+
         Raises
         ------
         RuntimeError
@@ -317,6 +477,7 @@ class Run:
         with self._lock:
             if self._finished:
                 raise RuntimeError("Cannot save checkpoint on a finished run.")
+        self._storage.flush()
         run_dir = self._local_storage.run_dir
         local_dir = checkpoint_dir(run_dir, step)
         staged = stage_checkpoint(
@@ -347,6 +508,7 @@ class Run:
                 step,
                 local_dir,
             )
+        return bool(uploaded)
 
     def load_checkpoint(
         self,

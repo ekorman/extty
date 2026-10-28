@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -2098,6 +2099,705 @@ class TestRunCheckpointsWithS3:
         assert run.load_checkpoint(5) == {"model_state_dict": {"w": 1}}
         client.download_file.assert_not_called()
         run.finish()
+
+
+_RESUME_CONFIG = {"opt": {"lr": 0.001, "momentum": 0.9}, "epochs": 3}
+_JOB = "pfx/runs/proj/job"
+
+
+def _attempt(
+    client: mock.MagicMock,
+    name: str | None,
+    config: dict[str, Any] | None = None,
+    *,
+    resume: bool = True,
+) -> extty.run.Run:
+    """Start one attempt of an S3-backed run, resuming by default."""
+    with mock.patch("boto3.client", return_value=client):
+        return extty.run.Run(
+            "proj",
+            name=name,
+            config=config,
+            system_metrics=False,
+            s3_config=_S3_CONFIG,
+            resume=resume,
+        )
+
+
+def _csv_steps(body: bytes) -> list[int]:
+    return [int(line.split(",")[0]) for line in body.decode().splitlines()[1:]]
+
+
+def _jsonl_steps(body: bytes) -> list[int]:
+    return [json.loads(line)["step"] for line in body.decode().splitlines()]
+
+
+def _every_kind(step: int) -> dict[str, Any]:
+    """One value of each step-keyed stream kind besides metrics."""
+    from PIL import Image as PILImage
+
+    return {
+        "val/example": extty.Example(prompt=f"p{step}", responses=["r"]),
+        "val/dets": extty.Image(PILImage.new("RGB", (2, 2), "red")),
+        "eval/cm": extty.ConfusionMatrix(matrix=[[1, 0], [0, 1]], labels=["a", "b"]),
+        "eval/roc": extty.Chart(
+            points=[(0.0, 0.0), (1.0, 1.0)], axis_names=("fpr", "tpr")
+        ),
+    }
+
+
+def _kill_after_ten_steps(run: extty.run.Run) -> None:
+    """Log steps 1-10 with a checkpoint at 5, then stop without finishing.
+
+    Examples are logged at 2 and 8, images at 4 and 8, and confusion
+    matrices and charts at 5 and 10.
+    """
+    for step in range(1, 11):
+        values: dict[str, Any] = {"loss": float(step)}
+        kinds = _every_kind(step)
+        if step in (2, 8):
+            values["val/example"] = kinds["val/example"]
+        if step in (4, 8):
+            values["val/dets"] = kinds["val/dets"]
+        if step in (5, 10):
+            values["eval/cm"] = kinds["eval/cm"]
+            values["eval/roc"] = kinds["eval/roc"]
+        run.log(values, step=step)
+        if step == 5:
+            run.save_checkpoint(5, state_dict={"w": 5})
+    run._storage.flush()
+
+
+def _new_pod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point extty at an empty home, as on a freshly created machine."""
+    home = tmp_path / "pod-2"
+    monkeypatch.setenv("EXTTY_HOME", str(home))
+    return home
+
+
+class TestResume:
+    """Continuing a run by name with ``resume=True``."""
+
+    def test_without_resume_same_name_overwrites(self) -> None:
+        client, stored = _mock_s3_client()
+        run_a = _attempt(client, "job", resume=False)
+        for step in range(1, 4):
+            run_a.log({"loss": float(step)}, step=step)
+        run_a.finish()
+
+        run_b = _attempt(client, "job", resume=False)
+        run_b.log({"loss": 1.0}, step=10)
+        run_b.finish()
+
+        assert run_b.resumed is False
+        assert _csv_steps(stored[f"{_JOB}/metrics/loss.csv"]) == [10]
+
+    def test_fresh_pod_continues_history(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_torch: mock.MagicMock,
+    ) -> None:
+        client, stored = _mock_s3_client()
+        _kill_after_ten_steps(_attempt(client, "job", _RESUME_CONFIG))
+        _new_pod(tmp_path, monkeypatch)
+
+        run_b = _attempt(client, "job", _RESUME_CONFIG)
+
+        assert run_b.resumed is True
+        assert run_b.resume_step == 5
+        assert _csv_steps(stored[f"{_JOB}/metrics/loss.csv"]) == [1, 2, 3, 4, 5]
+        assert _jsonl_steps(stored[f"{_JOB}/examples/val/example.jsonl"]) == [2]
+        assert _jsonl_steps(stored[f"{_JOB}/images/val/dets.jsonl"]) == [4]
+        assert _jsonl_steps(stored[f"{_JOB}/confusion_matrices/eval/cm.jsonl"]) == [5]
+        assert _jsonl_steps(stored[f"{_JOB}/charts/eval/roc.jsonl"]) == [5]
+        assert f"{_JOB}/images/val/dets/step_8.png" in stored
+        assert run_b.load_checkpoint(5) == {"model_state_dict": {"w": 5}}
+
+        for step in range(6, 9):
+            run_b.log({"loss": float(step)}, step=step)
+        run_b.finish()
+
+        assert _csv_steps(stored[f"{_JOB}/metrics/loss.csv"]) == list(range(1, 9))
+
+    def test_meta_keeps_first_attempt_and_records_resume(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_torch: mock.MagicMock,
+    ) -> None:
+        """A first attempt that crashed inside ``with`` is recorded as completed."""
+        client, stored = _mock_s3_client()
+        monkeypatch.setenv("EXTTY_GIT_HASH", "aaa")
+        run_a = _attempt(client, "job", _RESUME_CONFIG)
+        run_a.save_checkpoint(5, state_dict={"w": 5})
+        run_a.finish()
+        meta_a = json.loads(stored[f"{_JOB}/meta.json"])
+        assert meta_a["status"] == "completed"
+
+        _new_pod(tmp_path, monkeypatch)
+        monkeypatch.setenv("EXTTY_GIT_HASH", "bbb")
+        run_b = _attempt(client, "job", _RESUME_CONFIG)
+        env_b = extty.run._collect_environment()
+
+        meta_b = json.loads(stored[f"{_JOB}/meta.json"])
+        assert json.loads((Path(run_b.run_dir) / "meta.json").read_text()) == meta_b
+        assert meta_b["started_at"] == meta_a["started_at"]
+        assert meta_b["config"] == meta_a["config"]
+        assert meta_a["config"]["_git_hash"] == "aaa"
+        assert run_b.config == meta_a["config"]
+        [resume] = meta_b["resumes"]
+        assert resume == {"at": resume["at"], "step": 5, "env": env_b}
+        assert env_b["_git_hash"] == "bbb"
+        assert datetime.fromisoformat(resume["at"]).utcoffset() == timedelta(0)
+        assert meta_b["status"] == "running"
+        assert meta_b["finished_at"] is None
+
+        run_b.finish()
+
+        meta_done = json.loads(stored[f"{_JOB}/meta.json"])
+        assert meta_done["status"] == "completed"
+        assert meta_done["finished_at"] is not None
+        assert meta_done["resumes"] == meta_b["resumes"]
+
+    def test_config_mismatch_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client, stored = _mock_s3_client()
+        run_a = _attempt(client, "job", _RESUME_CONFIG)
+        run_a.log({"loss": 1.0}, step=1)
+        run_a._storage.flush()
+        snapshot = dict(stored)
+        pod = _new_pod(tmp_path, monkeypatch)
+
+        changed = {**_RESUME_CONFIG, "opt": {"lr": 0.01, "momentum": 0.9}}
+        with pytest.raises(extty.RunConfigMismatch) as excinfo:
+            _attempt(client, "job", changed)
+
+        assert excinfo.value.paths == ["opt.lr"]
+        assert isinstance(excinfo.value, ValueError)
+        assert "opt.lr: 0.001 (stored) != 0.01 (new)" in str(excinfo.value)
+        assert stored == snapshot
+        assert not get_run_dir("proj", "job").exists()
+        assert not pod.exists()
+
+    def test_tuple_and_environment_changes_still_match(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client, _ = _mock_s3_client()
+        monkeypatch.setenv("EXTTY_GIT_HASH", "aaa")
+        _attempt(client, "job", {"sizes": [1, 2]})._storage.flush()
+        _new_pod(tmp_path, monkeypatch)
+        monkeypatch.setenv("EXTTY_GIT_HASH", "bbb")
+
+        run_b = _attempt(client, "job", {"sizes": (1, 2)})
+
+        assert run_b.resumed is True
+        assert run_b.resume_step is None
+        run_b.finish()
+
+    def test_no_checkpoint_empties_history_but_keeps_system(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client, stored = _mock_s3_client()
+        run_a = _attempt(client, "job", _RESUME_CONFIG)
+        run_a.log({"loss": 1.0, **_every_kind(1)}, step=1)
+        run_a._storage.log_system(1.0, 16.0)
+        run_a._storage.log_system(2.0, 16.0, 3.0, 24.0, 50.0)
+        run_a._storage.flush()
+        system_a = stored[f"{_JOB}/system.csv"]
+        _new_pod(tmp_path, monkeypatch)
+
+        run_b = _attempt(client, "job", _RESUME_CONFIG)
+
+        assert run_b.resumed is True
+        assert run_b.resume_step is None
+        assert stored[f"{_JOB}/metrics/loss.csv"] == b"step,timestamp,value\n"
+        for key in (
+            "examples/val/example.jsonl",
+            "images/val/dets.jsonl",
+            "confusion_matrices/eval/cm.jsonl",
+            "charts/eval/roc.jsonl",
+        ):
+            assert stored[f"{_JOB}/{key}"] == b""
+        assert stored[f"{_JOB}/system.csv"] == system_a
+
+        run_b._storage.log_system(3.0, 16.0)
+        run_b._storage.flush()
+
+        lines_a = system_a.decode().splitlines()
+        lines_b = stored[f"{_JOB}/system.csv"].decode().splitlines()
+        assert len(lines_a) == 3
+        assert lines_b[:3] == lines_a
+        assert len(lines_b) == 4
+        run_b.finish()
+
+    def test_unknown_name_starts_new_run(self) -> None:
+        client, stored = _mock_s3_client()
+        run = _attempt(client, "fresh", _RESUME_CONFIG)
+
+        assert run.resumed is False
+        assert run.resume_step is None
+        assert "resumes" not in json.loads(stored["pfx/runs/proj/fresh/meta.json"])
+        local_meta = json.loads((Path(run.run_dir) / "meta.json").read_text())
+        assert "resumes" not in local_meta
+        assert local_meta["config"]["opt"] == _RESUME_CONFIG["opt"]
+        run.finish()
+
+    def test_resume_without_name_raises(self) -> None:
+        with pytest.raises(ValueError, match="name"):
+            extty.run.Run("proj", system_metrics=False, resume=True)
+
+    @pytest.mark.parametrize(
+        "failing_key", ["meta.json", "checkpoints.json"], ids=["meta", "index"]
+    )
+    def test_s3_read_error_propagates(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_torch: mock.MagicMock,
+        failing_key: str,
+    ) -> None:
+        """Any S3 error other than a missing key stops init before it writes."""
+        client, stored = _mock_s3_client()
+        run_a = _attempt(client, "job", _RESUME_CONFIG)
+        run_a.log({"loss": 1.0}, step=1)
+        run_a.save_checkpoint(1, state_dict={"w": 1})
+        run_a._storage.flush()
+        snapshot = dict(stored)
+        get_object = client.get_object.side_effect
+
+        def get_object_failing(Bucket: str, Key: str) -> Any:
+            if Key == f"{_JOB}/{failing_key}":
+                raise Exception("S3 unavailable")
+            return get_object(Bucket=Bucket, Key=Key)
+
+        client.get_object.side_effect = get_object_failing
+        _new_pod(tmp_path, monkeypatch)
+
+        with pytest.raises(Exception, match="S3 unavailable"):
+            _attempt(client, "job", _RESUME_CONFIG)
+
+        assert stored == snapshot
+
+    def test_local_only_resume(self, fake_torch: mock.MagicMock) -> None:
+        def attempt() -> extty.run.Run:
+            return extty.run.Run(
+                "proj",
+                name="local-job",
+                config=_RESUME_CONFIG,
+                system_metrics=False,
+                resume=True,
+            )
+
+        run_a = attempt()
+        for step in range(1, 11):
+            run_a.log({"loss": float(step)}, step=step)
+            if step == 5:
+                run_a.save_checkpoint(5, state_dict={"w": 5})
+        run_a._storage.flush()
+        csv = get_run_dir("proj", "local-job") / "metrics" / "loss.csv"
+        before = csv.read_bytes()
+        assert _csv_steps(before) == list(range(1, 11))
+
+        run_b = attempt()
+
+        assert run_b.resumed is True
+        assert run_b.resume_step == 5
+        assert csv.read_bytes() == b"".join(before.splitlines(keepends=True)[:6])
+        assert run_b.load_checkpoint(5) == {"model_state_dict": {"w": 5}}
+        for step in range(6, 9):
+            run_b.log({"loss": float(step)}, step=step)
+        run_b.finish()
+
+        assert _csv_steps(csv.read_bytes()) == list(range(1, 9))
+
+    def test_run_storage_truncate_after(self, tmp_path: Path) -> None:
+        """Kept rows stay byte for byte, and untouched streams are not rewritten."""
+        from PIL import Image as PILImage
+
+        run_dir = tmp_path / "run"
+        storage = RunStorage(run_dir=run_dir)
+        for step in (1, 2, 3):
+            storage.log_metric("train/loss", step / 3, step)
+            storage.log_example("val/ex", {"text": f"t{step}"}, step)
+            storage.log_image(
+                "val/dets", extty.Image(PILImage.new("RGB", (2, 2), "red")), step
+            )
+        storage.log_example("val/early", {"text": "t"}, 1)
+        storage.log_system(1.0, 2.0)
+        storage.flush()
+        metric = run_dir / "metrics" / "train" / "loss.csv"
+        with open(metric, "ab") as f:
+            f.write(b"4,17")
+        before = metric.read_bytes()
+        system = (run_dir / "system.csv").read_bytes()
+        early = run_dir / "examples" / "val" / "early.jsonl"
+        early_inode = early.stat().st_ino
+
+        storage.truncate_after(2)
+
+        assert metric.read_bytes() == b"".join(before.splitlines(keepends=True)[:3])
+        assert _jsonl_steps((run_dir / "examples/val/ex.jsonl").read_bytes()) == [1, 2]
+        assert _jsonl_steps((run_dir / "images/val/dets.jsonl").read_bytes()) == [1, 2]
+        assert (run_dir / "images/val/dets/step_3.png").exists()
+        assert (run_dir / "system.csv").read_bytes() == system
+        assert early.stat().st_ino == early_inode
+        assert not list(run_dir.rglob("*.tmp"))
+
+    def test_sanitized_metric_names_keep_history(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_torch: mock.MagicMock,
+    ) -> None:
+        client, stored = _mock_s3_client()
+        run_a = _attempt(client, "job", _RESUME_CONFIG)
+        for step in range(1, 4):
+            run_a.log({"a b": float(step)}, step=step)
+        run_a.save_checkpoint(3, state_dict={"w": 3})
+        run_a._storage.flush()
+        _new_pod(tmp_path, monkeypatch)
+
+        run_b = _attempt(client, "job", _RESUME_CONFIG)
+        run_b.log({"a b": 4.0}, step=4)
+        run_b.finish()
+
+        assert _csv_steps(stored[f"{_JOB}/metrics/a_b.csv"]) == [1, 2, 3, 4]
+
+    def test_save_checkpoint_flushes_logged_rows(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        client, stored = _mock_s3_client()
+        run = _attempt(client, "job", resume=False)
+        run.log({"loss": 0.5}, step=5)
+        run.save_checkpoint(5, state_dict={"w": 5})
+
+        assert _csv_steps(stored[f"{_JOB}/metrics/loss.csv"]) == [5]
+        run.finish()
+
+    def test_save_checkpoint_while_another_thread_logs(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        """The flush before a save neither loses nor repeats rows logged meanwhile."""
+        run = extty.run.Run("proj", name="threads", system_metrics=False)
+        n_rows = 3000
+
+        def log_rows() -> None:
+            for step in range(n_rows):
+                run.log(
+                    {
+                        f"m{step % 20}": 1.0,
+                        f"ex{step % 200}": extty.Example(prompt="p", responses=["r"]),
+                    },
+                    step=step,
+                )
+                if step % 5 == 0:
+                    time.sleep(0.0005)
+
+        thread = threading.Thread(target=log_rows)
+        thread.start()
+        saves = 0
+        while thread.is_alive():
+            run.save_checkpoint(saves, state_dict={"w": saves})
+            saves += 1
+        thread.join()
+        run.finish()
+
+        run_dir = Path(run.run_dir)
+        metric_rows = sum(
+            len(path.read_text().splitlines()) - 1
+            for path in (run_dir / "metrics").rglob("*.csv")
+        )
+        example_rows = sum(
+            len(path.read_text().splitlines())
+            for path in (run_dir / "examples").rglob("*.jsonl")
+        )
+        assert saves > 1
+        assert (metric_rows, example_rows) == (n_rows, n_rows)
+
+    def test_meta_write_failure_stops_init(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_torch: mock.MagicMock,
+    ) -> None:
+        """A run never trains without its meta.json in S3."""
+        client, stored = _mock_s3_client()
+        put_object = client.put_object.side_effect
+        meta_key = f"{_JOB}/meta.json"
+
+        def put_object_failing(
+            Bucket: str, Key: str, Body: bytes, ContentType: str | None = None
+        ) -> None:
+            if Key == meta_key:
+                raise BotoCoreError()
+            put_object(Bucket=Bucket, Key=Key, Body=Body, ContentType=ContentType)
+
+        client.put_object.side_effect = put_object_failing
+        with pytest.raises(BotoCoreError):
+            _attempt(client, "job", _RESUME_CONFIG)
+        assert stored == {}
+        assert not (get_run_dir("proj", "job") / "meta.json").exists()
+
+        client.put_object.side_effect = put_object
+        _kill_after_ten_steps(_attempt(client, "job", _RESUME_CONFIG))
+        meta_a = stored[meta_key]
+        _new_pod(tmp_path, monkeypatch)
+
+        client.put_object.side_effect = put_object_failing
+        with pytest.raises(BotoCoreError):
+            _attempt(client, "job", _RESUME_CONFIG)
+        assert stored[meta_key] == meta_a
+        assert not (get_run_dir("proj", "job") / "meta.json").exists()
+
+        client.put_object.side_effect = put_object
+        run = _attempt(client, "job", _RESUME_CONFIG)
+        assert run.resume_step == 5
+        assert len(json.loads(stored[meta_key])["resumes"]) == 1
+        assert _csv_steps(stored[f"{_JOB}/metrics/loss.csv"]) == [1, 2, 3, 4, 5]
+        run.finish()
+
+    def test_files_without_meta_are_not_started_over(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_torch: mock.MagicMock,
+    ) -> None:
+        client, stored = _mock_s3_client()
+        _kill_after_ten_steps(_attempt(client, "job", _RESUME_CONFIG))
+        del stored[f"{_JOB}/meta.json"]
+        snapshot = dict(stored)
+        pod = _new_pod(tmp_path, monkeypatch)
+
+        with pytest.raises(RuntimeError, match="no meta.json"):
+            _attempt(client, "job", _RESUME_CONFIG)
+
+        assert stored == snapshot
+        assert not pod.exists()
+        prefix_of_job = _attempt(client, "jo", _RESUME_CONFIG)
+        assert prefix_of_job.resumed is False
+        prefix_of_job.finish()
+
+    def test_uploads_after_resume_do_not_read(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_torch: mock.MagicMock,
+    ) -> None:
+        client, stored = _mock_s3_client()
+        _kill_after_ten_steps(_attempt(client, "job", _RESUME_CONFIG))
+        _new_pod(tmp_path, monkeypatch)
+        run_b = _attempt(client, "job", _RESUME_CONFIG)
+
+        def get_object(Bucket: str, Key: str) -> Any:
+            raise AssertionError(f"unexpected get_object call for {Key!r}")
+
+        client.get_object.side_effect = get_object
+        client.get_object.reset_mock()
+        run_b.log({"loss": 6.0, **_every_kind(6)}, step=6)
+        run_b._storage.log_system(1.0, 16.0)
+        run_b._storage.flush()
+        run_b.finish()
+
+        client.get_object.assert_not_called()
+        assert _csv_steps(stored[f"{_JOB}/metrics/loss.csv"]) == list(range(1, 7))
+        assert _jsonl_steps(stored[f"{_JOB}/examples/val/example.jsonl"]) == [2, 6]
+        assert _jsonl_steps(stored[f"{_JOB}/images/val/dets.jsonl"]) == [4, 6]
+        assert _jsonl_steps(stored[f"{_JOB}/confusion_matrices/eval/cm.jsonl"]) == [
+            5,
+            6,
+        ]
+        assert _jsonl_steps(stored[f"{_JOB}/charts/eval/roc.jsonl"]) == [5, 6]
+
+    def test_save_checkpoint_reports_whether_it_reached_s3(
+        self, fake_torch: mock.MagicMock
+    ) -> None:
+        client, _ = _mock_s3_client()
+        run = _attempt(client, "job", resume=False)
+        assert run.save_checkpoint(1, state_dict={"w": 1}) is True
+
+        client.upload_file.side_effect = BotoCoreError()
+        assert run.save_checkpoint(2, state_dict={"w": 2}) is False
+        assert read_local_checkpoint(local_checkpoint_dir("proj", "job", 2)) == {
+            "model_state_dict": {"w": 2}
+        }
+        run.finish()
+
+        local = extty.run.Run("proj", name="local", system_metrics=False)
+        assert local.save_checkpoint(1, state_dict={"w": 1}) is False
+        local.finish()
+
+    @pytest.mark.parametrize(
+        ("case", "expected"),
+        [
+            ("uploaded", True),
+            ("upload-failed", False),
+            ("no-s3", False),
+            ("non-main", None),
+        ],
+    )
+    def test_module_save_checkpoint_returns_run_result(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_torch: mock.MagicMock,
+        case: str,
+        expected: bool | None,
+    ) -> None:
+        client, _ = _mock_s3_client()
+        if case == "upload-failed":
+            client.upload_file.side_effect = BotoCoreError()
+        if case != "no-s3":
+            monkeypatch.setenv("EXTTY_S3_BUCKET", "b")
+            monkeypatch.setenv("EXTTY_S3_PREFIX", "pfx")
+        with mock.patch("boto3.client", return_value=client):
+            extty.init(
+                "proj",
+                name="job",
+                system_metrics=False,
+                rank=1 if case == "non-main" else 0,
+            )
+        result = extty.save_checkpoint(1, state_dict={"w": 1})
+        extty.finish()
+
+        assert result is expected
+
+    def test_meta_data_round_trips_resumes(self) -> None:
+        resumes = [{"at": "2026-01-01T00:00:00+00:00", "step": 5, "env": {"_a": 1}}]
+        meta = MetaData(
+            project="p",
+            run_name="r",
+            config={"a": 1},
+            started_at="2026-01-01T00:00:00+00:00",
+            resumes=resumes,
+        )
+        assert MetaData.from_dict(json.loads(json.dumps(meta.to_dict()))) == meta
+
+        old = {
+            "project": "p",
+            "run_name": "r",
+            "config": {},
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "finished_at": None,
+            "status": "completed",
+        }
+        loaded = MetaData.from_dict(old)
+        assert loaded.resumes == []
+        assert loaded.to_dict() == old
+
+    def test_init_resumes_with_s3_from_environment(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_torch: mock.MagicMock,
+    ) -> None:
+        client, stored = _mock_s3_client()
+        monkeypatch.setenv("EXTTY_S3_BUCKET", "b")
+        monkeypatch.setenv("EXTTY_S3_PREFIX", "pfx")
+
+        def init() -> extty.Run:
+            with mock.patch("boto3.client", return_value=client):
+                return extty.init(
+                    "proj",
+                    name="job",
+                    config=_RESUME_CONFIG,
+                    system_metrics=False,
+                    resume=True,
+                )
+
+        run_a = init()
+        assert run_a.resumed is False
+        for step in range(1, 5):
+            extty.log({"loss": float(step)}, step=step)
+            if step == 2:
+                assert extty.save_checkpoint(2, state_dict={"w": 2}) is True
+        run_a._storage.flush()
+        extty._active_run = None
+        _new_pod(tmp_path, monkeypatch)
+
+        run_b = init()
+
+        assert run_b.resumed is True
+        assert run_b.resume_step == 2
+        assert _csv_steps(stored[f"{_JOB}/metrics/loss.csv"]) == [1, 2]
+        assert extty.load_checkpoint(2) == {"model_state_dict": {"w": 2}}
+        extty.finish()
+
+    def test_noop_run_is_never_resumed(self) -> None:
+        run = extty.init("proj", name="job", rank=1, resume=True)
+        assert isinstance(run, extty.NoOpRun)
+        assert run.resumed is False
+        assert run.resume_step is None
+        extty.finish()
+
+
+def _meta_with_resumes(resumes: int) -> MetaData:
+    return MetaData(
+        project="proj",
+        run_name="job",
+        config={},
+        started_at="2026-01-01T00:00:00+00:00",
+        resumes=[
+            {"at": "2026-01-02T00:00:00+00:00", "step": i, "env": {}}
+            for i in range(resumes)
+        ],
+    )
+
+
+def _local_job(resumes: int, steps: list[int]) -> Path:
+    """Write a local copy of proj/job that has seen ``resumes`` resumes."""
+    run_dir = get_run_dir("proj", "job")
+    storage = RunStorage(run_dir=run_dir)
+    storage.write_meta(_meta_with_resumes(resumes))
+    for step in steps:
+        storage.log_metric("loss", float(step), step)
+    storage.flush()
+    return run_dir
+
+
+def _remote_job(stored: dict[str, bytes], resumes: int, steps: list[int]) -> None:
+    """Store S3's copy of proj/job, with rows at timestamps a pull never saw."""
+    meta = _meta_with_resumes(resumes).to_dict()
+    stored[f"{_JOB}/meta.json"] = json.dumps(meta).encode()
+    rows = "".join(f"{step},{1000.0 + step:.6f},{float(step)}\n" for step in steps)
+    stored[f"{_JOB}/metrics/loss.csv"] = f"step,timestamp,value\n{rows}".encode()
+
+
+class TestPushAfterResume:
+    """``extty.push`` never merges streams across a resume."""
+
+    def _push(self, client: mock.MagicMock) -> list[str]:
+        with mock.patch("boto3.client", return_value=client):
+            return extty.push("proj/job", s3_config=_S3_CONFIG)
+
+    def test_copy_pulled_before_a_resume_is_refused(self) -> None:
+        client, stored = _mock_s3_client()
+        _local_job(resumes=0, steps=[1, 2, 3, 4])
+        _remote_job(stored, resumes=1, steps=[1, 2, 3])
+        snapshot = dict(stored)
+
+        with pytest.raises(RuntimeError, match="pull it again"):
+            self._push(client)
+
+        assert stored == snapshot
+
+    def test_copy_resumed_since_s3_was_written_replaces_it(self) -> None:
+        client, stored = _mock_s3_client()
+        run_dir = _local_job(resumes=1, steps=[1, 2, 3])
+        _remote_job(stored, resumes=0, steps=[1, 2, 3, 4, 5])
+
+        assert self._push(client) == ["proj/job"]
+
+        local_csv = (run_dir / "metrics" / "loss.csv").read_bytes()
+        assert stored[f"{_JOB}/metrics/loss.csv"] == local_csv
+        assert len(json.loads(stored[f"{_JOB}/meta.json"])["resumes"]) == 1
+
+    def test_merged_meta_prefers_more_resumes(self) -> None:
+        completed = {**_meta_with_resumes(0).to_dict(), "status": "completed"}
+        resumed = _meta_with_resumes(1).to_dict()
+
+        assert extty._merge_meta(completed, resumed) == resumed
+        assert extty._merge_meta(resumed, completed) == resumed
 
 
 class TestDeleteLocalCheckpoint:
