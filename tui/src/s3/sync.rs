@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -177,10 +178,15 @@ impl S3Client {
     /// Downloads a run from S3.
     ///
     /// Returns `Ok(None)` if the run was skipped because it is already completed
-    /// locally. Otherwise every object under the run prefix (checkpoints aside) is
-    /// compared against its local copy and only stale or missing ones are fetched,
-    /// up to [`DOWNLOAD_CONCURRENCY`] at a time. Pass `force` to re-download
-    /// everything.
+    /// locally and S3's copy has not been resumed since it was pulled. Otherwise
+    /// every object under the run prefix (checkpoints aside) is compared against
+    /// its local copy and only stale or missing ones are fetched, up to
+    /// [`DOWNLOAD_CONCURRENCY`] at a time, then merged into the local copy as
+    /// [`PullMode`] says. Pass `force` to re-download everything.
+    ///
+    /// `meta.json` is read first and stored last, so a resume that lands during
+    /// the pull leaves the local `meta.json` behind S3's and the next pull
+    /// replaces the streams it cut.
     pub async fn download_run(
         &self,
         project: &str,
@@ -191,13 +197,15 @@ impl S3Client {
     ) -> Result<Option<PullSummary>> {
         let prefix = self.s3_prefix(&format!("runs/{}/{}/", project, run));
         let run_dir = dest.join(project).join(run);
+        let meta_key = format!("{}meta.json", prefix);
 
+        let mut mode = PullMode::Merge;
+        let mut remote_meta: Option<Vec<u8>> = None;
         if !force && !dry_run {
-            let meta_path = run_dir.join("meta.json");
-            if let Ok(content) = fs::read(&meta_path)
-                && let Ok(meta) = serde_json::from_slice::<MetaJson>(&content)
-                && meta.status.as_deref() == Some("completed")
-            {
+            remote_meta = self.get_object_content(&meta_key).await?;
+            let local_meta = fs::read(run_dir.join("meta.json")).ok();
+            mode = pull_mode(local_meta.as_deref(), remote_meta.as_deref());
+            if mode == PullMode::Skip {
                 let _ = self
                     .sync_checkpoints_index_if_newer(project, run, &run_dir)
                     .await;
@@ -217,8 +225,10 @@ impl S3Client {
 
         fs::create_dir_all(&run_dir)?;
 
+        let replace = force || mode == PullMode::Replace;
         let mut pending: Vec<(String, PathBuf)> = Vec::new();
         let mut skipped = 0usize;
+        let mut store_meta = false;
         for object in self.list_objects(&prefix).await? {
             let Some(key) = object.key() else {
                 continue;
@@ -229,8 +239,19 @@ impl S3Client {
             }
 
             let local_path = run_dir.join(relative_path);
-            if !force && local_is_current(&local_path, &object, is_mergeable(key)) {
+            let mergeable = is_mergeable(key);
+            let skip = match mode {
+                _ if force => false,
+                PullMode::KeepLocal if mergeable => true,
+                PullMode::Replace if mergeable => false,
+                _ => local_is_current(&local_path, &object, mergeable),
+            };
+            if skip {
                 skipped += 1;
+                continue;
+            }
+            if key == meta_key && remote_meta.is_some() {
+                store_meta = true;
                 continue;
             }
             if let Some(parent) = local_path.parent() {
@@ -239,14 +260,17 @@ impl S3Client {
             pending.push((key.to_string(), local_path));
         }
 
-        let downloaded = pending.len();
+        let downloaded = pending.len() + usize::from(store_meta);
         futures_util::stream::iter(pending)
             .map(move |(key, local_path)| async move {
-                self.download_file(&key, &local_path, force).await
+                self.download_file(&key, &local_path, replace).await
             })
             .buffer_unordered(DOWNLOAD_CONCURRENCY)
             .try_collect::<()>()
             .await?;
+        if store_meta && let Some(body) = &remote_meta {
+            store_downloaded(&meta_key, &run_dir.join("meta.json"), body, replace)?;
+        }
 
         Ok(Some(PullSummary {
             downloaded,
@@ -314,12 +338,20 @@ impl S3Client {
         }
 
         let prefix = self.s3_prefix(&format!("runs/{}/{}", project, run));
+        let replace = force || {
+            let remote_meta = self
+                .get_object_content(&format!("{}/meta.json", prefix))
+                .await?;
+            let local_meta = fs::read(run_dir.join("meta.json")).ok();
+            push_mode(project, run, local_meta.as_deref(), remote_meta.as_deref())?
+                == PushMode::Replace
+        };
 
         for entry in run_files_to_upload(&run_dir)? {
             let relative_path = entry.strip_prefix(&run_dir)?;
             let s3_key = format!("{}/{}", prefix, relative_path.display());
 
-            self.upload_file(&entry, &s3_key, force).await?;
+            self.upload_file(&entry, &s3_key, replace).await?;
         }
 
         Ok(())
@@ -636,6 +668,92 @@ impl S3Client {
     }
 }
 
+/// How a pull treats the local copy of a run.
+///
+/// The SDK records each time it resumes a run in `meta.json`'s `resumes` list,
+/// and a resume cuts the run's metric, example, confusion matrix, chart and
+/// image index streams back to a checkpoint before appending to them. Two
+/// copies whose lists differ in length therefore hold different histories,
+/// and merging their streams row by row would keep the rows the resume dropped
+/// next to the ones that replaced them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullMode {
+    /// Leave the run alone: its local copy is completed and S3's has not been
+    /// resumed since.
+    Skip,
+    /// Merge S3's streams and `meta.json` into the local copy.
+    Merge,
+    /// Replace the local streams and `meta.json` with S3's, which was resumed
+    /// after the local copy was pulled.
+    Replace,
+    /// Keep the local streams and `meta.json`: the local copy was resumed after
+    /// S3's was written, so S3's still hold the rows that resume dropped.
+    KeepLocal,
+}
+
+/// How a push treats S3's copy of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushMode {
+    /// Merge the local streams and `meta.json` into S3's.
+    Merge,
+    /// Overwrite S3's with the local ones, which were resumed after S3's were
+    /// written.
+    Replace,
+}
+
+/// How many times the SDK has resumed the run, from its `meta.json`.
+fn resume_count(meta: &MetaJson) -> usize {
+    meta.resumes
+        .as_ref()
+        .and_then(|resumes| resumes.as_array())
+        .map_or(0, Vec::len)
+}
+
+fn parse_meta(content: Option<&[u8]>) -> Option<MetaJson> {
+    content.and_then(|bytes| serde_json::from_slice(bytes).ok())
+}
+
+/// Decide how to pull a run from the local and S3 `meta.json`, either of
+/// which may be missing.
+fn pull_mode(local_meta: Option<&[u8]>, remote_meta: Option<&[u8]>) -> PullMode {
+    let Some(local) = parse_meta(local_meta) else {
+        return PullMode::Merge;
+    };
+    let local_resumes = resume_count(&local);
+    let remote_resumes = parse_meta(remote_meta).map_or(local_resumes, |r| resume_count(&r));
+    match remote_resumes.cmp(&local_resumes) {
+        Ordering::Greater => PullMode::Replace,
+        Ordering::Less => PullMode::KeepLocal,
+        Ordering::Equal if local.status.as_deref() == Some("completed") => PullMode::Skip,
+        Ordering::Equal => PullMode::Merge,
+    }
+}
+
+/// Decide how to push a run from the local and S3 `meta.json`, either of
+/// which may be missing.
+///
+/// Fails when S3's copy was resumed after the local one was pulled: merging
+/// would add the rows that resume dropped back into S3.
+fn push_mode(
+    project: &str,
+    run: &str,
+    local_meta: Option<&[u8]>,
+    remote_meta: Option<&[u8]>,
+) -> Result<PushMode> {
+    let local_resumes = parse_meta(local_meta).map_or(0, |m| resume_count(&m));
+    let remote_resumes = parse_meta(remote_meta).map_or(0, |m| resume_count(&m));
+    match local_resumes.cmp(&remote_resumes) {
+        Ordering::Less => anyhow::bail!(
+            "{}/{} was resumed in S3 after this copy was pulled; pull it again \
+             before pushing, or push with --force to overwrite S3's copy",
+            project,
+            run
+        ),
+        Ordering::Greater => Ok(PushMode::Replace),
+        Ordering::Equal => Ok(PushMode::Merge),
+    }
+}
+
 /// Keys whose local copy is merged with the remote rather than overwritten.
 /// Must agree with the branches in [`S3Client::download_file`].
 fn is_mergeable(key: &str) -> bool {
@@ -860,6 +978,9 @@ struct MetaJson {
     status: Option<String>,
     #[serde(default)]
     finished_at: Option<String>,
+    /// One entry per time the SDK resumed the run; absent until the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resumes: Option<serde_json::Value>,
     #[serde(flatten)]
     other: HashMap<String, serde_json::Value>,
 }
@@ -1206,7 +1327,18 @@ fn merge_meta_bytes(local: &[u8], remote: &[u8]) -> Result<Vec<u8>> {
     let local_meta: MetaJson = serde_json::from_slice(local)?;
     let remote_meta: MetaJson = serde_json::from_slice(remote)?;
 
-    let merged = if local_meta.status.as_deref() == Some("completed") {
+    let merged = match resume_count(&local_meta).cmp(&resume_count(&remote_meta)) {
+        Ordering::Greater => local_meta,
+        Ordering::Less => remote_meta,
+        Ordering::Equal => merge_meta_of_one_attempt(local_meta, remote_meta),
+    };
+
+    Ok(serde_json::to_vec_pretty(&merged)?)
+}
+
+/// Pick between two `meta.json` that have seen the same resumes.
+fn merge_meta_of_one_attempt(local_meta: MetaJson, remote_meta: MetaJson) -> MetaJson {
+    if local_meta.status.as_deref() == Some("completed") {
         local_meta
     } else if remote_meta.status.as_deref() == Some("completed") {
         remote_meta
@@ -1223,15 +1355,17 @@ fn merge_meta_bytes(local: &[u8], remote: &[u8]) -> Result<Vec<u8>> {
             (None, Some(_)) => remote_meta,
             (None, None) => local_meta,
         }
-    };
-
-    Ok(serde_json::to_vec_pretty(&merged)?)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use aws_sdk_s3::primitives::DateTime;
+    use std::collections::BTreeMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
 
     fn object(secs_ago: i64, size: i64) -> Object {
         let now = std::time::SystemTime::now()
@@ -1438,6 +1572,388 @@ mod tests {
             .build();
         assert!(!local_is_current(&path, &no_size, false));
         assert!(local_is_current(&path, &no_size, true));
+    }
+
+    /// A minimal S3 endpoint for the sync tests: path-style GetObject,
+    /// HeadObject, PutObject and ListObjectsV2 over plain HTTP/1.1, backed by
+    /// a map from key to body. Every object reports a far-future LastModified,
+    /// so a pull always treats the remote copy as newer.
+    struct FakeS3 {
+        objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+        endpoint: String,
+    }
+
+    impl FakeS3 {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::default();
+            let shared = Arc::clone(&objects);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { return };
+                    let shared = Arc::clone(&shared);
+                    std::thread::spawn(move || serve_connection(stream, &shared));
+                }
+            });
+            Self { objects, endpoint }
+        }
+
+        fn config(&self) -> S3Config {
+            S3Config {
+                bucket: "test".to_string(),
+                prefix: String::new(),
+                region: Some("us-east-1".to_string()),
+                access_key_id: Some("test".to_string()),
+                secret_access_key: Some("test-secret".to_string()),
+                endpoint_url: Some(self.endpoint.clone()),
+            }
+        }
+
+        fn put(&self, key: &str, body: Vec<u8>) {
+            self.objects.lock().unwrap().insert(key.to_string(), body);
+        }
+
+        fn get(&self, key: &str) -> Vec<u8> {
+            self.objects.lock().unwrap()[key].clone()
+        }
+
+        fn snapshot(&self) -> BTreeMap<String, Vec<u8>> {
+            self.objects.lock().unwrap().clone()
+        }
+    }
+
+    fn serve_connection(stream: TcpStream, objects: &Mutex<BTreeMap<String, Vec<u8>>>) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        loop {
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                return;
+            }
+            let mut parts = request_line.split_whitespace();
+            let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
+                return;
+            };
+            let (method, target) = (method.to_string(), target.to_string());
+            let mut headers: HashMap<String, String> = HashMap::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+                }
+            }
+            let header = |name: &str| headers.get(name).map(String::as_str).unwrap_or("");
+            let mut body = Vec::new();
+            if header("transfer-encoding").contains("chunked") {
+                body = read_chunks(&mut reader);
+            } else if let Ok(len) = header("content-length").parse::<usize>() {
+                body.resize(len, 0);
+                reader.read_exact(&mut body).unwrap();
+            }
+            if header("content-encoding").contains("aws-chunked") {
+                body = read_chunks(&mut body.as_slice());
+            }
+
+            let (status, response) = respond(&method, &target, body, objects);
+            let head = format!(
+                "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\n\r\n",
+                status,
+                response.len()
+            );
+            writer.write_all(head.as_bytes()).unwrap();
+            if method != "HEAD" {
+                writer.write_all(&response).unwrap();
+            }
+        }
+    }
+
+    /// Decode an HTTP or aws-chunked body, dropping any trailers.
+    fn read_chunks(reader: &mut impl BufRead) -> Vec<u8> {
+        let mut body = Vec::new();
+        loop {
+            let mut size_line = String::new();
+            reader.read_line(&mut size_line).unwrap();
+            let size_hex = size_line.trim().split(';').next().unwrap_or("0");
+            let size = usize::from_str_radix(size_hex, 16).unwrap();
+            if size == 0 {
+                loop {
+                    let mut trailer = String::new();
+                    if reader.read_line(&mut trailer).unwrap_or(0) == 0 || trailer.trim().is_empty()
+                    {
+                        return body;
+                    }
+                }
+            }
+            let mut chunk = vec![0; size + 2];
+            reader.read_exact(&mut chunk).unwrap();
+            body.extend_from_slice(&chunk[..size]);
+        }
+    }
+
+    fn percent_decode(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                out.push(u8::from_str_radix(&text[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    fn respond(
+        method: &str,
+        target: &str,
+        body: Vec<u8>,
+        objects: &Mutex<BTreeMap<String, Vec<u8>>>,
+    ) -> (&'static str, Vec<u8>) {
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let path = percent_decode(path);
+        let key = path
+            .trim_start_matches('/')
+            .split_once('/')
+            .map_or("", |(_bucket, key)| key)
+            .to_string();
+        let mut objects = objects.lock().unwrap();
+        match method {
+            "PUT" => {
+                objects.insert(key, body);
+                ("200 OK", Vec::new())
+            }
+            "GET" if key.is_empty() => {
+                let prefix = query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .find(|(name, _)| *name == "prefix")
+                    .map_or(String::new(), |(_, value)| percent_decode(value));
+                let contents: String = objects
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .map(|(key, body)| {
+                        format!(
+                            "<Contents><Key>{}</Key>\
+                             <LastModified>2099-01-01T00:00:00.000Z</LastModified>\
+                             <ETag>\"0\"</ETag><Size>{}</Size>\
+                             <StorageClass>STANDARD</StorageClass></Contents>",
+                            key,
+                            body.len()
+                        )
+                    })
+                    .collect();
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <Name>test</Name><Prefix>{}</Prefix><MaxKeys>1000</MaxKeys>\
+                     <IsTruncated>false</IsTruncated>{}</ListBucketResult>",
+                    prefix, contents
+                );
+                ("200 OK", xml.into_bytes())
+            }
+            "GET" | "HEAD" => match objects.get(&key) {
+                Some(body) => ("200 OK", body.clone()),
+                None => (
+                    "404 Not Found",
+                    b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code>\
+                      <Message>The specified key does not exist.</Message></Error>"
+                        .to_vec(),
+                ),
+            },
+            _ => ("501 Not Implemented", Vec::new()),
+        }
+    }
+
+    fn meta_json(status: &str, resumes: usize) -> Vec<u8> {
+        let mut meta = serde_json::json!({
+            "project": "p",
+            "run_name": "r",
+            "config": {"lr": 0.1},
+            "started_at": "2026-10-01T00:00:00+00:00",
+            "finished_at": null,
+            "status": status,
+        });
+        if resumes > 0 {
+            let entries: Vec<serde_json::Value> = (0..resumes)
+                .map(|i| serde_json::json!({"at": "2026-10-02T00:00:00+00:00", "step": i, "env": {}}))
+                .collect();
+            meta["resumes"] = serde_json::json!(entries);
+        }
+        serde_json::to_vec_pretty(&meta).unwrap()
+    }
+
+    /// A metric CSV from `(step, timestamp)` rows; a resumed attempt logs a
+    /// step again at a new timestamp.
+    fn loss_csv(rows: &[(u64, f64)]) -> Vec<u8> {
+        let mut csv = String::from("step,timestamp,value\n");
+        for (step, timestamp) in rows {
+            csv.push_str(&format!("{},{:.6},0.5\n", step, timestamp));
+        }
+        csv.into_bytes()
+    }
+
+    fn examples_jsonl(rows: &[(u64, f64)]) -> Vec<u8> {
+        rows.iter()
+            .map(|(step, timestamp)| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({"step": step, "timestamp": timestamp, "data": {}})
+                )
+            })
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    fn csv_steps(content: &[u8]) -> Vec<u64> {
+        let text = std::str::from_utf8(content).unwrap();
+        text.lines()
+            .skip(1)
+            .map(|line| line.split(',').next().unwrap().parse().unwrap())
+            .collect()
+    }
+
+    fn meta_resumes(content: &[u8]) -> usize {
+        resume_count(&serde_json::from_slice(content).unwrap())
+    }
+
+    #[test]
+    fn pull_and_sync_follow_a_resumed_run() {
+        const META: &str = "runs/p/r/meta.json";
+        const LOSS: &str = "runs/p/r/metrics/loss.csv";
+        const EXAMPLES: &str = "runs/p/r/examples/val.jsonl";
+        let s3 = FakeS3::start();
+        let dest = tempfile::tempdir().unwrap();
+        let run_dir = dest.path().join("p").join("r");
+        let local = |relative: &str| fs::read(run_dir.join(relative)).unwrap();
+
+        // Attempt 1 logged steps 1-4 and crashed inside `with extty.init(...)`,
+        // which records the run as completed.
+        s3.put(META, meta_json("completed", 0));
+        s3.put(LOSS, loss_csv(&[(1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0)]));
+        s3.put(EXAMPLES, examples_jsonl(&[(2, 2.0), (4, 4.0)]));
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let client = S3Client::new(s3.config()).await.unwrap();
+            let pull = || client.download_run("p", "r", dest.path(), false, false);
+
+            assert!(pull().await.unwrap().is_some());
+            assert_eq!(csv_steps(&local("metrics/loss.csv")), [1, 2, 3, 4]);
+            assert!(pull().await.unwrap().is_none(), "completed and unchanged");
+
+            // Attempt 2 resumes from checkpoint 2: the SDK cuts every stream
+            // back to step 2, then logs steps 3 and 5 again.
+            s3.put(META, meta_json("running", 1));
+            s3.put(LOSS, loss_csv(&[(1, 1.0), (2, 2.0), (3, 13.0), (5, 15.0)]));
+            s3.put(EXAMPLES, examples_jsonl(&[(2, 2.0)]));
+
+            assert!(pull().await.unwrap().is_some(), "resumed since the pull");
+            for (relative, key) in [
+                ("meta.json", META),
+                ("metrics/loss.csv", LOSS),
+                ("examples/val.jsonl", EXAMPLES),
+            ] {
+                assert_eq!(local(relative), s3.get(key), "{relative}");
+            }
+
+            // Attempt 3 resumes from checkpoint 3 before a sync.
+            s3.put(META, meta_json("running", 2));
+            s3.put(LOSS, loss_csv(&[(1, 1.0), (2, 2.0), (3, 13.0), (4, 24.0)]));
+
+            client.sync_run("p", "r", dest.path(), false).await.unwrap();
+            assert_eq!(csv_steps(&s3.get(LOSS)), [1, 2, 3, 4]);
+            assert_eq!(csv_steps(&local("metrics/loss.csv")), [1, 2, 3, 4]);
+            assert_eq!(meta_resumes(&s3.get(META)), 2);
+            assert_eq!(meta_resumes(&local("meta.json")), 2);
+
+            // A push from a copy pulled before attempt 4 resumed is refused.
+            s3.put(META, meta_json("running", 3));
+            s3.put(LOSS, loss_csv(&[(1, 1.0), (2, 2.0)]));
+            let before = s3.snapshot();
+            let err = client
+                .upload_run("p", "r", dest.path(), false, false)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("pull it again"), "{err}");
+            assert_eq!(s3.snapshot(), before);
+        });
+    }
+
+    #[test]
+    fn pull_mode_follows_resume_counts() {
+        let completed = meta_json("completed", 1);
+        let running = meta_json("running", 1);
+        let resumed_again = meta_json("running", 2);
+        let first_attempt = meta_json("completed", 0);
+
+        assert_eq!(pull_mode(None, Some(&running)), PullMode::Merge);
+        assert_eq!(pull_mode(Some(&completed), Some(&running)), PullMode::Skip);
+        assert_eq!(pull_mode(Some(&completed), None), PullMode::Skip);
+        assert_eq!(pull_mode(Some(&running), Some(&completed)), PullMode::Merge);
+        assert_eq!(pull_mode(Some(&running), None), PullMode::Merge);
+        assert_eq!(
+            pull_mode(Some(&completed), Some(&resumed_again)),
+            PullMode::Replace
+        );
+        assert_eq!(
+            pull_mode(Some(&first_attempt), Some(&running)),
+            PullMode::Replace
+        );
+        assert_eq!(
+            pull_mode(Some(&resumed_again), Some(&running)),
+            PullMode::KeepLocal
+        );
+    }
+
+    #[test]
+    fn push_mode_follows_resume_counts() {
+        let once = meta_json("running", 1);
+        let twice = meta_json("running", 2);
+
+        assert_eq!(
+            push_mode("p", "r", Some(&once), Some(&once)).unwrap(),
+            PushMode::Merge
+        );
+        assert_eq!(
+            push_mode("p", "r", Some(&once), None).unwrap(),
+            PushMode::Replace
+        );
+        assert_eq!(
+            push_mode("p", "r", Some(&twice), Some(&once)).unwrap(),
+            PushMode::Replace
+        );
+        assert!(push_mode("p", "r", Some(&once), Some(&twice)).is_err());
+        assert!(push_mode("p", "r", None, Some(&once)).is_err());
+    }
+
+    #[test]
+    fn merged_meta_prefers_more_resumes_and_keeps_them() {
+        let completed_first = meta_json("completed", 0);
+        let resumed = meta_json("running", 1);
+
+        for (local, remote) in [(&completed_first, &resumed), (&resumed, &completed_first)] {
+            let merged: serde_json::Value =
+                serde_json::from_slice(&merge_meta_bytes(local, remote).unwrap()).unwrap();
+            assert_eq!(merged["status"], "running");
+            assert_eq!(merged["resumes"].as_array().unwrap().len(), 1);
+            assert_eq!(merged["config"]["lr"], 0.1);
+        }
+        let merged: serde_json::Value = serde_json::from_slice(
+            &merge_meta_bytes(&completed_first, &meta_json("running", 0)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(merged["status"], "completed");
+        assert!(merged.get("resumes").is_none());
     }
 
     #[test]

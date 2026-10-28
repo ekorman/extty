@@ -38,7 +38,7 @@ from extty.confusion import ConfusionMatrix
 from extty.example import BatchExample, Example
 from extty.image import Image
 from extty.query import RunData, get_run, get_runs
-from extty.run import NoOpRun, Run
+from extty.run import NoOpRun, Run, RunConfigMismatch
 from extty.s3 import S3Config
 from extty.storage import (
     ChartRecord,
@@ -63,6 +63,7 @@ __all__ = [
     "delete_local_checkpoint",
     "finish",
     "Run",
+    "RunConfigMismatch",
     "RunData",
     "get_runs",
     "get_run",
@@ -151,9 +152,10 @@ def init(
     config: dict[str, Any] | None = None,
     system_metrics: bool = True,
     rank: int | None = None,
+    resume: bool = False,
 ) -> Run:
     """
-    Initialize a new experiment run.
+    Initialize a new experiment run, or continue an existing one.
 
     On non-main processes in distributed training (detected via the RANK
     environment variable or the explicit ``rank`` parameter), returns a
@@ -172,11 +174,36 @@ def init(
     rank : int, optional
         Explicit process rank. When provided, overrides the RANK environment
         variable. Only rank 0 creates a real run.
+    resume : bool, default False
+        Continue the run called ``name`` if it exists, reading it from S3
+        when configured and from the run directory otherwise. Its logged
+        history is cut back to its latest checkpoint, ``run.resume_step``,
+        and later logs append to it; its ``config`` and ``started_at`` are
+        kept. With no such run, a new one is started. Without ``resume``, a
+        run with the same name is overwritten. Only one process may write a
+        run at a time, and resuming is not supported in distributed training:
+        non-main processes get a :class:`NoOpRun` with ``resumed`` False.
 
     Returns
     -------
     Run
         The initialized run object (or :class:`NoOpRun` on non-main processes).
+        ``run.resumed`` says whether an existing run was continued.
+
+    Raises
+    ------
+    ValueError
+        If ``resume`` is set without a ``name``.
+    RunConfigMismatch
+        If ``resume`` is set and the run's stored config differs from
+        ``config`` outside its ``_`` keys. Nothing is written in that case.
+    RuntimeError
+        If ``resume`` is set and S3 holds files of the run but no
+        ``meta.json``. Nothing is written in that case.
+    botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError
+        If ``resume`` is set with S3 configured and reading the run from S3
+        fails for any reason but a missing object, or its ``meta.json``
+        cannot be written to S3.
     """
     global _active_run, _atexit_registered
     if _active_run is not None:
@@ -191,6 +218,7 @@ def init(
             name=name,
             config=config,
             system_metrics=system_metrics,
+            resume=resume,
         )
         _logger.info(
             "initialized run %s/%s, writing to %s",
@@ -233,12 +261,13 @@ def save_checkpoint(
     state_dict: Any = None,
     optimizer_state_dict: Any = None,
     keep_local: bool = False,
-) -> None:
+) -> bool | None:
     """
     Save a checkpoint for the active run.
 
     Saved to the run directory, or uploaded to S3 when configured; see
-    :meth:`extty.Run.save_checkpoint`.
+    :meth:`extty.Run.save_checkpoint`. The rows logged so far are flushed
+    first.
 
     Parameters
     ----------
@@ -252,10 +281,16 @@ def save_checkpoint(
         Optimizer state dict to include when using state_dict.
     keep_local : bool, default False
         Keep the local copy after a successful S3 upload.
+
+    Returns
+    -------
+    bool or None
+        True if the save reached S3, False if it was kept only locally, and
+        None on a non-main process, where nothing is saved.
     """
     if _active_run is None:
         raise RuntimeError("No active run. Call extty.init() first.")
-    _active_run.save_checkpoint(
+    return _active_run.save_checkpoint(
         step,
         path=path,
         state_dict=state_dict,
@@ -607,6 +642,13 @@ def push(
     -------
     list[str]
         List of pushed run paths (project/run_name format).
+
+    Raises
+    ------
+    RuntimeError
+        If a run was resumed in S3 after its local copy was pulled. Without
+        ``force``, a local copy resumed more often than S3's overwrites it
+        instead of being merged.
     """
     if s3_config is None:
         s3_config = S3Config.load()
@@ -675,41 +717,52 @@ def _push_run_to_s3(
     local_run_dir,
     force: bool = False,
 ) -> None:
-    """Push a single run directory to S3."""
+    """
+    Push a single run directory to S3.
+
+    Without ``force``, S3's streams are merged with the local ones, unless
+    the two copies have seen a different number of resumes: a resume cuts a
+    run's streams back to a checkpoint, so merging would keep the rows it
+    dropped. A local copy resumed more often overwrites S3's, and one resumed
+    less often is refused.
+
+    Raises
+    ------
+    RuntimeError
+        If S3's copy was resumed after the local one was pulled.
+    """
     import json
 
     meta_path = local_run_dir / "meta.json"
-    if meta_path.exists():
-        with open(meta_path) as f:
-            meta_content = f.read()
-        if force:
-            client.put_object(
-                Bucket=bucket,
-                Key=f"{s3_prefix}/meta.json",
-                Body=meta_content.encode("utf-8"),
-                ContentType="application/json",
+    meta_content = meta_path.read_text() if meta_path.exists() else None
+    remote_meta = None
+    if not force:
+        try:
+            response = client.get_object(Bucket=bucket, Key=f"{s3_prefix}/meta.json")
+            remote_meta = json.loads(response["Body"].read().decode("utf-8"))
+        except client.exceptions.NoSuchKey:
+            pass
+        local_resumes = _resume_count(json.loads(meta_content or "{}"))
+        remote_resumes = _resume_count(remote_meta or {})
+        if remote_resumes > local_resumes:
+            raise RuntimeError(
+                f"{s3_prefix} was resumed in S3 after this copy was pulled; pull "
+                "it again before pushing, or push with force=True to overwrite "
+                "S3's copy"
             )
-        else:
-            try:
-                response = client.get_object(
-                    Bucket=bucket, Key=f"{s3_prefix}/meta.json"
-                )
-                remote_meta = json.loads(response["Body"].read().decode("utf-8"))
-                local_meta = json.loads(meta_content)
-                merged_meta = _merge_meta(local_meta, remote_meta)
-                client.put_object(
-                    Bucket=bucket,
-                    Key=f"{s3_prefix}/meta.json",
-                    Body=json.dumps(merged_meta, indent=2).encode("utf-8"),
-                    ContentType="application/json",
-                )
-            except client.exceptions.NoSuchKey:
-                client.put_object(
-                    Bucket=bucket,
-                    Key=f"{s3_prefix}/meta.json",
-                    Body=meta_content.encode("utf-8"),
-                    ContentType="application/json",
-                )
+        force = local_resumes > remote_resumes
+    if meta_content is not None:
+        body = meta_content
+        if not force and remote_meta is not None:
+            body = json.dumps(
+                _merge_meta(json.loads(meta_content), remote_meta), indent=2
+            )
+        client.put_object(
+            Bucket=bucket,
+            Key=f"{s3_prefix}/meta.json",
+            Body=body.encode("utf-8"),
+            ContentType="application/json",
+        )
 
     metrics_dir = local_run_dir / "metrics"
     if metrics_dir.exists():
@@ -758,8 +811,15 @@ def _push_run_to_s3(
         _push_csv_file(client, bucket, s3_key, system_csv, force=force)
 
 
+def _resume_count(meta: dict) -> int:
+    """How many times a run was resumed, from its ``meta.json``."""
+    return len(meta.get("resumes") or [])
+
+
 def _merge_meta(local: dict, remote: dict) -> dict:
     """Merge meta.json from local and remote."""
+    if _resume_count(local) != _resume_count(remote):
+        return max(local, remote, key=_resume_count)
     if local.get("status") == "completed":
         return local
     if remote.get("status") == "completed":

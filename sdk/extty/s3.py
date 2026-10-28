@@ -703,32 +703,36 @@ class S3Storage:
     ) -> None:
         safe_name = sanitize_metric_name(name)
         key = self._s3_key("metrics", f"{safe_name}.csv")
-        rows = list(self._cumulative_metric_rows.get(name, [])) + list(values)
+        rows = list(self._cumulative_metric_rows.get(safe_name, [])) + list(values)
         self._put_csv_metric(key, rows)
-        self._cumulative_metric_rows[name] = rows
+        self._cumulative_metric_rows[safe_name] = rows
 
     def _upload_examples(self, name: str, records: list[dict[str, Any]]) -> None:
         safe_name = sanitize_metric_name(name)
         key = self._s3_key("examples", f"{safe_name}.jsonl")
-        all_records = list(self._cumulative_example_rows.get(name, [])) + list(records)
+        all_records = list(self._cumulative_example_rows.get(safe_name, [])) + list(
+            records
+        )
         self._put_jsonl(key, all_records)
-        self._cumulative_example_rows[name] = all_records
+        self._cumulative_example_rows[safe_name] = all_records
 
     def _upload_confusion(self, name: str, records: list[dict[str, Any]]) -> None:
         safe_name = sanitize_metric_name(name)
         key = self._s3_key("confusion_matrices", f"{safe_name}.jsonl")
-        all_records = list(self._cumulative_confusion_rows.get(name, [])) + list(
+        all_records = list(self._cumulative_confusion_rows.get(safe_name, [])) + list(
             records
         )
         self._put_jsonl(key, all_records)
-        self._cumulative_confusion_rows[name] = all_records
+        self._cumulative_confusion_rows[safe_name] = all_records
 
     def _upload_chart(self, name: str, records: list[dict[str, Any]]) -> None:
         safe_name = sanitize_metric_name(name)
         key = self._s3_key("charts", f"{safe_name}.jsonl")
-        all_records = list(self._cumulative_chart_rows.get(name, [])) + list(records)
+        all_records = list(self._cumulative_chart_rows.get(safe_name, [])) + list(
+            records
+        )
         self._put_jsonl(key, all_records)
-        self._cumulative_chart_rows[name] = all_records
+        self._cumulative_chart_rows[safe_name] = all_records
 
     def _upload_images(self, name: str, items: list[dict[str, Any]]) -> None:
         """Upload pending PNGs (write-once objects) then rewrite the index JSONL.
@@ -746,9 +750,9 @@ class S3Storage:
         safe_name = sanitize_metric_name(name)
         key = self._s3_key("images", f"{safe_name}.jsonl")
         new_records = [item["record"] for item in items]
-        all_records = list(self._cumulative_image_rows.get(name, [])) + new_records
+        all_records = list(self._cumulative_image_rows.get(safe_name, [])) + new_records
         self._put_jsonl(key, all_records)
-        self._cumulative_image_rows[name] = all_records
+        self._cumulative_image_rows[safe_name] = all_records
 
     def _upload_system(
         self,
@@ -761,7 +765,96 @@ class S3Storage:
         self._put_csv_system(key, rows)
         self._cumulative_system_rows = rows
 
-    def write_meta(self, meta_dict: dict[str, Any]) -> None:
+    def truncate_after(self, step: int) -> None:
+        """
+        Cut the run's logged history in S3 back to ``step`` and continue it.
+
+        Each metric CSV and each examples, confusion matrix, chart and image
+        index JSONL stream in S3 is read once. Its rows with a step at most
+        ``step`` seed the in-memory history that later flushes append to, and
+        a stream that loses rows is rewritten at once. ``system.csv`` is kept
+        whole and seeds the system history. PNGs and checkpoints are left
+        alone, and uploads after this stay free of reads.
+
+        It must run before the first log call, while nothing is buffered.
+
+        Parameters
+        ----------
+        step : int
+            The last step to keep; -1 drops every step-keyed row.
+
+        Raises
+        ------
+        botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError
+            On any S3 error other than a missing object, which is not
+            swallowed.
+        """
+        reader = S3RunReader(
+            self.config, self.project, self.run_name, _client=self._client
+        )
+        streams: tuple[tuple[str, str, dict[str, list[Any]]], ...] = (
+            ("metrics", ".csv", self._cumulative_metric_rows),
+            ("examples", ".jsonl", self._cumulative_example_rows),
+            ("confusion_matrices", ".jsonl", self._cumulative_confusion_rows),
+            ("charts", ".jsonl", self._cumulative_chart_rows),
+            ("images", ".jsonl", self._cumulative_image_rows),
+        )
+        with self._lock:
+            for sub, suffix, cumulative in streams:
+                for name in reader._list_stream_names(sub, suffix):
+                    key = self._s3_key(sub, name + suffix)
+                    text = reader._get_text(key)
+                    if text is None:
+                        continue
+                    if sub == "metrics":
+                        rows: list[Any] = [
+                            (p.step, p.timestamp, p.value)
+                            for p in parse_metric_csv(text)
+                        ]
+                        kept = [row for row in rows if row[0] <= step]
+                    else:
+                        rows = [
+                            json.loads(line)
+                            for line in text.splitlines()
+                            if line.strip()
+                        ]
+                        kept = [row for row in rows if row["step"] <= step]
+                    cumulative[name] = kept
+                    if len(kept) == len(rows):
+                        continue
+                    if sub == "metrics":
+                        self._put_csv_metric(key, kept)
+                    else:
+                        self._put_jsonl(key, kept)
+            self._cumulative_system_rows = [
+                (
+                    p.timestamp,
+                    p.ram_used_gb,
+                    p.ram_total_gb,
+                    p.gpu_mem_used_gb,
+                    p.gpu_mem_total_gb,
+                    p.gpu_util_pct,
+                )
+                for p in reader.read_system_metrics()
+            ]
+
+    def write_meta(self, meta_dict: dict[str, Any], *, strict: bool = False) -> None:
+        """
+        Write the run's ``meta.json`` to S3.
+
+        Parameters
+        ----------
+        meta_dict : dict[str, Any]
+            The run's metadata, as :meth:`extty.storage.MetaData.to_dict`
+            returns it.
+        strict : bool, default False
+            Raise S3 errors instead of logging them as a warning.
+
+        Raises
+        ------
+        botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError
+            On an S3 error, when ``strict`` is set.
+        """
         key = self._s3_key("meta.json")
         try:
             self._client.put_object(
@@ -771,6 +864,8 @@ class S3Storage:
                 ContentType="application/json",
             )
         except _S3_ERRORS:
+            if strict:
+                raise
             logger.warning("Failed to write run metadata to S3", exc_info=True)
 
     def upload_checkpoint(
@@ -1194,6 +1289,23 @@ class S3RunReader:
                     names.append(relative)
         names.sort()
         return names
+
+    def has_objects(self) -> bool:
+        """
+        Whether S3 holds any object under the run's prefix.
+
+        Returns
+        -------
+        bool
+            True if at least one object exists there, ``meta.json`` or not.
+        """
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=self.config.bucket, Prefix=self._s3_key("")
+        ):
+            if page.get("Contents"):
+                return True
+        return False
 
     def read_meta(self) -> MetaData | None:
         text = self._get_text(self._s3_key("meta.json"))
